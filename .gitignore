@@ -1,0 +1,4 @@
+.worktrees/
+*.log
+*.pid
+__pycache__/

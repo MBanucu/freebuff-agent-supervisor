@@ -1,0 +1,479 @@
+#!/usr/bin/env bash
+# Spawn and inspect parallel Freebuff agents, one git worktree per agent.
+#
+# What this wraps:
+#   1. create a git worktree and branch from a base;
+#   2. write the task brief to .task.md in the worktree;
+#   3. start Freebuff in a detached tmux session at 180x55 (the TUI does not
+#      enter raw input mode in smaller panes);
+#   4. wait until the TUI accepts input, then send the short "read .task.md"
+#      prompt;
+#   5. status/list/attach/stop/send against the live session.
+#
+# The agent is told to commit, push and open the PR. This tool never commits
+# and never touches the main worktree.
+set -euo pipefail
+
+COLS=180
+ROWS=55
+PROMPT='Read the file .task.md in this directory and execute it autonomously. Do not modify or commit .task.md or local.properties. Follow the PR instructions in it exactly. Do not ask questions; if blocked, open a draft PR and explain.'
+
+usage() {
+    cat <<'USAGE'
+Spawn parallel Freebuff agents in isolated git worktrees.
+
+  spawn-freebuff-agent start --issue N [options]
+      Create .worktrees/<name> on a new branch, write .task.md, and launch
+      Freebuff in tmux session fb-<name> at 180x55.
+
+      --issue N          GitHub issue number (required)
+      --name NAME        worktree/session name (default: issue-N)
+      --branch BRANCH    new branch (default: issue/N)
+      --base REF         base ref (default: main)
+      --task-file FILE   use a custom brief instead of the generic one
+      --title TEXT       issue title (otherwise read with gh)
+      --url URL          issue URL (otherwise read with gh)
+      --sdk-dir DIR      write sdk.dir into local.properties
+      --no-start         create the worktree and brief, do not launch
+      --dry-run          print the plan, change nothing
+      --help             this text
+
+  spawn-freebuff-agent status NAME [--lines N] [--no-gh]
+      Show the session, input mode, pane tail, branch, last commit and PR.
+      --lines N   pane lines to show (default: 25)
+      --no-gh     do not ask gh for the PR
+
+  spawn-freebuff-agent list
+      List worktrees and whether their fb-<name> session is running.
+
+  spawn-freebuff-agent attach NAME
+      Attach to the tmux session (detach with Ctrl-b d).
+
+  spawn-freebuff-agent send NAME TEXT
+      Send a follow-up message to a running agent.
+
+  spawn-freebuff-agent stop NAME
+      Kill the tmux session; the worktree and branch are left in place.
+
+Environment:
+  FREEBUFF_BIN        freebuff executable (default: freebuff on PATH)
+  FREEBUFF_TMUX       tmux executable (default: tmux on PATH, then nix-shell)
+  FREEBUFF_SUPERVISOR_ROOT  repository root override (tests)
+  GH_BIN              gh executable (default: gh on PATH)
+
+Notes:
+  - The TUI needs a 180x55 pane. Smaller panes stay in canonical mode and
+    silently ignore the prompt; this tool waits for -icanon before sending.
+  - A running agent runs shell commands with its normal approvals. Do not
+    attach and type while it is working.
+  - The tool never deletes a worktree or branch. Use git worktree remove and
+    git branch -D explicitly when the PR is done.
+USAGE
+}
+
+die() {
+    printf 'spawn-freebuff-agent: %s\n' "$*" >&2
+    exit 1
+}
+
+note() {
+    printf '%s\n' "$*"
+}
+
+valid_name() {
+    case "${1:-}" in
+        ''|*[!A-Za-z0-9_-]*) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+repo_slug() {
+    local url
+    url=$(git -C "$ROOT" remote get-url origin 2>/dev/null || true)
+    [ -n "$url" ] || return 0
+    printf '%s' "$url" |
+        sed -E 's#^git@github\.com:##; s#^https://github\.com/##; s#\.git$##'
+}
+
+tmux_bin() {
+    local cache path
+    if [ -n "${FREEBUFF_TMUX:-}" ]; then
+        printf '%s' "$FREEBUFF_TMUX"
+        return 0
+    fi
+    if command -v tmux >/dev/null 2>&1; then
+        command -v tmux
+        return 0
+    fi
+    cache="${XDG_CACHE_HOME:-$HOME/.cache}/wireless-adb-keeper/tmux.path"
+    if [ -x "$cache" ]; then
+        cat "$cache"
+        return 0
+    fi
+    if command -v nix-shell >/dev/null 2>&1; then
+        path=$(nix-shell -p tmux --run 'command -v tmux' 2>/dev/null | tail -n 1 || true)
+        if [ -n "$path" ] && [ -x "$path" ]; then
+            mkdir -p "$(dirname "$cache")" 2>/dev/null || true
+            printf '%s' "$path" >"$cache" 2>/dev/null || true
+            printf '%s' "$path"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+freebuff_bin() {
+    if [ -n "${FREEBUFF_BIN:-}" ]; then
+        printf '%s' "$FREEBUFF_BIN"
+        return 0
+    fi
+    if command -v freebuff >/dev/null 2>&1; then
+        command -v freebuff
+        return 0
+    fi
+    if [ -x "$HOME/.local/bin/freebuff" ]; then
+        printf '%s' "$HOME/.local/bin/freebuff"
+        return 0
+    fi
+    return 1
+}
+
+exclude_path() {
+    local common
+    common=$(git -C "$ROOT" rev-parse --git-common-dir 2>/dev/null || true)
+    [ -n "$common" ] || common="$ROOT/.git"
+    case "$common" in
+        /*) ;;
+        *) common="$ROOT/$common" ;;
+    esac
+    printf '%s/info/exclude' "$common"
+}
+
+ensure_excludes() {
+    local file entry
+    file=$(exclude_path)
+    mkdir -p "$(dirname "$file")"
+    for entry in '.worktrees/' '.task.md' 'local.properties'; do
+        grep -qxF "$entry" "$file" 2>/dev/null || printf '%s\n' "$entry" >>"$file"
+    done
+}
+
+write_task() {
+    local file="$1" slug="${2:-}" issue="$3" title="$4" url="$5" branch="$6" base="$7"
+    cat >"$file" <<EOF
+# Task: issue #$issue — $title
+
+Repo: ${slug:-this repository}. Branch: \`$branch\` (based on \`$base\`).
+Issue: $url
+Read it with: \`gh issue view $issue${slug:+ -R $slug}\`.
+
+## Deliverable
+
+Implement the issue end to end in this worktree. Follow the repository's
+existing conventions. Add or update the tests the change needs. Run the
+relevant checks and report exactly what was run.
+
+## Constraints
+
+- Work only in this worktree. Do not modify the main worktree or another
+  worktree.
+- Do not modify or commit \`.task.md\` or \`local.properties\`.
+- Do not touch unrelated files.
+- If you need the phone, do not reboot or lock it; read-only adb checks only.
+- If blocked, commit what works and open a draft PR explaining the blocker.
+
+## Finish
+
+Commit with a conventional message, push \`$branch\`, and open a PR against
+\`$base\` with \`gh pr create\`. The PR body must link #$issue and list what
+was tested. Report the PR URL, branch, commit and tests in your final message.
+EOF
+}
+
+wait_ready() {
+    local tmux="$1" session="$2" i tty pane
+    for i in $(seq 1 90); do
+        if ! "$tmux" has-session -t "$session" 2>/dev/null; then
+            return 1
+        fi
+        tty=$("$tmux" display-message -p -t "$session" '#{pane_tty}' 2>/dev/null || true)
+        pane=$("$tmux" capture-pane -p -t "$session" 2>/dev/null || true)
+        if [ -n "$tty" ] &&
+            stty -a -F "$tty" 2>/dev/null | grep -q -- '-icanon' &&
+            printf '%s' "$pane" | grep -q 'Enter a coding task'; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+start() {
+    local issue="" name="" branch="" base="main" title="" url="" task_file=""
+    local sdk_dir="" dry=0 nostart=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --issue) issue=${2:-}; shift 2 ;;
+            --name) name=${2:-}; shift 2 ;;
+            --branch) branch=${2:-}; shift 2 ;;
+            --base) base=${2:-}; shift 2 ;;
+            --task-file) task_file=${2:-}; shift 2 ;;
+            --title) title=${2:-}; shift 2 ;;
+            --url) url=${2:-}; shift 2 ;;
+            --sdk-dir) sdk_dir=${2:-}; shift 2 ;;
+            --dry-run) dry=1; shift ;;
+            --no-start) nostart=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "start: unsupported argument: $1" ;;
+        esac
+    done
+
+    case "$issue" in
+        ''|*[!0-9]*) die "start: --issue must be a number" ;;
+    esac
+    name=${name:-"issue-$issue"}
+    branch=${branch:-"issue/$issue"}
+    valid_name "$name" || die "start: name may only contain letters, digits, _ and -"
+    [ -n "$branch" ] || die "start: branch is empty"
+
+    local slug wt session
+    slug=$(repo_slug || true)
+    wt="$ROOT/.worktrees/$name"
+    session="fb-$name"
+
+    if [ -z "$title" ] || [ -z "$url" ]; then
+        if [ -n "$slug" ] && command -v "${GH_BIN:-gh}" >/dev/null 2>&1; then
+            local meta
+            meta=$("${GH_BIN:-gh}" issue view "$issue" -R "$slug" \
+                --json title,url --jq '[.title,.url]|@tsv' 2>/dev/null || true)
+            if [ -n "$meta" ]; then
+                title=${title:-${meta%%$'\t'*}}
+                url=${url:-${meta#*$'\t'}}
+            fi
+        fi
+        title=${title:-"issue #$issue"}
+        url=${url:-"https://github.com/${slug:-owner/repo}/issues/$issue"}
+    fi
+
+    if [ "$dry" = 1 ]; then
+        note "worktree=$wt"
+        note "branch=$branch"
+        note "base=$base"
+        note "session=$session"
+        note "task=$wt/.task.md"
+        note "tmux=${FREEBUFF_TMUX:-tmux} -x $COLS -y $ROWS -c $wt"
+        return 0
+    fi
+
+    if [ -e "$wt" ]; then
+        die "start: worktree already exists: $wt (try status $name)"
+    fi
+    if git -C "$ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
+        die "start: branch already exists: $branch"
+    fi
+    if ! git -C "$ROOT" rev-parse --verify "$base^{commit}" >/dev/null 2>&1; then
+        die "start: base ref not found: $base"
+    fi
+
+    ensure_excludes
+    mkdir -p "$ROOT/.worktrees"
+    git -C "$ROOT" worktree add -b "$branch" "$wt" "$base" >/dev/null
+
+    if [ -n "$sdk_dir" ]; then
+        printf 'sdk.dir=%s\n' "$sdk_dir" >"$wt/local.properties"
+    elif [ -f "$ROOT/local.properties" ]; then
+        cp "$ROOT/local.properties" "$wt/local.properties"
+    fi
+
+    if [ -n "$task_file" ]; then
+        [ -f "$task_file" ] || die "start: task file not found: $task_file"
+        cp "$task_file" "$wt/.task.md"
+    else
+        write_task "$wt/.task.md" "$slug" "$issue" "$title" "$url" "$branch" "$base"
+    fi
+
+    note "created=$wt"
+    note "branch=$branch"
+    note "task=$wt/.task.md"
+
+    if [ "$nostart" = 1 ]; then
+        return 0
+    fi
+
+    local tmux fb cmd
+    tmux=$(tmux_bin) || die "start: tmux not found; install tmux or set FREEBUFF_TMUX"
+    fb=$(freebuff_bin) || die "start: freebuff not found; set FREEBUFF_BIN"
+    printf -v cmd 'TERM=xterm-256color %q --cwd %q --trust-agents' "$fb" "$wt"
+    "$tmux" new-session -d -s "$session" -x "$COLS" -y "$ROWS" -c "$wt" "$cmd"
+
+    if ! wait_ready "$tmux" "$session"; then
+        printf '%s\n' '--- last pane lines ---'
+        "$tmux" capture-pane -p -t "$session" -S -15 2>/dev/null || true
+        die "start: TUI did not reach raw input in $session; session left running (stop $name)"
+    fi
+
+    "$tmux" send-keys -t "$session" -l "$PROMPT"
+    sleep 0.5
+    "$tmux" send-keys -t "$session" C-m
+    sleep 2
+
+    note "session=$session"
+    note "started=yes"
+    "$tmux" capture-pane -p -t "$session" -S -8 2>/dev/null || true
+}
+
+status() {
+    local name="" lines=25 no_gh=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --lines) lines=${2:-}; shift 2 ;;
+            --no-gh) no_gh=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            -*) die "status: unsupported argument: $1" ;;
+            *) name=$1; shift ;;
+        esac
+    done
+    [ -n "$name" ] || die "status: NAME is required"
+    valid_name "$name" || die "status: invalid name"
+    case "$lines" in
+        ''|*[!0-9]*) die "status: --lines must be a number" ;;
+    esac
+
+    local wt="$ROOT/.worktrees/$name" branch session tmux running=0 tty mode=unknown
+    [ -d "$wt" ] || die "status: no worktree at $wt"
+    branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
+    session="fb-$name"
+    tmux=$(tmux_bin 2>/dev/null || true)
+
+    printf 'name=%s\nbranch=%s\nworktree=%s\nsession=%s\n' \
+        "$name" "$branch" "$wt" "$session"
+
+    if [ -n "$tmux" ] && "$tmux" has-session -t "$session" 2>/dev/null; then
+        running=1
+        tty=$("$tmux" display-message -p -t "$session" '#{pane_tty}' 2>/dev/null || true)
+        if [ -n "$tty" ] && stty -a -F "$tty" 2>/dev/null | grep -q -- '-icanon'; then
+            mode=raw
+        else
+            mode=canonical
+        fi
+        printf 'running=yes\ninput=%s\n' "$mode"
+        "$tmux" capture-pane -p -t "$session" -S "-$lines" 2>/dev/null || true
+    else
+        printf 'running=no\n'
+    fi
+
+    printf 'commit=%s\n' "$(git -C "$wt" log -1 --oneline 2>/dev/null || true)"
+    if [ -n "$(git -C "$wt" status --short 2>/dev/null || true)" ]; then
+        printf 'dirty=yes\n'
+    else
+        printf 'dirty=no\n'
+    fi
+
+    if [ "$no_gh" = 0 ]; then
+        local slug prs
+        slug=$(repo_slug || true)
+        if [ -n "$slug" ] && command -v "${GH_BIN:-gh}" >/dev/null 2>&1; then
+            prs=$("${GH_BIN:-gh}" pr list -R "$slug" --head "$branch" --state open \
+                --json number,url,title \
+                --jq '.[] | "pr=#\(.number) \(.url) \(.title)"' 2>/dev/null || true)
+            if [ -n "$prs" ]; then
+                printf '%s\n' "$prs"
+            else
+                printf 'pr=none\n'
+            fi
+        fi
+    fi
+}
+
+list_agents() {
+    local wt name branch session tmux running
+    [ -d "$ROOT/.worktrees" ] || {
+        note "no worktrees"
+        return 0
+    }
+    tmux=$(tmux_bin 2>/dev/null || true)
+    printf '%-24s %-34s %-30s %s\n' NAME BRANCH SESSION RUNNING
+    for wt in "$ROOT"/.worktrees/*; do
+        [ -d "$wt" ] || continue
+        name=$(basename "$wt")
+        branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
+        session="fb-$name"
+        running=no
+        if [ -n "$tmux" ] && "$tmux" has-session -t "$session" 2>/dev/null; then
+            running=yes
+        fi
+        printf '%-24s %-34s %-30s %s\n' "$name" "$branch" "$session" "$running"
+    done
+}
+
+attach() {
+    local name=${1:-} tmux
+    [ -n "$name" ] || die "attach: NAME is required"
+    valid_name "$name" || die "attach: invalid name"
+    [ -t 0 ] && [ -t 1 ] || die "attach: needs a terminal"
+    tmux=$(tmux_bin) || die "attach: tmux not found"
+    exec "$tmux" attach -t "fb-$name"
+}
+
+send() {
+    local name=${1:-} text=${2:-} tmux
+    [ -n "$name" ] || die "send: NAME is required"
+    valid_name "$name" || die "send: invalid name"
+    [ -n "$text" ] || die "send: TEXT is required"
+    tmux=$(tmux_bin) || die "send: tmux not found"
+    "$tmux" has-session -t "fb-$name" 2>/dev/null ||
+        die "send: session fb-$name is not running"
+    "$tmux" send-keys -t "fb-$name" -l "$text"
+    sleep 0.2
+    "$tmux" send-keys -t "fb-$name" C-m
+}
+
+stop() {
+    local name=${1:-} tmux
+    [ -n "$name" ] || die "stop: NAME is required"
+    valid_name "$name" || die "stop: invalid name"
+    tmux=$(tmux_bin) || die "stop: tmux not found"
+    if "$tmux" has-session -t "fb-$name" 2>/dev/null; then
+        "$tmux" kill-session -t "fb-$name"
+        note "stopped=fb-$name"
+    else
+        note "stopped=no (fb-$name not running)"
+    fi
+}
+
+# --root is accepted before the subcommand so tests can point at a temp repo.
+ROOT="${FREEBUFF_SUPERVISOR_ROOT:-}"
+args=("$@")
+while [ ${#args[@]} -gt 0 ]; do
+    case "${args[0]}" in
+        --root)
+            [ ${#args[@]} -ge 2 ] || die "--root needs a directory"
+            ROOT=${args[1]}
+            args=("${args[@]:2}")
+            ;;
+        *) break ;;
+    esac
+done
+set -- "${args[@]}"
+
+if [ -z "$ROOT" ]; then
+    ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
+fi
+[ -n "$ROOT" ] || die "not inside a git repository"
+[ -d "$ROOT" ] || die "root does not exist: $ROOT"
+
+cmd=${1:-}
+if [ $# -gt 0 ]; then
+    shift
+fi
+case "$cmd" in
+    start) start "$@" ;;
+    status) status "$@" ;;
+    list|ls) list_agents "$@" ;;
+    attach) attach "$@" ;;
+    send) send "$@" ;;
+    stop) stop "$@" ;;
+    -h|--help|help) usage ;;
+    '') usage; exit 2 ;;
+    *) die "unknown command: $cmd (try --help)" ;;
+esac
