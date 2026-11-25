@@ -99,12 +99,13 @@ FAKE_DIR="$TMP/fake"
 mkdir -p "$FAKE_DIR" "$TMP/bin"
 : >"$FAKE_DIR/tty"
 : >"$FAKE_DIR/killed"
+: >"$FAKE_DIR/escaped"
 cat >"$TMP/bin/tmux" <<'FAKE'
 #!/usr/bin/env bash
 d=${FAKE_TMUX_DIR:?}
 case "${1:-}" in
     has-session)
-        [ "$(cat "$d/session" 2>/dev/null || true)" = "${3:-}" ]
+        grep -qxF -- "${3:-}" "$d/session" 2>/dev/null
         ;;
     capture-pane)
         cat "$d/pane" 2>/dev/null || true
@@ -117,9 +118,20 @@ case "${1:-}" in
             *) printf '0\n' ;;
         esac
         ;;
+    send-keys)
+        if [ "${!#}" = Escape ]; then
+            printf '%s\n' "${3:-}" >>"$d/escaped"
+            if [ -f "$d/pane_after_escape" ]; then
+                mv "$d/pane_after_escape" "$d/pane"
+            fi
+        fi
+        ;;
     kill-session)
         printf '%s\n' "${3:-}" >>"$d/killed"
-        rm -f "$d/session"
+        if [ -f "$d/session" ]; then
+            grep -vxF -- "${3:-}" "$d/session" >"$d/session.tmp" 2>/dev/null || true
+            mv "$d/session.tmp" "$d/session"
+        fi
         ;;
     list-sessions)
         cat "$d/session" 2>/dev/null || true
@@ -143,6 +155,11 @@ fake_session() {
 fake_clear() {
     rm -f "$FAKE_DIR/session"
     : >"$FAKE_DIR/killed"
+}
+
+fake_add_session() {
+    # fake_add_session NAME: add a live fb-* session next to the fixture one
+    printf 'fb-%s\n' "$1" >>"$FAKE_DIR/session"
 }
 
 # Panes as captured from Freebuff 0.2.38.
@@ -318,6 +335,118 @@ check contains "$(cat "$REPO/.worktrees/.orphans.log")" 'reason=orphan'
 
 fake_clear
 
+# ---- session inventory (#11) ----
+
+fake_session test-999 "$IDLE_PANE"
+printf 'state=blocked\n' >"$WT/.agent-result"
+fake_add_session ghost
+printf 'autostop=pid:%s\n' "$$" >>"$WT/.supervisor.log"
+
+out=$(bash "$TOOL" --root "$REPO" sessions --no-gh)
+check contains "$out" 'WORKTREE'
+check contains "$out" 'RESULT'
+check contains "$out" 'BRANCH'
+check test "$(printf '%s\n' "$out" | grep -c '^test-999')" = 1
+check test "$(printf '%s\n' "$out" | grep -c '^ghost')" = 1
+# columns: NAME STATE IDLE WATCHER WORKTREE RESULT BRANCH
+check test "$(printf '%s\n' "$out" | awk '$1 == "ghost" { print $5 }')" = missing
+check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $5 }')" = yes
+check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $4 }')" = "pid:$$"
+check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $6 }')" = blocked
+check contains "$out" 'sessions=2 running=2 worktrees=1 orphans=1'
+
+# a watcher that was recorded but has gone is not reported as alive
+printf 'autostop=pid:999999\n' >>"$WT/.supervisor.log"
+out=$(bash "$TOOL" --root "$REPO" sessions --no-gh)
+check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $4 }')" = dead
+
+# list names the orphan, so it cannot be reaped without ever being seen
+out=$(bash "$TOOL" --root "$REPO" list)
+check contains "$out" 'orphans=ghost'
+
+# even a root with no worktrees reports the orphan instead of only "no worktrees"
+mkdir -p "$TMP/no-worktrees"
+out=$(bash "$TOOL" --root "$TMP/no-worktrees" list)
+check contains "$out" 'no worktrees'
+check contains "$out" 'orphans=test-999 ghost'
+rm -f "$WT/.agent-result"
+
+# ---- graceful stop (#10) ----
+
+rm -f "$WT/.supervisor.log"
+fake_session test-999 "$BUSY_PANE"
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane_after_escape"
+: >"$FAKE_DIR/escaped"
+if bash "$TOOL" --root "$REPO" stop test-999 --graceful --wait 5 \
+    >"$TMP/stop.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+check grep -qxF 'fb-test-999' "$FAKE_DIR/escaped"
+check grep -qxF 'fb-test-999' "$FAKE_DIR/killed"
+check contains "$(cat "$TMP/stop.out")" 'graceful=escape'
+check contains "$(cat "$WT/.supervisor.log")" 'reason=graceful'
+check contains "$(cat "$WT/.supervisor.log")" 'interrupted=yes'
+check contains "$(cat "$WT/.supervisor.log")" 'pane_state=idle'
+
+# a turn that does not end within the window is left running, not killed
+rm -f "$FAKE_DIR/pane_after_escape"
+fake_session test-999 "$BUSY_PANE"
+if bash "$TOOL" --root "$REPO" stop test-999 --graceful --wait 1 \
+    >"$TMP/stop.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 1
+check test ! -s "$FAKE_DIR/killed"
+check contains "$(cat "$TMP/stop.out")" 'still busy'
+
+# nothing to interrupt when the turn already ended
+fake_session test-999 "$IDLE_PANE"
+if bash "$TOOL" --root "$REPO" stop test-999 --graceful --wait 1 \
+    >"$TMP/stop.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+check contains "$(cat "$TMP/stop.out")" 'graceful=already-idle'
+check contains "$(cat "$WT/.supervisor.log")" 'interrupted=no'
+
+# the hard stop keeps working and sends nothing
+fake_session test-999 "$BUSY_PANE"
+: >"$FAKE_DIR/escaped"
+out=$(bash "$TOOL" --root "$REPO" stop test-999)
+check contains "$out" 'stopped=fb-test-999'
+check test ! -s "$FAKE_DIR/escaped"
+
+# ---- capacity before the worktree is spent (#12) ----
+
+fake_session test-999 "$IDLE_PANE"
+if bash "$TOOL" --root "$REPO" start --issue 1000 --name test-cap \
+    --branch test/cap --title T --url U --max-sessions 1 --no-start \
+    >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 1
+check contains "$(cat "$TMP/start.out")" 'already live'
+check test ! -e "$REPO/.worktrees/test-cap"
+
+out=$(bash "$TOOL" --root "$REPO" start --issue 1000 --name test-cap \
+    --branch test/cap --title T --url U --max-sessions 1 --dry-run 2>&1)
+check contains "$out" 'max_sessions=1 live=1 wait_slot=0'
+
+if bash "$TOOL" --root "$REPO" start --issue 1000 --name test-cap \
+    --branch test/cap --title T --url U --max-sessions 1 --wait-slot 0 \
+    --no-start >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 1
+check contains "$(cat "$TMP/start.out")" 'nothing was created'
+check test ! -e "$REPO/.worktrees/test-cap"
+
+if bash "$TOOL" --root "$REPO" start --issue 1000 --name test-cap \
+    --branch test/cap --title T --url U --wait-slot 5 --no-start \
+    >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 1
+check contains "$(cat "$TMP/start.out")" 'needs --max-sessions'
+
+# a launch that never takes input is stopped; the worktree is kept
+if bash "$TOOL" --root "$REPO" start --issue 1001 --name test-dead \
+    --branch test/dead --title T --url U >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 1
+check contains "$(cat "$TMP/start.out")" 'stopped it, worktree kept'
+check grep -qxF 'fb-test-dead' "$FAKE_DIR/killed"
+check test -d "$REPO/.worktrees/test-dead"
+fake_clear
+
 # ---- remaining checks ----
 
 if bash "$TOOL" --root "$REPO" start --issue 999 --name test-999 \
@@ -339,7 +468,8 @@ check contains "$(bash "$TOOL" --help 2>&1)" 'start'
 
 git -C "$REPO" worktree remove --force "$WT" >/dev/null 2>&1 || true
 git -C "$REPO" worktree remove --force "$REPO/.worktrees/test-custom" >/dev/null 2>&1 || true
-git -C "$REPO" branch -D test/999 test/custom >/dev/null 2>&1 || true
+git -C "$REPO" worktree remove --force "$REPO/.worktrees/test-dead" >/dev/null 2>&1 || true
+git -C "$REPO" branch -D test/999 test/custom test/dead >/dev/null 2>&1 || true
 
 if [ "$failed" -ne 0 ]; then
     printf '%d/%d checks failed\n' "$failed" "$total" >&2

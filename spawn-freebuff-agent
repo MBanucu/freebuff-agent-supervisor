@@ -48,6 +48,9 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       --auto-stop        stop fb-<name> after the agent finishes
       --idle-seconds N   idle window for --auto-stop (default: 120)
       --poll N           watcher poll interval in seconds (default: 5)
+      --max-sessions N   refuse to start while N fb-* sessions are live
+      --wait-slot [N]    wait up to N seconds (default: 300) for a free slot
+                         instead of failing; requires --max-sessions
       --no-start         create the worktree and brief, do not launch
       --dry-run          print the plan, change nothing
       --help             this text
@@ -60,6 +63,12 @@ Spawn parallel Freebuff agents in isolated git worktrees.
 
   spawn-freebuff-agent list
       List worktrees with session state, running flag and idle time.
+
+  spawn-freebuff-agent sessions [--no-gh]
+      One table over every fb-* session and every worktree: live state, idle
+      time, attached autostop watcher, whether a worktree exists, the result
+      state, the branch and the open PR. Sessions with no worktree are listed
+      here instead of only being reapable by gc --all.
 
   spawn-freebuff-agent attach NAME
       Attach to the tmux session (detach with Ctrl-b d).
@@ -76,8 +85,11 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       Watch, then stop fb-<name> and record the run evidence. This is what
       start --auto-stop runs detached.
 
-  spawn-freebuff-agent stop NAME
+  spawn-freebuff-agent stop NAME [--graceful [--wait N]]
       Kill the tmux session; the worktree and branch are left in place.
+      --graceful sends Escape, waits up to N seconds (default: 20) for the turn
+      to end, then stops, recording the pane state. It refuses to kill a
+      session that is still working when the wait expires.
 
   spawn-freebuff-agent gc [--idle-hours N] [--all] [--dry-run]
       Stop finished sessions, sessions idle past N hours (default: 12),
@@ -345,7 +357,7 @@ wait_ready() {
 start() {
     local issue="" name="" branch="" base="main" title="" url="" task_file=""
     local sdk_dir="" dry=0 nostart=0 autostop=0 idle=120 poll=5
-    local idle_set=0 poll_set=0
+    local idle_set=0 poll_set=0 max_sessions=0 wait_slot=0 slot_wait=300
     while [ $# -gt 0 ]; do
         case "$1" in
             --issue) issue=${2:-}; shift 2 ;;
@@ -359,6 +371,14 @@ start() {
             --auto-stop) autostop=1; shift ;;
             --idle-seconds) idle=${2:-}; idle_set=1; shift 2 ;;
             --poll) poll=${2:-}; poll_set=1; shift 2 ;;
+            --max-sessions) max_sessions=${2:-}; shift 2 ;;
+            --wait-slot)
+                wait_slot=1
+                case "${2:-}" in
+                    ''|*[!0-9]*) shift ;;
+                    *) slot_wait=$2; shift 2 ;;
+                esac
+                ;;
             --dry-run) dry=1; shift ;;
             --no-start) nostart=1; shift ;;
             -h|--help) usage; exit 0 ;;
@@ -377,6 +397,10 @@ start() {
     is_num "$poll" || die "start: --poll must be a number"
     if [ "$autostop" = 0 ] && { [ "$idle_set" = 1 ] || [ "$poll_set" = 1 ]; }; then
         die "start: --idle-seconds and --poll require --auto-stop"
+    fi
+    is_num "$max_sessions" || die "start: --max-sessions must be a number"
+    if [ "$max_sessions" = 0 ] && [ "$wait_slot" = 1 ]; then
+        die "start: --wait-slot needs --max-sessions N (nothing to wait for otherwise)"
     fi
 
     local slug wt session result
@@ -410,7 +434,34 @@ start() {
         if [ "$autostop" = 1 ]; then
             note "autostop=yes idle_seconds=$idle poll=$poll"
         fi
+        if [ "$max_sessions" -gt 0 ]; then
+            note "max_sessions=$max_sessions live=$(live_session_count) wait_slot=$wait_slot"
+        fi
         return 0
+    fi
+
+    # Every session shares one account, so a launch is pointless while the
+    # limit is reached: the pane stops on the overlay and never takes input.
+    # Check before spending a worktree, and wait for a slot if asked.
+    if [ "$max_sessions" -gt 0 ]; then
+        local live deadline
+        live=$(live_session_count)
+        if [ "$live" -ge "$max_sessions" ]; then
+            if [ "$wait_slot" = 0 ]; then
+                die "start: $live fb-* session(s) already live (--max-sessions $max_sessions); stop one or pass --wait-slot"
+            fi
+            deadline=$(( $(date +%s) + slot_wait ))
+            note "waiting-for-slot=yes live=$live max=$max_sessions timeout=${slot_wait}s"
+            while [ "$live" -ge "$max_sessions" ]; do
+                if [ "$(date +%s)" -ge "$deadline" ]; then
+                    die "start: still $live fb-* session(s) after ${slot_wait}s; nothing was created"
+                fi
+                sleep 5
+                live=$(live_session_count)
+                note "waiting-for-slot=yes live=$live"
+            done
+            note "slot-free=yes live=$live"
+        fi
     fi
 
     if [ -e "$wt" ]; then
@@ -458,7 +509,10 @@ start() {
     if ! wait_ready "$tmux" "$session"; then
         printf '%s\n' '--- last pane lines ---'
         "$tmux" capture-pane -p -t "$session" -S -15 2>/dev/null || true
-        die "start: TUI did not reach raw input in $session; session left running (stop $name)"
+        # A pane that never reached raw input can never accept the brief, so it
+        # is dead weight. Kill only the session; the worktree and branch stay.
+        "$tmux" kill-session -t "$session" 2>/dev/null || true
+        die "start: TUI did not reach raw input in $session; stopped it, worktree kept ($wt)"
     fi
 
     "$tmux" send-keys -t "$session" -l "$PROMPT"
@@ -568,10 +622,21 @@ status() {
 
 list_agents() {
     local wt name branch session tmux running state idle activity now idle_secs
-    [ -d "$ROOT/.worktrees" ] || {
+    local orphans="" orphan
+    # Sessions with no worktree are not in the table below; name them so they
+    # cannot be reaped by gc --all without ever having been seen.
+    while IFS= read -r orphan; do
+        [ -n "$orphan" ] || continue
+        orphan=${orphan#fb-}
+        [ -d "$ROOT/.worktrees/$orphan" ] ||
+            orphans="${orphans:+$orphans }$orphan"
+    done <<<"$(live_sessions)"
+
+    if [ ! -d "$ROOT/.worktrees" ]; then
         note "no worktrees"
+        [ -z "$orphans" ] || note "orphans=$orphans (no worktree; see sessions)"
         return 0
-    }
+    fi
     tmux=$(tmux_bin 2>/dev/null || true)
     now=$(date +%s)
     printf '%-22s %-30s %-26s %-8s %-10s %s\n' \
@@ -600,11 +665,152 @@ list_agents() {
         printf '%-22s %-30s %-26s %-8s %-10s %s\n' \
             "$name" "$branch" "$session" "$running" "$state" "$idle"
     done
+
+    [ -z "$orphans" ] || note "orphans=$orphans (no worktree; see sessions)"
+}
+
+watcher_state() {
+    # watcher_state WORKTREE -> pid:N when the recorded autostop is alive,
+    # dead when it was recorded but has gone, - when no watcher ever started
+    local wt="$1" pid
+    pid=$(grep -o 'autostop=pid:[0-9]*' "$wt/.supervisor.log" 2>/dev/null |
+        tail -n 1 | cut -d: -f2 || true)
+    [ -n "$pid" ] || {
+        printf '%s' '-'
+        return 0
+    }
+    if kill -0 "$pid" 2>/dev/null; then
+        printf 'pid:%s' "$pid"
+    else
+        printf 'dead'
+    fi
+}
+
+live_sessions() {
+    # live_sessions -> fb-* session names, one per line, none when tmux is gone
+    local tmux
+    tmux=$(tmux_bin 2>/dev/null || true)
+    [ -n "$tmux" ] || return 0
+    "$tmux" list-sessions -F '#{session_name}' 2>/dev/null | grep '^fb-' || true
+}
+
+live_session_count() {
+    # live_session_count -> number of live fb-* sessions (0 when none)
+    local count
+    count=$(live_sessions | grep -c . || true)
+    printf '%s' "${count:-0}"
+}
+
+sessions() {
+    # sessions -> one table over every fb-* session and every worktree, so a
+    # session with no worktree is visible before gc --all reaps it
+    local no_gh=0 name wt worktree running state idle activity now idle_secs
+    local watcher result branch pr prs="" slug="" tmux total=0 live=0 trees=0
+    local names=() x
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --no-gh) no_gh=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "sessions: unsupported argument: $1" ;;
+        esac
+    done
+    tmux=$(tmux_bin 2>/dev/null || true)
+    now=$(date +%s)
+
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        names+=("$name")
+    done <<<"$(live_sessions | sed 's/^fb-//')"
+
+    for wt in "$ROOT"/.worktrees/*; do
+        [ -d "$wt" ] || continue
+        name=$(basename "$wt")
+        for x in ${names[@]+"${names[@]}"}; do
+            [ "$x" = "$name" ] && continue 2
+        done
+        names+=("$name")
+    done
+
+    if [ ${#names[@]} -eq 0 ]; then
+        note 'no sessions'
+        return 0
+    fi
+    mapfile -t names < <(printf '%s\n' "${names[@]}" | LC_ALL=C sort)
+
+    # One gh call for every branch, instead of one per row.
+    if [ "$no_gh" = 0 ]; then
+        slug=$(repo_slug || true)
+        if [ -n "$slug" ] && command -v "${GH_BIN:-gh}" >/dev/null 2>&1; then
+            prs=$("${GH_BIN:-gh}" pr list -R "$slug" --state open \
+                --json headRefName,url --jq '.[] | "\(.headRefName) \(.url)"' \
+                2>/dev/null || true)
+        fi
+    fi
+
+    if [ -n "$prs" ]; then
+        printf '%-22s %-9s %-8s %-9s %-9s %-9s %-24s %s\n' \
+            NAME STATE IDLE WATCHER WORKTREE RESULT BRANCH PR
+    else
+        printf '%-22s %-9s %-8s %-9s %-9s %-9s %s\n' \
+            NAME STATE IDLE WATCHER WORKTREE RESULT BRANCH
+    fi
+
+    for name in "${names[@]}"; do
+        wt="$ROOT/.worktrees/$name"
+        total=$((total + 1))
+        if [ -d "$wt" ]; then
+            worktree=yes
+            trees=$((trees + 1))
+            branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || printf '?')
+            result=$(result_state "$wt")
+            [ -n "$result" ] || result=-
+            watcher=$(watcher_state "$wt")
+        else
+            worktree=missing
+            branch=-
+            result=-
+            watcher=-
+        fi
+        running=no
+        idle=-
+        if [ -n "$tmux" ] && "$tmux" has-session -t "fb-$name" 2>/dev/null; then
+            running=yes
+            live=$((live + 1))
+            state=$(session_state "$name")
+            activity=$(session_activity "$name" 2>/dev/null || true)
+            if is_num "$activity"; then
+                idle_secs=$((now - activity))
+                [ "$idle_secs" -ge 0 ] || idle_secs=0
+                idle="${idle_secs}s"
+            fi
+        elif [ "$worktree" = yes ]; then
+            state=$(result_state "$wt")
+            [ -n "$state" ] || state=stopped
+        else
+            state=-
+        fi
+
+        if [ -n "$prs" ] && [ "$branch" != '-' ]; then
+            pr=$(printf '%s\n' "$prs" |
+                awk -v b="$branch" '$1 == b { print $2; exit }')
+            [ -n "$pr" ] || pr=-
+            printf '%-22s %-9s %-8s %-9s %-9s %-9s %-24s %s\n' \
+                "$name" "$state" "$idle" "$watcher" "$worktree" "$result" \
+                "$branch" "$pr"
+        else
+            printf '%-22s %-9s %-8s %-9s %-9s %-9s %s\n' \
+                "$name" "$state" "$idle" "$watcher" "$worktree" "$result" \
+                "$branch"
+        fi
+    done
+
+    printf 'sessions=%s running=%s worktrees=%s orphans=%s\n' \
+        "$total" "$live" "$trees" "$((total - trees))"
 }
 
 reap() {
-    # reap NAME REASON -> record evidence under .worktrees, then kill the session
-    local name="$1" reason="$2" session="fb-$name"
+    # reap NAME REASON [EXTRA] -> record evidence under .worktrees, then kill
+    local name="$1" reason="$2" extra="${3:-}" session="fb-$name"
     local wt="$ROOT/.worktrees/$name" log branch="" tmux pr=unknown slug dirty=no
     local pane=""
     tmux=$(tmux_bin 2>/dev/null || true)
@@ -639,6 +845,7 @@ reap() {
         printf 'commit=%s\n' "$(git -C "$wt" log -1 --oneline 2>/dev/null || true)"
         printf 'dirty=%s\n' "$dirty"
         printf 'pr=%s\n' "$pr"
+        [ -z "$extra" ] || printf '%s\n' "$extra"
         if [ -n "$pane" ]; then
             printf '%s\n' 'pane:'
             printf '%s\n' "$pane"
@@ -869,16 +1076,60 @@ send() {
 }
 
 stop() {
-    local name=${1:-} tmux
+    local name="" tmux graceful=0 wait=20 initial state deadline interrupted=no
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --graceful) graceful=1; shift ;;
+            --wait) wait=${2:-}; shift 2 ;;
+            -h|--help) usage; exit 0 ;;
+            -*) die "stop: unsupported argument: $1" ;;
+            *) name=$1; shift ;;
+        esac
+    done
     [ -n "$name" ] || die "stop: NAME is required"
     valid_name "$name" || die "stop: invalid name"
+    is_num "$wait" || die "stop: --wait must be a number"
     tmux=$(tmux_bin) || die "stop: tmux not found"
-    if "$tmux" has-session -t "fb-$name" 2>/dev/null; then
+
+    if ! "$tmux" has-session -t "fb-$name" 2>/dev/null; then
+        note "stopped=no (fb-$name not running)"
+        return 0
+    fi
+
+    if [ "$graceful" = 0 ]; then
         "$tmux" kill-session -t "fb-$name"
         note "stopped=fb-$name"
-    else
-        note "stopped=no (fb-$name not running)"
+        return 0
     fi
+
+    # Graceful: end the turn with Escape, then wait for the resting prompt, so
+    # a kill cannot land between an edit and its commit unnoticed.
+    initial=$(session_state "$name")
+    if [ "$initial" = working ]; then
+        "$tmux" send-keys -t "fb-$name" Escape
+        interrupted=yes
+        note 'graceful=escape'
+    else
+        note "graceful=already-$initial"
+    fi
+    deadline=$(( $(date +%s) + wait ))
+    while :; do
+        state=$(session_state "$name")
+        case "$state" in
+            done|idle|refused|missing) break ;;
+        esac
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            break
+        fi
+        sleep 1
+    done
+    if [ "$state" = working ]; then
+        note "graceful=no state=working waited=${wait}s"
+        note "still busy: nothing was stopped; use plain 'stop $name' to kill it"
+        return 1
+    fi
+    reap "$name" graceful \
+        "pane_state=$state interrupted=$interrupted waited=${wait}s"
 }
 
 # --root is accepted before the subcommand so tests can point at a temp repo.
@@ -910,6 +1161,7 @@ case "$cmd" in
     start) start "$@" ;;
     status) status "$@" ;;
     list|ls) list_agents "$@" ;;
+    sessions|ps) sessions "$@" ;;
     attach) attach "$@" ;;
     send) send "$@" ;;
     watch) watch "$@" ;;

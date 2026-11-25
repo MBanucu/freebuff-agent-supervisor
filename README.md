@@ -143,13 +143,15 @@ session_state=done          # live: done, idle, working, refused or missing
 
 ```bash
 spawn-freebuff-agent list
+spawn-freebuff-agent sessions
 spawn-freebuff-agent status 103-example --lines 40
 spawn-freebuff-agent status 103-example --no-gh
 spawn-freebuff-agent attach 103-example   # detach with Ctrl-b d
 spawn-freebuff-agent send 103-example "Also run the new test"
 spawn-freebuff-agent watch 103-example --idle-seconds 120 --poll 5
 spawn-freebuff-agent autostop 103-example
-spawn-freebuff-agent stop 103-example
+spawn-freebuff-agent stop 103-example            # hard kill
+spawn-freebuff-agent stop 103-example --graceful # end the turn first
 spawn-freebuff-agent gc --dry-run
 ```
 
@@ -163,6 +165,20 @@ the result file appears or the pane has been idle past the window, `1` on
 `status` prints the result state, `session_state`, idle seconds, the pane
 tail, the last commit, whether the worktree is dirty, and any open PR for the
 branch.
+
+`sessions` is the inventory: one row per `fb-*` session **and** per worktree,
+with `WORKTREE yes|missing`, the attached `autostop` watcher (`pid:N`, `dead`
+or `-`), the result state, the branch and the open PR. It starts from
+`tmux list-sessions`, so a session with no worktree appears there instead of
+only being found when `gc --all` kills it; `list` also names such orphans.
+`--no-gh` skips the PR column.
+
+`stop` is a hard kill. `stop --graceful` sends `Escape` to end the turn, waits
+up to `--wait` seconds (default 20) for the pane to reach `done`, `idle` or
+`refused`, then stops and appends `pane_state=`, `interrupted=` and the wait
+to `.supervisor.log`. If the pane is still `working` when the window expires
+it stops nothing and exits 1, so a kill cannot land between an edit and its
+commit by accident.
 
 `gc` stops sessions that are `done`, stuck on the concurrent-session overlay,
 idle for more than `--idle-hours` (default 12), or — with `--all` — `fb-*`
@@ -184,9 +200,15 @@ and silently ignores the prompt. `start` waits for `-icanon` and the
 `Enter a coding task` line before sending anything, and fails with the last
 pane lines if the TUI never becomes ready.
 
-A pane that never becomes ready — for example the concurrent-session overlay
-— is deliberately left running for inspection; `gc` stops it because it can
-never become usable.
+A pane that never becomes ready — for example the concurrent-session overlay —
+can never accept the brief, so `start` prints the last pane lines and stops
+that session, leaving the worktree and branch in place.
+
+Because every session shares one account, `start` checks capacity before it
+spends a worktree: `--max-sessions N` refuses to start while N `fb-*` sessions
+are live, and `--wait-slot [SECONDS]` (default 300, requires
+`--max-sessions`) polls until one goes away. A refused `start` creates nothing
+at all.
 
 ## Safety
 
@@ -206,11 +228,14 @@ never become usable.
   the Freebuff release; the result file is the stable signal.
 - Concurrent Freebuff sessions share one account; if the service throttles a
   new session, the pane says `Can't reach Freebuff's servers. Retrying...`.
-  The session is left running for inspection. The banner is drawn above the
+  `start` stops a launch that never takes input (the worktree stays), while a
+  session throttled mid-run is left alone. The banner is drawn above the
   resting prompt, so such a session reads as `idle` and `gc` only reaps it
-  after `--idle-hours` — it is never reaped on sight.
-- The test suite is deviceless: a fake tmux serves fixture panes and records
-  kills, so it covers the result protocol, state transitions, autostop and
-  `gc` decisions without a Freebuff session, account slot, `gh` or network.
+  after `--idle-hours` — never on sight.
+- The test suite is deviceless: a fake tmux serves fixture panes, several
+  session names and recorded kills, so it covers the result protocol, state
+  transitions, autostop and `gc` decisions, the `sessions` inventory, graceful
+  stop and the capacity pre-flight without a Freebuff session, account slot,
+  `gh` or network.
   It does not exercise the real TUI; verify marker changes with one controlled
   run when upgrading Freebuff.
