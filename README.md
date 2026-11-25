@@ -270,7 +270,8 @@ served by any static host, so it works on a phone and nothing listens to be
 attacked. There are no external assets — CSS is inline and there is no
 script — so `file://` works offline and a strict CSP cannot break the view
 (the page declares `default-src 'none'; style-src 'unsafe-inline'; img-src
-data:`). `--watch N` rewrites the file every N seconds and adds
+data:; connect-src 'self'` — the last one only so Chrome DevTools' own
+`/.well-known` probe is not blocked and does not fill the console). `--watch N` rewrites the file every N seconds and adds
 `<meta http-equiv="refresh" content="N">`, so an open browser follows along
 without JavaScript. Without it, a single snapshot is written and the command
 exits.

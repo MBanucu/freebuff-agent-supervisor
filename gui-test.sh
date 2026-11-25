@@ -258,6 +258,13 @@ code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
     -H 'Authorization: Bearer wrong' "$base/api/sessions" || true)
 check test "$code" = 401
 
+# The Chrome DevTools probe is answered without a token so the browser
+# console stays quiet; it must stay empty instead of serving a file list.
+code=$(curl -sS --max-time 10 -o "$TMP/devtools.json" -w '%{http_code}' \
+    "$base/.well-known/appspecific/com.chrome.devtools.json" || true)
+check test "$code" = 204
+check test ! -s "$TMP/devtools.json"
+
 # 404 for a name the inventory does not know.
 code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
     -H "Authorization: Bearer $TOKEN" \

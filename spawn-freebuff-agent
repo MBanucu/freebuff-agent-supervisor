@@ -480,8 +480,13 @@ snapshot_html() {
         printf '<html lang="en">\n<head>\n'
         printf '<meta charset="utf-8">\n'
         printf '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
-        printf '<meta http-equiv="Content-Security-Policy" content="default-src %s; style-src %s; img-src data:">\n' \
-            "'none'" "'unsafe-inline'"
+        # connect-src 'self' is here for Chrome DevTools, which fetches
+        # /.well-known/appspecific/com.chrome.devtools.json from the page's
+        # origin; without it the probe is blocked and the console shows two
+        # violations per load. Same origin only, and there is no script to
+        # use the allowance anyway.
+        printf '<meta http-equiv="Content-Security-Policy" content="default-src %s; style-src %s; img-src data:; connect-src %s">\n' \
+            "'none'" "'unsafe-inline'" "'self'"
         printf '<meta name="referrer" content="no-referrer">\n'
         [ -z "$refresh" ] || printf '%s\n' "$refresh"
         printf '<title>freebuff agents</title>\n'
