@@ -239,3 +239,41 @@ at all.
   `gh` or network.
   It does not exercise the real TUI; verify marker changes with one controlled
   run when upgrading Freebuff.
+
+## Upstream: expect the TUI to stay the only mode
+
+This tool exists because Freebuff has no one-shot or headless mode. That is not
+an oversight waiting to be fixed, and it should not be planned around one
+arriving. Checked on 2026-11-25 against Freebuff 0.2.38 and the upstream
+tracker:
+
+- The official docs state it as a property: *"It is an interactive client: it
+  does not accept an initial prompt as an argument, and it is not a scriptable
+  JSON mode."* The project's own comparison writing says the same: *"The CLI is
+  a terminal UI with no non-interactive mode, which rules out CI and scripts."*
+- The reason is the funding model, not effort. Freebuff is ad-funded and the
+  ads render in the TUI; free-mode admission is allowlisted to the official
+  clients. A run driven by a third-party harness with the device token was
+  refused, *"warning, then ban"*.
+- The request is already filed twice: `CodebuffAI/freebuff#947` (open since
+  2026-08-06, no maintainer reply) and `#1322` (closed by the stale bot, which
+  said closing was "not a verdict"). Another issue would be a duplicate.
+- The only movement is *inside* the official binary: `#1477` accepts an initial
+  prompt argument and is *"deliberately not a headless mode"*; `#1611` adds
+  `freebuff --acp`, serving the Agent Client Protocol over stdio. Both were open
+  and unmerged on that date.
+
+What that means here:
+
+- The `.agent-result` protocol and the pane markers are the design, not a
+  workaround to be deleted once headless lands.
+- If `#1477` lands, `start` can pass the brief as an argument instead of waiting
+  for raw input and typing it. That removes the most fragile step and changes
+  nothing else.
+- If `#1611` lands, an ACP client could drive the official binary with no pane
+  at all; this tool would then be about parallel worktrees rather than session
+  lifetime.
+
+Until then, do not file another upstream one-shot request: it duplicates
+`#947`, and the part that will not change on request is the admission rule
+that keeps third-party harnesses out.
