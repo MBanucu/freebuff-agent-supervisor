@@ -305,6 +305,13 @@ class Handler(BaseHTTPRequestHandler):
         segments = [unquote(part) for part in parsed.path.split("/") if part]
         query = parse_qs(parsed.query, keep_blank_values=True)
 
+        # Chrome DevTools fetches this from the page's origin for its
+        # workspace feature. Answering 204 keeps the console free of errors;
+        # the real payload is a file list, which this server never exposes, so
+        # the endpoint stays empty and needs no token.
+        if segments == [".well-known", "appspecific", "com.chrome.devtools.json"]:
+            return self._send(204, "", "application/json", [])
+
         provided, source = self._form_token()
         if not provided and method == "GET":
             provided = (query.get("token") or [""])[0]

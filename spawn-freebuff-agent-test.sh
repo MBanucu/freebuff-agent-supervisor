@@ -511,7 +511,9 @@ check contains "$SNAP" 'ok &lt;b&gt;&amp;&quot;quoted&quot;&lt;/b&gt;'
 check test "$(printf '%s' "$SNAP" | grep -c '<b>')" = 0
 check test "$(printf '%s' "$SNAP" | grep -c '<script')" = 0
 # no server, no external assets, and a strict inline-style-only CSP
-check contains "$SNAP" "default-src 'none'; style-src 'unsafe-inline'"
+check contains "$SNAP" "default-src 'none'; style-src 'unsafe-inline'; img-src data:; connect-src 'self'"
+# connect-src is same-origin only: no external fetch is permitted
+check test "$(printf '%s' "$SNAP" | grep -c "connect-src 'self'")" = 1
 check test "$(printf '%s' "$SNAP" | grep -cE '(href|src)="https?://')" = 0
 
 # --watch rewrites the file and asks the browser to reload it
