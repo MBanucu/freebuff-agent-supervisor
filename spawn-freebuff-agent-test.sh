@@ -165,6 +165,18 @@ case "${1:-}" in
             mv "$d/session.tmp" "$d/session"
         fi
         ;;
+    new-session)
+        # Opt-in: only a test that reaches the send path creates the ready
+        # file, so a launch in a pane that cannot take input still fails fast
+        # (wait_ready would otherwise poll for the whole window).
+        if [ -f "$d/ready" ]; then
+            prev=''
+            for arg in "$@"; do
+                if [ "$prev" = -s ]; then printf '%s\n' "$arg" >>"$d/session"; fi
+                prev=$arg
+            done
+        fi
+        ;;
     list-sessions)
         cat "$d/session" 2>/dev/null || true
         ;;
@@ -605,6 +617,88 @@ check contains "$(cat "$TMP/start.out")" 'stopped it, worktree kept'
 check grep -qxF 'fb-test-dead' "$FAKE_DIR/killed"
 check test -d "$REPO/.worktrees/test-dead"
 fake_clear
+
+# ---- brief ledger: never the same text twice (#48) ----
+
+# Reach the real send path: a stub freebuff, a fake stty that reports raw
+# mode, and a fake tmux that registers the session it was asked to create.
+cat >"$TMP/bin/stty" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' 'speed 38400 baud; line = 0; -icanon -echo'
+FAKE
+cat >"$TMP/bin/freebuff" <<'FAKE'
+#!/usr/bin/env bash
+exit 0
+FAKE
+chmod +x "$TMP/bin/stty" "$TMP/bin/freebuff"
+PATH="$TMP/bin:$PATH"
+export PATH
+export FREEBUFF_BIN="$TMP/bin/freebuff"
+: >"$FAKE_DIR/ready"
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+fake_clear
+: >"$FAKE_DIR/sent"
+
+launch_brief() {
+    # launch_brief NAME ISSUE [extra...]: one start that reaches the send
+    bash "$TOOL" --root "$REPO" start --issue "$2" --name "$1" \
+        --branch "test/$1" --title T --url U ${3+"${@:3}"}
+}
+
+sent_text() {
+    # sent_text NAME -> the literal text argument of the last send
+    grep -F -- '-l' "$FAKE_DIR/sent" | grep -F -- "fb-$1" | tail -n 1
+}
+
+if launch_brief test-brief-a 1002 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+check contains "$(cat "$TMP/start.out")" 'started=yes'
+sent_a=$(sent_text test-brief-a)
+check contains "$sent_a" 'Session test-brief-a'
+check contains "$sent_a" "worktree $REPO/.worktrees/test-brief-a"
+check contains "$sent_a" 'Issue #1002'
+check contains "$(cat "$REPO/.supervisor-briefs.jsonl")" '"name": "test-brief-a"'
+check grep -qxF '.supervisor-briefs.jsonl' "$REPO/.git/info/exclude"
+
+if launch_brief test-brief-b 1003 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+sent_b=$(sent_text test-brief-b)
+check contains "$sent_b" 'Issue #1003'
+check test "$sent_a" != "$sent_b"
+check test "$(grep -c . "$REPO/.supervisor-briefs.jsonl" || true)" = 2
+
+# Seed older entries so the next success also proves the window is trimmed
+# to the last 20 rather than growing without bound.
+for i in $(seq 1 25); do
+    printf '{"at": "seed", "name": "seed", "branch": "seed", "hash": "seed%s"}\n' \
+        "$i" >>"$REPO/.supervisor-briefs.jsonl"
+done
+
+# A reused --prompt is the case the ledger exists for: send it once, then the
+# same literal text from another session must fail before any keystroke.
+if launch_brief test-brief-c 1004 --prompt 'one identical brief' \
+    >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+check contains "$(sent_text test-brief-c)" 'one identical brief'
+check test "$(grep -c . "$REPO/.supervisor-briefs.jsonl" || true)" = 20
+
+: >"$FAKE_DIR/sent"
+if launch_brief test-brief-d 1005 --prompt 'one identical brief' \
+    >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 1
+check contains "$(cat "$TMP/start.out")" 'refusing a duplicate brief'
+check contains "$(cat "$TMP/start.out")" 'test-brief-c'
+check contains "$(cat "$TMP/start.out")" 'scripted or automated use'
+check test ! -s "$FAKE_DIR/sent"
+check test ! -e "$REPO/.worktrees/test-brief-d"
+check test "$(grep -c 'fb-test-brief-d' "$FAKE_DIR/session" || true)" = 0
+
+# Several allowed slots jitter the send; the dry run names the bound only.
+out=$(bash "$TOOL" --root "$REPO" start --issue 1006 --name test-brief-j \
+    --branch test/brief-j --title T --url U --max-sessions 2 --dry-run)
+check contains "$out" 'jitter_max=4s'
+check contains "$out" 'brief_hash='
+check test ! -e "$REPO/.worktrees/test-brief-j"
 
 # ---- remaining checks ----
 
@@ -1074,7 +1168,13 @@ rm -f "$WT/.agent-result"
 git -C "$REPO" worktree remove --force "$WT" >/dev/null 2>&1 || true
 git -C "$REPO" worktree remove --force "$REPO/.worktrees/test-custom" >/dev/null 2>&1 || true
 git -C "$REPO" worktree remove --force "$REPO/.worktrees/test-dead" >/dev/null 2>&1 || true
-git -C "$REPO" branch -D test/999 test/custom test/dead >/dev/null 2>&1 || true
+for brief in a b c; do
+    git -C "$REPO" worktree remove --force "$REPO/.worktrees/test-brief-$brief" \
+        >/dev/null 2>&1 || true
+done
+git -C "$REPO" branch -D test/999 test/custom test/dead \
+    test/test-brief-a test/test-brief-b test/test-brief-c \
+    >/dev/null 2>&1 || true
 
 if [ "$failed" -ne 0 ]; then
     printf '%d/%d checks failed\n' "$failed" "$total" >&2

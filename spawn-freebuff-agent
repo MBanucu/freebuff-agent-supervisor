@@ -19,6 +19,13 @@ COLS=180
 ROWS=55
 PROMPT='Read the file .task.md in this directory and execute it autonomously. Do not commit .task.md, .agent-result or local.properties. Follow the PR instructions in it exactly. Do not ask questions; if blocked, open a draft PR and explain.'
 RESULT_FILE='.agent-result'
+# The vendor refuses a message identical to a recent one as scripted use and
+# counts a strike, so every sent brief is hashed here before it is typed. The
+# file lives in the repository root and the last BRIEF_LEDGER_KEEP hashes are
+# kept: a brief stops counting as a duplicate once it has aged out of the
+# window, so a retry next week is not blocked by today's run.
+BRIEF_LEDGER='.supervisor-briefs.jsonl'
+BRIEF_LEDGER_KEEP=20
 # The pane is the only completion signal Freebuff offers. Markers are matched
 # against the bottom lines of the visible pane only, so prose in the agent's
 # scrollback cannot keep a finished session alive.
@@ -51,6 +58,8 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       --max-sessions N   refuse to start while N fb-* sessions are live
       --wait-slot [N]    wait up to N seconds (default: 300) for a free slot
                          instead of failing; requires --max-sessions
+                         With N > 1, each send is jittered by a random delay
+                         so a burst does not reach the TUI in one second.
       --no-start         create the worktree and brief, do not launch
       --prompt TEXT      send this message instead of the default brief
       --dry-run          print the plan, change nothing
@@ -129,6 +138,9 @@ Spawn parallel Freebuff agents in isolated git worktrees.
 Environment:
   FREEBUFF_BIN        freebuff executable (default: freebuff on PATH)
   FREEBUFF_TMUX       tmux executable (default: tmux on PATH, then nix-shell)
+  FREEBUFF_START_JITTER  upper bound in seconds for the random delay before a
+                         send when --max-sessions allows several (default:
+                         2N; 0 disables the wait)
   FREEBUFF_TTYD       ttyd executable for gui --ttyd (default: ttyd on PATH)
   FREEBUFF_SUPERVISOR_ROOT  repository root override (tests)
   GH_BIN              gh executable (default: gh on PATH)
@@ -138,6 +150,10 @@ Notes:
     silently ignore the prompt; this tool waits for -icanon before sending.
   - A running agent runs shell commands with its normal approvals. Do not
     attach and type while it is working.
+  - A brief is hashed into .supervisor-briefs.jsonl (last 20 kept) before it
+    is typed; a repeat inside that window is a hard error and sends nothing,
+    because Freebuff treats a repeated message as scripted use and counts a
+    strike against the account.
   - Completion is either the agent's .agent-result file (stock brief) or an
     idle pane after the window; the pane heuristic is tied to the TUI.
   - The tool never deletes a worktree or branch. Use git worktree remove and
@@ -234,7 +250,8 @@ ensure_excludes() {
     local file entry
     file=$(exclude_path)
     mkdir -p "$(dirname "$file")"
-    for entry in '.worktrees/' '.task.md' 'local.properties' "$RESULT_FILE" '.supervisor.log'; do
+    for entry in '.worktrees/' '.task.md' 'local.properties' "$RESULT_FILE" \
+        '.supervisor.log' "$BRIEF_LEDGER"; do
         grep -qxF "$entry" "$file" 2>/dev/null || printf '%s\n' "$entry" >>"$file"
     done
 }
@@ -699,10 +716,94 @@ wait_ready() {
     return 1
 }
 
+brief_hash() {
+    # brief_hash TEXT -> a stable digest of the text about to be typed.
+    # sha256sum is coreutils, shasum ships with macOS and cksum is the POSIX
+    # last resort; the ledger is only ever read by this same tool, so a
+    # weaker digest on a bare phone is enough to notice a repeat.
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "${1-}" | sha256sum | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        printf '%s' "${1-}" | shasum -a 256 | cut -d' ' -f1
+    else
+        printf '%s' "${1-}" | cksum | tr ' ' '-'
+    fi
+}
+
+brief_ledger_file() {
+    printf '%s/%s' "$ROOT" "$BRIEF_LEDGER"
+}
+
+brief_ledger_seen() {
+    # brief_ledger_seen HASH -> the last ledger line carrying that hash, empty
+    # when the brief was not sent inside the retained window.
+    local file
+    file=$(brief_ledger_file)
+    [ -f "$file" ] || return 0
+    grep -F "\"hash\": \"$1\"" "$file" 2>/dev/null | tail -n 1 || true
+}
+
+brief_ledger_record() {
+    # brief_ledger_record HASH NAME BRANCH -> one JSON line, then trim to the
+    # last BRIEF_LEDGER_KEEP so the window stays small and recent.
+    local file line
+    file=$(brief_ledger_file)
+    mkdir -p "$(dirname "$file")"
+    line=$(printf '{"at": %s, "name": %s, "branch": %s, "hash": %s}' \
+        "$(json_str "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")" \
+        "$(json_str "${2:-}")" "$(json_str "${3:-}")" "$(json_str "${1:-}")")
+    printf '%s\n' "$line" >>"$file"
+    tail -n "$BRIEF_LEDGER_KEEP" "$file" >"$file.tmp.$$"
+    mv "$file.tmp.$$" "$file"
+}
+
+refuse_sent_brief() {
+    # refuse_sent_brief HASH -> die when that text was already sent recently.
+    # This runs before the worktree is created, so a refusal costs no worktree
+    # and no keystroke; the vendor's rule and the earlier send are named so the
+    # caller can change the brief instead of retrying blindly.
+    local seen at prev
+    seen=$(brief_ledger_seen "$1")
+    [ -n "$seen" ] || return 0
+    at=$(printf '%s' "$seen" | sed -n 's/.*"at": "\([^"]*\)".*/\1/p')
+    prev=$(printf '%s' "$seen" | sed -n 's/.*"name": "\([^"]*\)".*/\1/p')
+    die "start: refusing a duplicate brief: its text was already sent to ${prev:-another session} at ${at:-an earlier run} (hash $1). Freebuff refuses a repeated identical message as scripted or automated use and counts a strike, so nothing was sent and nothing was created. Give this session a different brief, name or issue, or pass a different --prompt."
+}
+
+compose_brief() {
+    # compose_brief NAME BRANCH WORKTREE ISSUE PROMPT -> the text typed into
+    # the TUI. It names real content (session, branch, worktree, issue) so the
+    # stock brief cannot repeat; PROMPT replaces it entirely, and is then the
+    # caller's job to keep unique (the ledger catches it otherwise).
+    local name=$1 branch=$2 wt=$3 issue=$4 prompt=${5:-}
+    if [ -n "$prompt" ]; then
+        printf '%s' "$prompt"
+        return 0
+    fi
+    local text="$PROMPT Session $name, branch $branch, worktree $wt."
+    [ -z "$issue" ] || text="$text Issue #$issue."
+    printf '%s' "$text"
+}
+
+brief_jitter_max() {
+    # brief_jitter_max MAX_SESSIONS -> upper bound for the random delay before
+    # a send. Only a pool of several slots is paced: one slot cannot fire two
+    # starts at once. FREEBUFF_START_JITTER overrides it, 0 disables the wait.
+    local max=$1 bound
+    [ "${max:-0}" -gt 1 ] || {
+        printf '0'
+        return 0
+    }
+    bound=${FREEBUFF_START_JITTER:-$((max * 2))}
+    is_num "$bound" || bound=0
+    printf '%s' "$bound"
+}
+
 start() {
     local issue="" name="" branch="" base="main" title="" url="" task_file=""
     local sdk_dir="" dry=0 nostart=0 autostop=0 idle=120 poll=5
     local idle_set=0 poll_set=0 max_sessions=0 wait_slot=0 slot_wait=300
+    local prompt_text="" sent brief_hash_value jitter_max jitter=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --issue) issue=${2:-}; shift 2 ;;
@@ -754,6 +855,11 @@ start() {
     wt="$ROOT/.worktrees/$name"
     session="fb-$name"
     result="$wt/$RESULT_FILE"
+    # The brief and its identity are known before anything is created, so a
+    # duplicate is a hard error rather than a spent worktree and a strike.
+    sent=$(compose_brief "$name" "$branch" "$wt" "$issue" "$prompt_text")
+    brief_hash_value=$(brief_hash "$sent")
+    jitter_max=$(brief_jitter_max "$max_sessions")
 
     if [ -z "$title" ] || [ -z "$url" ]; then
         if [ -n "$slug" ] && command -v "${GH_BIN:-gh}" >/dev/null 2>&1; then
@@ -776,6 +882,9 @@ start() {
         note "session=$session"
         note "task=$wt/.task.md"
         note "result=$result"
+        note "brief_hash=$brief_hash_value"
+        note "brief_chars=${#sent}"
+        [ "$jitter_max" = 0 ] || note "jitter_max=${jitter_max}s"
         note "tmux=${FREEBUFF_TMUX:-tmux} -x $COLS -y $ROWS -c $wt"
         if [ "$autostop" = 1 ]; then
             note "autostop=yes idle_seconds=$idle poll=$poll"
@@ -820,6 +929,11 @@ start() {
         die "start: base ref not found: $base"
     fi
 
+    # A brief already sent inside the ledger window is a hard error: the
+    # vendor reads it as scripted use and answers with a strike. --no-start
+    # sends nothing, so it has nothing to refuse.
+    [ "$nostart" = 1 ] || refuse_sent_brief "$brief_hash_value"
+
     ensure_excludes
     mkdir -p "$ROOT/.worktrees"
     git -C "$ROOT" worktree add -b "$branch" "$wt" "$base" >/dev/null
@@ -862,15 +976,20 @@ start() {
     fi
 
     # A brief that is byte-identical across sessions reads as scripted use to
-    # the vendor, which refuses the message and counts a strike. Name the
-    # session, branch and issue so every send differs by construction;
-    # --prompt replaces the whole message.
-    local sent="$PROMPT Session $name, branch $branch."
-    [ -z "$issue" ] || sent="$sent Issue #$issue."
-    [ -z "$prompt_text" ] || sent=$prompt_text
+    # the vendor, which refuses the message and counts a strike. `sent` was
+    # composed from the session, branch, worktree and issue, and its hash
+    # cleared the ledger above, so this exact text has not been sent recently.
+    if [ "$jitter_max" -gt 0 ]; then
+        jitter=$((RANDOM % (jitter_max + 1)))
+        note "jitter=${jitter}s max=${jitter_max}s"
+        sleep "$jitter"
+    fi
     "$tmux" send-keys -t "$session" -l "$sent"
     sleep 0.5
     "$tmux" send-keys -t "$session" C-m
+    # Recorded once the keys are sent, so a launch that fails earlier never
+    # blocks a retry with text nobody saw.
+    brief_ledger_record "$brief_hash_value" "$name" "$branch"
     sleep 2
 
     note "session=$session"

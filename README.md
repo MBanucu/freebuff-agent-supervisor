@@ -60,10 +60,20 @@ Use `--root /path/to/repo` to target another checkout. The default name is
 copied when present.
 
 `--prompt TEXT` replaces the message typed into the TUI; the brief itself still
-comes from `.task.md`. The default message names the session, its branch and the
-issue number, so no two sessions receive byte-identical text: Freebuff refuses
-repeated identical messages as scripted use and counts a strike against the
-account.
+comes from `.task.md`. The default message names the session, its branch, its
+worktree path and the issue number, so no two sessions receive byte-identical
+text.
+
+Every sent brief is hashed and appended to `.supervisor-briefs.jsonl` in the
+repository root, which `start` also adds to `.git/info/exclude`. The last 20
+hashes are kept: before a worktree is created, `start` refuses text whose hash
+is still in that window and names the earlier session, time and hash. That is a
+hard error with no keystroke sent, not a retry. `--prompt` text is hashed too,
+so passing the same literal prompt to two sessions fails the second.
+
+With `--max-sessions N` for N > 1, `start` waits a random 0–2N seconds before
+typing, so a burst of launches does not reach the TUI within the same second.
+`FREEBUFF_START_JITTER` overrides the bound (`0` disables the wait).
 
 Use `--task-file FILE` when an issue needs a custom scope instead of the
 generic issue brief. `--dry-run` prints the plan and changes nothing;
@@ -521,14 +531,47 @@ that session, leaving the worktree and branch in place.
 Because every session shares one account, `start` checks capacity before it
 spends a worktree: `--max-sessions N` refuses to start while N `fb-*` sessions
 are live, and `--wait-slot [SECONDS]` (default 300, requires
-`--max-sessions`) polls until one goes away. A refused `start` creates nothing
-at all.
+`--max-sessions`) polls until one goes away. A refused `start` creates nothing at all.
+
+## Vendor policy: scripted use
+
+Freebuff polices scripted or automated use. Its filter refuses a message that
+repeats one already sent — "It breaks the usage policy (Scripted or automated
+use): it is the same message sent over and over" — and counts a strike against
+the account; strikes reset at midnight with the daily hours. The refused
+session is released, so the run produces nothing.
+
+This tool drives an interactive client with a shell-backed account, several
+sessions at a time, and types a brief into each. It can therefore generate
+exactly the pattern that filter looks for. The mitigation below does not make
+that automation permissible, and it does not override the vendor's decision:
+it only stops the tool from tripping the filter by accident, which is a bug in
+this repository, not a policy argument.
+
+- **Unique by construction.** The stock brief names the session, branch,
+  worktree and issue, so two issues never send the same bytes. There is no
+  random filler: the text carries real content instead of looking less
+  scripted.
+- **A ledger of what was sent.** Each send is hashed into
+  `.supervisor-briefs.jsonl` (last 20 kept) and an identical hash inside that
+  window is refused locally, before any keystroke and before a worktree is
+  created.
+- **Jittered launches.** Under a multi-slot `--max-sessions`, sends are spaced
+  by a random delay instead of arriving in one second.
+
+If Freebuff refuses a send anyway, the strike is the vendor's decision and the
+account's cost; this tool cannot undo it. Do not add randomised filler or
+prompt churn to get around the filter — that is the behaviour the policy
+targets, and a strike is the user's risk to accept before running several
+agents.
 
 ## Safety
 
 - The tool writes only under `.worktrees/` in the target repository, plus
+  `.supervisor-briefs.jsonl` in its root (the last 20 sent-brief hashes) and
   `.git/info/exclude` entries for `.worktrees/`, `.task.md`,
-  `.agent-result`, `.supervisor.log` and `local.properties`.
+  `.agent-result`, `.supervisor.log`, `.supervisor-briefs.jsonl` and
+  `local.properties`.
 - A running agent uses its normal shell approvals. Do not attach and type while
   it is working; use `send` for a deliberate follow-up.
 - Auto-stop and `gc` only kill `fb-<name>`, after appending the pane tail,
