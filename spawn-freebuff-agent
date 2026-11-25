@@ -79,6 +79,15 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       --watch N   rewrite the file every N seconds (adds a meta refresh)
       --no-gh     do not ask gh for the PR
 
+  spawn-freebuff-agent gui --serve [--port N] [--host H] [--token T] [--read-only]
+      Serve a read-only dashboard and JSON API from python3's standard
+      library: GET / is the --snapshot page, GET /api/sessions is
+      `sessions --json` verbatim and GET /api/session/<name>/pane is
+      `status --json`. Binds 127.0.0.1:7788 by default; a non-loopback host
+      is refused unless --token is given. Without --token one is generated
+      and printed once. --read-only answers every POST with 403. No TLS: put
+      a reverse proxy in front for LAN or Tailscale access.
+
   spawn-freebuff-agent attach NAME
       Attach to the tmux session (detach with Ctrl-b d).
 
@@ -509,48 +518,10 @@ CSS
             printf '%s' "$cards"
         fi
         printf '</main>\n'
-        printf '<footer>Read-only snapshot from spawn-freebuff-agent sessions --json. No server, no script.</footer>\n'
+        printf '<footer>Read-only view from spawn-freebuff-agent sessions --json. No script.</footer>\n'
         printf '</body>\n</html>\n'
     } >"$file.tmp.$$"
     mv "$file.tmp.$$" "$file"
-}
-
-gui() {
-    # gui --snapshot FILE [--watch N] [--no-gh] -> write the page, and with
-    # --watch keep rewriting it so an open browser follows along. Read-only:
-    # nothing in the page acts, so there is nothing to attack and nothing to
-    # miss when the server this tool does not have is absent.
-    local snapshot='' watch='' no_gh=0 first=1 json args
-    while [ $# -gt 0 ]; do
-        case "$1" in
-            --snapshot) snapshot=${2:-}; shift 2 ;;
-            --watch) watch=${2:-}; shift 2 ;;
-            --no-gh) no_gh=1; shift ;;
-            -h|--help) usage; exit 0 ;;
-            *) die "gui: unsupported argument: $1" ;;
-        esac
-    done
-    [ -n "$snapshot" ] || die "gui: --snapshot FILE is required"
-    if [ -n "$watch" ]; then
-        is_num "$watch" || die "gui: --watch must be a number"
-        [ "$watch" -ge 1 ] || die "gui: --watch must be at least 1 second"
-    fi
-    mkdir -p "$(dirname "$snapshot")"
-    while :; do
-        args=(--json)
-        if [ "$no_gh" = 1 ]; then
-            args+=(--no-gh)
-        fi
-        json=$(sessions "${args[@]}")
-        snapshot_html "$snapshot" "$json" "$watch"
-        if [ "$first" = 1 ]; then
-            note "snapshot=$snapshot"
-            [ -z "$watch" ] || note "watch_seconds=$watch"
-            first=0
-        fi
-        [ -n "$watch" ] || return 0
-        sleep "$watch"
-    done
 }
 
 pr_json_array() {
@@ -1482,6 +1453,68 @@ gc() {
         else
             note "skip name=$name reason=orphan (use --all)"
         fi
+    done
+}
+
+gui() {
+    # Two modes over the same inventory:
+    #   --snapshot FILE [--watch N] [--no-gh]      write one page
+    #   --serve [--port N] [--host H] [--token T]  serve that page and the API
+    # The server itself is gui/server.py; python3 stays optional so the rest
+    # of the CLI works on a host that does not have it.
+    local snapshot='' watch='' no_gh=0 serve=0 first=1 json args py dir
+    local passthrough=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --snapshot) snapshot=${2:-}; shift 2 ;;
+            --watch) watch=${2:-}; shift 2 ;;
+            --no-gh) no_gh=1; shift ;;
+            --serve) serve=1; shift ;;
+            --port|--host|--token)
+                [ $# -ge 2 ] || die "gui: $1 needs a value"
+                passthrough+=("$1" "$2"); shift 2 ;;
+            --read-only) passthrough+=(--read-only); shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "gui: unsupported argument: $1" ;;
+        esac
+    done
+
+    if [ "$serve" = 1 ]; then
+        [ -z "$snapshot" ] ||
+            die "gui: --serve and --snapshot are separate modes"
+        py=$(command -v python3 2>/dev/null || true)
+        [ -n "$py" ] ||
+            die "gui: --serve needs python3 (pkg install python on Termux); the rest of the CLI works without it"
+        case "$0" in
+            */*) dir=$(cd "$(dirname "$0")" && pwd) ;;
+            *) dir=$(cd "$(dirname "$(command -v "$0" 2>/dev/null || printf '%s' "$0")")" && pwd) ;;
+        esac
+        [ -f "$dir/gui/server.py" ] ||
+            die "gui: gui/server.py is missing next to the tool"
+        exec "$py" "$dir/gui/server.py" --root "$ROOT" \
+            ${passthrough[@]+"${passthrough[@]}"}
+    fi
+
+    [ -n "$snapshot" ] || die "gui: --snapshot FILE or --serve is required"
+    if [ -n "$watch" ]; then
+        is_num "$watch" || die "gui: --watch must be a number"
+        [ "$watch" -ge 1 ] || die "gui: --watch must be at least 1 second"
+    fi
+    mkdir -p "$(dirname "$snapshot")"
+    while :; do
+        args=(--json)
+        if [ "$no_gh" = 1 ]; then
+            args+=(--no-gh)
+        fi
+        json=$(sessions "${args[@]}")
+        snapshot_html "$snapshot" "$json" "$watch"
+        if [ "$first" = 1 ]; then
+            note "snapshot=$snapshot"
+            [ -z "$watch" ] || note "watch_seconds=$watch"
+            first=0
+        fi
+        [ -n "$watch" ] || return 0
+        sleep "$watch"
     done
 }
 

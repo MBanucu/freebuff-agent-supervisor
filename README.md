@@ -29,6 +29,8 @@ anything, and it never modifies the main worktree.
   path; otherwise install it or set `FREEBUFF_TMUX`.
 - `gh` authenticated for the PR column and for the generated brief. The tool
   still works without it with `--title`/`--url` or `--no-gh`.
+- `python3` is optional and used only by `gui --serve`; every other command
+  works without it.
 
 ## Install
 
@@ -270,6 +272,36 @@ rendered value is HTML-escaped, because branch names, PR URLs, commit subjects
 and the `tests` line are arbitrary text. The page is read-only: it offers no
 buttons that only pretend to act.
 
+## Browser GUI (read-only)
+
+`gui --serve` serves that page over HTTP from python3's standard library, with
+no third-party packages. `GET /` runs the same `gui --snapshot` renderer into a
+temporary file, so the server owns no second markup, and `/api/sessions` is
+`sessions --json` verbatim — the CLI stays the only source of state.
+
+```bash
+spawn-freebuff-agent gui --serve                    # http://127.0.0.1:7788
+spawn-freebuff-agent gui --serve --port 8080 --token "$TOKEN"
+spawn-freebuff-agent gui --serve --read-only
+```
+
+- `GET /` renders one card per session, including `worktree=missing` orphans.
+- `GET /api/sessions` returns `sessions --json` verbatim.
+- `GET /api/session/<name>/pane` returns `status NAME --json`, or 404 when the
+  name has no worktree.
+- Every POST is 403 with `--read-only`; the mutating routes are a later phase.
+- Codes: 401 for a missing or wrong token, 400 for a name that fails
+  `^[A-Za-z0-9_-]+$`, 404 for an unknown session, 403 in read-only mode.
+
+The token is compared in constant time and accepted as
+`Authorization: Bearer T`, as an `fb_token` cookie, or as `?token=T` on a GET
+that then sets the cookie. Without `--token`, one is generated and printed
+once to stderr; it is never written to a log file. The server binds
+`127.0.0.1` by default and refuses a non-loopback `--host` unless `--token`
+was given explicitly. Binding to `0.0.0.0` exposes the pane of every agent to
+the LAN, so use it only behind a reverse proxy (Caddy, Tailscale Serve) that
+terminates TLS — this server does not.
+
 ## The 180x55 rule
 
 The size is not cosmetic. At 120x40 the Freebuff TUI stays in canonical mode
@@ -312,8 +344,8 @@ at all.
 - The test suite is deviceless: a fake tmux serves fixture panes, several
   session names and recorded kills, so it covers the result protocol, state
   transitions, autostop and `gc` decisions, the `sessions` inventory, graceful
-  stop and the capacity pre-flight without a Freebuff session, account slot,
-  `gh` or network.
+  stop, the capacity pre-flight, and the read-only server's routes, auth and
+  bind rules without a Freebuff session, account slot, `gh` or network.
   It does not exercise the real TUI; verify marker changes with one controlled
   run when upgrading Freebuff.
 

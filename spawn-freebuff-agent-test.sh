@@ -604,6 +604,176 @@ bash "$TOOL" --root "$REPO" start --issue 998 --name test-custom \
 check contains "$(cat "$REPO/.worktrees/test-custom/.task.md")" 'Do the thing.'
 
 check contains "$(bash "$TOOL" --help 2>&1)" 'start'
+check contains "$(bash "$TOOL" --help 2>&1)" 'gui --serve'
+
+# ---- read-only server (#19) ----
+
+# The server shells out to sessions/status, so the same fake tmux is enough:
+# two inventory rows, one orphan, and arbitrary branch text to escape.
+fake_session test-999 "$IDLE_PANE"
+fake_add_session ghost
+printf 'state=blocked\npr=https://example.test/pr/19\ncommit=abc1234\ntests=server\n' \
+    >"$WT/.agent-result"
+git -C "$WT" branch -m 'evil<&"branch'
+
+if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
+    : >"$TMP/gui.out"
+    : >"$TMP/gui.err"
+    bash "$TOOL" --root "$REPO" gui --serve --port 0 --token s3cret \
+        >"$TMP/gui.out" 2>"$TMP/gui.err" &
+    gui_pid=$!
+    i=0
+    while [ "$i" -lt 100 ]; do
+        if grep -q '^listening=' "$TMP/gui.out" 2>/dev/null; then break; fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    base=$(sed -n 's/^listening=//p' "$TMP/gui.out" | head -n 1)
+    check test -n "$base"
+
+    # /api/sessions is sessions --json, verbatim: the same rows the CLI lists
+    code=$(curl -sS --max-time 10 -o "$TMP/gui.body" -w '%{http_code}' \
+        -H 'Authorization: Bearer s3cret' "$base/api/sessions" || true)
+    check test "$code" = 200
+    check json_ok "$(cat "$TMP/gui.body")"
+    check contains "$(cat "$TMP/gui.body")" '"name": "test-999"'
+    check contains "$(cat "$TMP/gui.body")" '"name": "ghost"'
+    check contains "$(cat "$TMP/gui.body")" '"worktree": "yes"'
+    check contains "$(cat "$TMP/gui.body")" '"worktree": "missing"'
+    api_names=$(python3 -c 'import json,sys
+print("\n".join(s["name"] for s in json.load(sys.stdin)))' \
+        <"$TMP/gui.body")
+    cli_names=$(bash "$TOOL" --root "$REPO" sessions --json |
+        python3 -c 'import json,sys
+print("\n".join(s["name"] for s in json.load(sys.stdin)))')
+    check test "$api_names" = "$cli_names"
+
+    # the dashboard is one page, escaped, with the orphan visibly worktree-less
+    code=$(curl -sS --max-time 10 -o "$TMP/gui.body" -w '%{http_code}' \
+        -H 'Authorization: Bearer s3cret' "$base/" || true)
+    check test "$code" = 200
+    check contains "$(cat "$TMP/gui.body")" 'freebuff agents'
+    check contains "$(cat "$TMP/gui.body")" 'no worktree'
+    check contains "$(cat "$TMP/gui.body")" 'test-999'
+    check contains "$(cat "$TMP/gui.body")" 'ghost'
+    check contains "$(cat "$TMP/gui.body")" 'evil&lt;&amp;&quot;branch'
+    case "$(cat "$TMP/gui.body")" in
+        *'evil<&"branch'*) check false ;;
+        *) check true ;;
+    esac
+
+    # the pane tail, and 404 for a name that does not exist
+    code=$(curl -sS --max-time 10 -o "$TMP/gui.body" -w '%{http_code}' \
+        -H 'Authorization: Bearer s3cret' \
+        "$base/api/session/test-999/pane" || true)
+    check test "$code" = 200
+    check json_ok "$(cat "$TMP/gui.body")"
+    check contains "$(cat "$TMP/gui.body")" 'Enter a coding task'
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+        -H 'Authorization: Bearer s3cret' "$base/api/session/nope/pane" || true)
+    check test "$code" = 404
+
+    # bad auth is 401; a crafted name never reaches a path and is 400
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+        "$base/api/sessions" || true)
+    check test "$code" = 401
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+        -H 'Authorization: Bearer wrong' "$base/api/sessions" || true)
+    check test "$code" = 401
+    code=$(curl -sS --max-time 10 --path-as-is -o /dev/null -w '%{http_code}' \
+        -H 'Authorization: Bearer s3cret' \
+        "$base/api/session/../etc/pane" || true)
+    check test "$code" = 400
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+        -H 'Authorization: Bearer s3cret' \
+        "$base/api/session/%2e%2e%2fetc/pane" || true)
+    check test "$code" = 400
+
+    # the token is accepted as a cookie too, and ?token= sets that cookie
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+        -H 'Cookie: fb_token=s3cret' "$base/api/sessions" || true)
+    check test "$code" = 200
+    curl -sS --max-time 10 -D "$TMP/gui.headers" -o /dev/null \
+        "$base/?token=s3cret" || true
+    check grep -qi '^set-cookie: fb_token=s3cret' "$TMP/gui.headers"
+    check grep -qi 'httponly' "$TMP/gui.headers"
+
+    # --read-only answers every POST with 403 and leaves GET alone
+    : >"$TMP/gui-ro.out"
+    bash "$TOOL" --root "$REPO" gui --serve --port 0 --token s3cret \
+        --read-only >"$TMP/gui-ro.out" 2>"$TMP/gui-ro.err" &
+    ro_pid=$!
+    i=0
+    while [ "$i" -lt 100 ]; do
+        if grep -q '^listening=' "$TMP/gui-ro.out" 2>/dev/null; then break; fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    ro_base=$(sed -n 's/^listening=//p' "$TMP/gui-ro.out" | head -n 1)
+    check test -n "$ro_base"
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X POST \
+        -H 'Authorization: Bearer s3cret' "$ro_base/api/sessions" || true)
+    check test "$code" = 403
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X POST \
+        -H 'Authorization: Bearer s3cret' \
+        "$ro_base/api/session/test-999/stop" || true)
+    check test "$code" = 403
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+        -H 'Authorization: Bearer s3cret' "$ro_base/api/sessions" || true)
+    check test "$code" = 200
+
+    # a generated token is printed once on startup and works
+    : >"$TMP/gui-gen.out"
+    : >"$TMP/gui-gen.err"
+    bash "$TOOL" --root "$REPO" gui --serve --port 0 \
+        >"$TMP/gui-gen.out" 2>"$TMP/gui-gen.err" &
+    gen_pid=$!
+    i=0
+    while [ "$i" -lt 100 ]; do
+        if grep -q '^listening=' "$TMP/gui-gen.out" 2>/dev/null; then break; fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    gen_base=$(sed -n 's/^listening=//p' "$TMP/gui-gen.out" | head -n 1)
+    gen_token=$(sed -n 's/^token=//p' "$TMP/gui-gen.err" | head -n 1)
+    check test -n "$gen_base"
+    check test -n "$gen_token"
+    check test "$(grep -c '^token=' "$TMP/gui-gen.err" || true)" = 1
+    check test "$(grep -c '^token=' "$TMP/gui-gen.out" || true)" = 0
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+        -H "Authorization: Bearer $gen_token" "$gen_base/api/sessions" || true)
+    check test "$code" = 200
+
+    kill "$gui_pid" "$ro_pid" "$gen_pid" 2>/dev/null || true
+    wait "$gui_pid" 2>/dev/null || true
+    wait "$ro_pid" 2>/dev/null || true
+    wait "$gen_pid" 2>/dev/null || true
+
+    # off-loopback without an explicit token is refused before anything binds
+    gui_port=$((20000 + $$ % 20000))
+    if bash "$TOOL" --root "$REPO" gui --serve --host 0.0.0.0 \
+        --port "$gui_port" >"$TMP/gui.refuse" 2>&1; then refused=0; else refused=$?; fi
+    check test "$refused" -ne 0
+    check contains "$(cat "$TMP/gui.refuse")" 'refusing to bind'
+    if curl -sS --max-time 2 "http://127.0.0.1:$gui_port/api/sessions" \
+        >/dev/null 2>&1; then still_listening=yes; else still_listening=no; fi
+    check test "$still_listening" = no
+
+    # without python3 the command explains itself and the CLI is untouched
+    nopy="$TMP/nopy"
+    bash_bin=$(command -v bash)
+    mkdir -p "$nopy"
+    ln -sf "$(command -v git)" "$nopy/git"
+    if PATH="$nopy" "$bash_bin" "$TOOL" --root "$REPO" gui --serve \
+        >"$TMP/gui.nopy" 2>&1; then nopy_rc=0; else nopy_rc=$?; fi
+    check test "$nopy_rc" -ne 0
+    check contains "$(cat "$TMP/gui.nopy")" 'needs python3'
+else
+    printf 'skip gui server checks: python3 or curl missing\n' >&2
+fi
+
+git -C "$WT" branch -m 'test/999'
+rm -f "$WT/.agent-result"
 
 git -C "$REPO" worktree remove --force "$WT" >/dev/null 2>&1 || true
 git -C "$REPO" worktree remove --force "$REPO/.worktrees/test-custom" >/dev/null 2>&1 || true
