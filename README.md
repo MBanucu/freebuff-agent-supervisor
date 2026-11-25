@@ -144,8 +144,10 @@ session_state=done          # live: done, idle, working, refused or missing
 ```bash
 spawn-freebuff-agent list
 spawn-freebuff-agent sessions
+spawn-freebuff-agent sessions --json
 spawn-freebuff-agent status 103-example --lines 40
 spawn-freebuff-agent status 103-example --no-gh
+spawn-freebuff-agent status 103-example --json
 spawn-freebuff-agent attach 103-example   # detach with Ctrl-b d
 spawn-freebuff-agent send 103-example "Also run the new test"
 spawn-freebuff-agent watch 103-example --idle-seconds 120 --poll 5
@@ -172,6 +174,51 @@ or `-`), the result state, the branch and the open PR. It starts from
 `tmux list-sessions`, so a session with no worktree appears there instead of
 only being found when `gc --all` kills it; `list` also names such orphans.
 `--no-gh` skips the PR column.
+
+### Machine-readable output
+
+`sessions --json` and `status NAME --json` emit the same data as the table and
+the `key=value` lines, for a GUI, a dashboard or a script. The human output is
+unchanged: `--json` is additive. There is no `jq` and no new dependency; the
+JSON is built in bash with a real string escaper, so a pane's tabs, newlines
+and the CR tmux leaves behind arrive as `\t`, `\n` and `\r` instead of raw
+bytes, and the rest of the control range becomes `\u00XX`.
+
+`sessions --json` is an array of objects in the table's order, `[]` when there
+is nothing to report. `state` is the table's STATE column: the live session
+state when it is running, the result state when it has stopped, so `state` can
+read `done` while `result` reads `blocked` — RESULT is what the agent wrote, not
+what the pane is doing.
+
+```json
+[
+  {
+    "name": "test-999",
+    "state": "done",
+    "idle_seconds": 30,
+    "watcher": "pid:123",
+    "worktree": "yes",
+    "result": "blocked",
+    "branch": "test/999",
+    "pr": null
+  }
+]
+```
+
+`status NAME --json` is one object with the same fields plus the detail view's:
+`running` and `dirty` as booleans, `input` (`raw|canonical|unknown`),
+`session_state`, `commit`, the `result_*` keys from `.agent-result`, and the
+pane tail as a `pane` string.
+
+A missing value is `null` rather than the table's `-`: `idle_seconds` when the
+session is not running, `result` with no `.agent-result`, `branch` and `pr` for
+a session with no worktree, `watcher` with no autostop recorded, and `pane`
+when no session is running. `status` keeps `state` identical to the human
+`state=` line (`unknown` when there is no result file) and adds
+`result_state`, which is `null` in that case, so a consumer can tell "nothing
+written yet" from "unusable state". `pr` in `sessions` is the row's PR URL;
+in `status` it is an array of `{"number", "url", "title"}`, empty when the
+branch has no open PR and `null` with `--no-gh` or no `gh`.
 
 `stop` is a hard kill. `stop --graceful` sends `Escape` to end the turn, waits
 up to `--wait` seconds (default 20) for the pane to reach `done`, `idle` or

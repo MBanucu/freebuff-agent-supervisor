@@ -55,20 +55,22 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       --dry-run          print the plan, change nothing
       --help             this text
 
-  spawn-freebuff-agent status NAME [--lines N] [--no-gh]
+  spawn-freebuff-agent status NAME [--lines N] [--no-gh] [--json]
       Show the session, input mode, result state, pane tail, branch, last
       commit and PR.
       --lines N   pane lines to show (default: 25)
       --no-gh     do not ask gh for the PR
+      --json      emit the same fields as one JSON object
 
   spawn-freebuff-agent list
       List worktrees with session state, running flag and idle time.
 
-  spawn-freebuff-agent sessions [--no-gh]
+  spawn-freebuff-agent sessions [--no-gh] [--json]
       One table over every fb-* session and every worktree: live state, idle
       time, attached autostop watcher, whether a worktree exists, the result
       state, the branch and the open PR. Sessions with no worktree are listed
-      here instead of only being reapable by gc --all.
+      here instead of only being reapable by gc --all. --json emits the same
+      rows as an array of objects.
 
   spawn-freebuff-agent attach NAME
       Attach to the tmux session (detach with Ctrl-b d).
@@ -225,6 +227,73 @@ result_state() {
         done|blocked|failed) printf '%s' "$state" ;;
         *) printf 'unknown' ;;
     esac
+}
+
+json_str() {
+    # json_str STRING -> a quoted JSON string. Session names are already
+    # restricted by valid_name, so only values need escaping: a pane carries
+    # tabs, newlines and CR from tmux, and prose may carry quotes and
+    # backslashes. This is not a general JSON writer, only a string escaper for
+    # values this tool produces. Byte-wise in the C locale so a multibyte glyph
+    # is re-emitted unchanged instead of being split.
+    local s=${1-} out='' c i
+    local LC_ALL=C
+    for ((i = 0; i < ${#s}; i++)); do
+        c=${s:i:1}
+        case "$c" in
+            '\') out+='\\' ;;
+            '"') out+='\"' ;;
+            $'\n') out+='\n' ;;
+            $'\r') out+='\r' ;;
+            $'\t') out+='\t' ;;
+            $'\b') out+='\b' ;;
+            $'\f') out+='\f' ;;
+            [[:cntrl:]])
+                printf -v c '\\u%04x' "'$c"
+                out+=$c
+                ;;
+            *) out+=$c ;;
+        esac
+    done
+    printf '"%s"' "$out"
+}
+
+json_nullable_str() {
+    # json_nullable_str VALUE -> "value", or null for empty and for the `-`
+    # placeholder the human views print for "not applicable"
+    if [ -n "${1:-}" ] && [ "$1" != '-' ]; then
+        json_str "$1"
+    else
+        printf 'null'
+    fi
+}
+
+json_nullable_num() {
+    # json_nullable_num VALUE -> a bare number, or null when it is not one
+    if is_num "${1:-}"; then
+        printf '%s' "$1"
+    else
+        printf 'null'
+    fi
+}
+
+pr_json_array() {
+    # pr_json_array "pr=#N URL TITLE" lines -> [{number,url,title}, ...]
+    # The human `pr=` lines already carry all three, so nesting them loses
+    # nothing. Empty input is [] rather than null: null means gh was not asked.
+    local line number url title first=1
+    printf '['
+    while IFS=$'\t' read -r number url title; do
+        case "$number" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        [ "$first" = 1 ] || printf ', '
+        first=0
+        printf '{"number": %s, "url": %s, "title": %s}' \
+            "$number" "$(json_str "$url")" "$(json_str "${title:-}")"
+    done <<<"$(printf '%s\n' "${1:-}" |
+        sed -E 's/^pr=#([0-9]+) ([^ ]+)( (.*))?$/\1\t\2\t\4/')"
+    printf ']'
 }
 
 session_state() {
@@ -539,11 +608,15 @@ start() {
 }
 
 status() {
-    local name="" lines=25 no_gh=0
+    # status NAME -> key=value lines by default, one JSON object with --json.
+    # Both views come from the same fields: the JSON is a serialization of the
+    # human output, not a second detection path.
+    local name="" lines=25 no_gh=0 json=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --lines) lines=${2:-}; shift 2 ;;
             --no-gh) no_gh=1; shift ;;
+            --json) json=1; shift ;;
             -h|--help) usage; exit 0 ;;
             -*) die "status: unsupported argument: $1" ;;
             *) name=$1; shift ;;
@@ -556,26 +629,33 @@ status() {
     esac
 
     local wt="$ROOT/.worktrees/$name" branch session tmux running=0 tty mode=unknown
-    local state result pane="" idle
+    local state rstate="" pane="" idle="" sstate="" last_commit dirty=no watcher=""
+    local result_pr="" result_commit="" result_tests="" prs="" pr_json=null
     [ -d "$wt" ] || die "status: no worktree at $wt"
     branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
     session="fb-$name"
     tmux=$(tmux_bin 2>/dev/null || true)
 
-    printf 'name=%s\nbranch=%s\nworktree=%s\nsession=%s\n' \
-        "$name" "$branch" "$wt" "$session"
+    if [ "$json" = 0 ]; then
+        printf 'name=%s\nbranch=%s\nworktree=%s\nsession=%s\n' \
+            "$name" "$branch" "$wt" "$session"
+    fi
 
     state=$(result_state "$wt")
     [ -n "$state" ] || state=unknown
-    printf 'state=%s\n' "$state"
+    if [ "$json" = 0 ]; then
+        printf 'state=%s\n' "$state"
+    fi
     if [ -f "$wt/$RESULT_FILE" ]; then
-        local pr commit tests
-        pr=$(result_key "$wt/$RESULT_FILE" pr)
-        commit=$(result_key "$wt/$RESULT_FILE" commit)
-        tests=$(result_key "$wt/$RESULT_FILE" tests)
-        [ -z "$pr" ] || printf 'result_pr=%s\n' "$pr"
-        [ -z "$commit" ] || printf 'result_commit=%s\n' "$commit"
-        [ -z "$tests" ] || printf 'result_tests=%s\n' "$tests"
+        rstate=$state
+        result_pr=$(result_key "$wt/$RESULT_FILE" pr)
+        result_commit=$(result_key "$wt/$RESULT_FILE" commit)
+        result_tests=$(result_key "$wt/$RESULT_FILE" tests)
+        if [ "$json" = 0 ]; then
+            [ -z "$result_pr" ] || printf 'result_pr=%s\n' "$result_pr"
+            [ -z "$result_commit" ] || printf 'result_commit=%s\n' "$result_commit"
+            [ -z "$result_tests" ] || printf 'result_tests=%s\n' "$result_tests"
+        fi
     fi
 
     if [ -n "$tmux" ] && "$tmux" has-session -t "$session" 2>/dev/null; then
@@ -586,38 +666,84 @@ status() {
         else
             mode=canonical
         fi
-        printf 'running=yes\ninput=%s\n' "$mode"
-        printf 'session_state=%s\n' "$(session_state "$name")"
+        sstate=$(session_state "$name")
         idle=$(idle_seconds "$name" || true)
-        [ -z "$idle" ] || printf 'idle_seconds=%s\n' "$idle"
         pane=$("$tmux" capture-pane -p -t "$session" -S "-$lines" 2>/dev/null || true)
+        if [ "$json" = 0 ]; then
+            printf 'running=yes\ninput=%s\n' "$mode"
+            printf 'session_state=%s\n' "$sstate"
+            [ -z "$idle" ] || printf 'idle_seconds=%s\n' "$idle"
+        fi
     else
-        printf 'running=no\nsession_state=missing\n'
+        sstate=missing
+        if [ "$json" = 0 ]; then
+            printf 'running=no\nsession_state=missing\n'
+        fi
     fi
 
-    printf 'commit=%s\n' "$(git -C "$wt" log -1 --oneline 2>/dev/null || true)"
+    last_commit=$(git -C "$wt" log -1 --oneline 2>/dev/null || true)
     if [ -n "$(git -C "$wt" status --short 2>/dev/null || true)" ]; then
-        printf 'dirty=yes\n'
+        dirty=yes
     else
-        printf 'dirty=no\n'
+        dirty=no
+    fi
+    if [ "$json" = 0 ]; then
+        printf 'commit=%s\n' "$last_commit"
+        printf 'dirty=%s\n' "$dirty"
     fi
 
     if [ "$no_gh" = 0 ]; then
-        local slug prs
+        local slug
         slug=$(repo_slug || true)
         if [ -n "$slug" ] && command -v "${GH_BIN:-gh}" >/dev/null 2>&1; then
             prs=$("${GH_BIN:-gh}" pr list -R "$slug" --head "$branch" --state open \
                 --json number,url,title \
                 --jq '.[] | "pr=#\(.number) \(.url) \(.title)"' 2>/dev/null || true)
             if [ -n "$prs" ]; then
-                printf '%s\n' "$prs"
+                if [ "$json" = 0 ]; then
+                    printf '%s\n' "$prs"
+                else
+                    pr_json=$(pr_json_array "$prs")
+                fi
             else
-                printf 'pr=none\n'
+                if [ "$json" = 0 ]; then
+                    printf 'pr=none\n'
+                else
+                    pr_json='[]'
+                fi
             fi
         fi
     fi
 
-    [ -z "$pane" ] || printf '%s\n' "$pane"
+    if [ "$json" = 0 ]; then
+        [ -z "$pane" ] || printf '%s\n' "$pane"
+        return 0
+    fi
+
+    # `state` mirrors the human `state=` line, including its `unknown`
+    # placeholder; `result_state` is null when there is no result file at all,
+    # so a consumer can tell "nothing written yet" from "unusable state".
+    watcher=$(watcher_state "$wt")
+    printf '{\n'
+    printf '  "name": %s,\n' "$(json_str "$name")"
+    printf '  "branch": %s,\n' "$(json_str "$branch")"
+    printf '  "worktree": %s,\n' "$(json_str "$wt")"
+    printf '  "session": %s,\n' "$(json_str "$session")"
+    printf '  "state": %s,\n' "$(json_str "$state")"
+    printf '  "result_state": %s,\n' "$(json_nullable_str "$rstate")"
+    printf '  "result_pr": %s,\n' "$(json_nullable_str "$result_pr")"
+    printf '  "result_commit": %s,\n' "$(json_nullable_str "$result_commit")"
+    printf '  "result_tests": %s,\n' "$(json_nullable_str "$result_tests")"
+    printf '  "running": %s,\n' "$([ "$running" = 1 ] && printf true || printf false)"
+    printf '  "input": %s,\n' "$(json_str "$mode")"
+    printf '  "session_state": %s,\n' "$(json_str "$sstate")"
+    printf '  "idle_seconds": %s,\n' "$(json_nullable_num "$idle")"
+    printf '  "watcher": %s,\n' "$(json_nullable_str "$watcher")"
+    printf '  "commit": %s,\n' "$(json_nullable_str "$last_commit")"
+    printf '  "dirty": %s,\n' "$([ "$dirty" = yes ] && printf true || printf false)"
+    printf '  "pr": %s,\n' "$pr_json"
+    printf '  "pane": %s\n' "$(json_nullable_str "$pane")"
+    printf '}\n'
 }
 
 list_agents() {
@@ -703,12 +829,14 @@ live_session_count() {
 
 sessions() {
     # sessions -> one table over every fb-* session and every worktree, so a
-    # session with no worktree is visible before gc --all reaps it
-    local no_gh=0 name wt worktree running state idle activity now idle_secs
+    # session with no worktree is visible before gc --all reaps it. --json is a
+    # serialization of the same rows: one array of objects, `[]` when empty.
+    local no_gh=0 json=0 name wt worktree running state idle activity now idle_secs
     local watcher result branch pr prs="" slug="" tmux total=0 live=0 trees=0
-    local names=() x
+    local names=() x first=1
     while [ $# -gt 0 ]; do
         case "$1" in
+            --json) json=1; shift ;;
             --no-gh) no_gh=1; shift ;;
             -h|--help) usage; exit 0 ;;
             *) die "sessions: unsupported argument: $1" ;;
@@ -732,7 +860,11 @@ sessions() {
     done
 
     if [ ${#names[@]} -eq 0 ]; then
-        note 'no sessions'
+        if [ "$json" = 1 ]; then
+            printf '[]\n'
+        else
+            note 'no sessions'
+        fi
         return 0
     fi
     mapfile -t names < <(printf '%s\n' "${names[@]}" | LC_ALL=C sort)
@@ -747,7 +879,9 @@ sessions() {
         fi
     fi
 
-    if [ -n "$prs" ]; then
+    if [ "$json" = 1 ]; then
+        printf '[\n'
+    elif [ -n "$prs" ]; then
         printf '%-22s %-9s %-8s %-9s %-9s %-9s %-24s %s\n' \
             NAME STATE IDLE WATCHER WORKTREE RESULT BRANCH PR
     else
@@ -758,6 +892,8 @@ sessions() {
     for name in "${names[@]}"; do
         wt="$ROOT/.worktrees/$name"
         total=$((total + 1))
+        idle_secs=""
+        pr=""
         if [ -d "$wt" ]; then
             worktree=yes
             trees=$((trees + 1))
@@ -793,6 +929,22 @@ sessions() {
         if [ -n "$prs" ] && [ "$branch" != '-' ]; then
             pr=$(printf '%s\n' "$prs" |
                 awk -v b="$branch" '$1 == b { print $2; exit }')
+        fi
+
+        if [ "$json" = 1 ]; then
+            [ "$first" = 1 ] || printf ',\n'
+            first=0
+            printf '  {\n'
+            printf '    "name": %s,\n' "$(json_str "$name")"
+            printf '    "state": %s,\n' "$(json_nullable_str "$state")"
+            printf '    "idle_seconds": %s,\n' "$(json_nullable_num "$idle_secs")"
+            printf '    "watcher": %s,\n' "$(json_nullable_str "$watcher")"
+            printf '    "worktree": %s,\n' "$(json_str "$worktree")"
+            printf '    "result": %s,\n' "$(json_nullable_str "$result")"
+            printf '    "branch": %s,\n' "$(json_nullable_str "$branch")"
+            printf '    "pr": %s\n' "$(json_nullable_str "$pr")"
+            printf '  }'
+        elif [ -n "$prs" ] && [ "$branch" != '-' ]; then
             [ -n "$pr" ] || pr=-
             printf '%-22s %-9s %-8s %-9s %-9s %-9s %-24s %s\n' \
                 "$name" "$state" "$idle" "$watcher" "$worktree" "$result" \
@@ -804,8 +956,12 @@ sessions() {
         fi
     done
 
-    printf 'sessions=%s running=%s worktrees=%s orphans=%s\n' \
-        "$total" "$live" "$trees" "$((total - trees))"
+    if [ "$json" = 1 ]; then
+        printf '\n]\n'
+    else
+        printf 'sessions=%s running=%s worktrees=%s orphans=%s\n' \
+            "$total" "$live" "$trees" "$((total - trees))"
+    fi
 }
 
 reap() {
