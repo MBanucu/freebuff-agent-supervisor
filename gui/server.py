@@ -8,6 +8,7 @@ those print. Standard library only (`http.server`), no third-party packages.
 Routes:
   GET  /                       the page `gui --snapshot` writes
   GET  /api/sessions           `sessions --json`, verbatim
+  GET  /tty/N                  302 to a ttyd viewing `tmux attach -t fb-N`
   GET  /api/session/N/pane     `status N --json`, verbatim
   POST /api/session/N/stop     `stop N`, plus `--graceful` with ?graceful=1
   POST /api/session/N/send     `send N TEXT`, text from a JSON body
@@ -36,10 +37,14 @@ import json
 import os
 import re
 import secrets
+import shutil
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
@@ -55,6 +60,12 @@ TOOL = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "spawn-freebuff-agent",
 )
+# ttyd is read-only by default: `-W` is the flag that lets a client type, so a
+# viewer is read-only exactly when `-W` is absent. ttyd 1.7.x has no `-R`.
+TTYD_USER = "fb"
+TTYD_READY_SECONDS = 5.0
+TTYD_MISSING = ("terminal links disabled: ttyd not found; "
+                "install ttyd or set FREEBUFF_TTYD")
 
 
 def valid_name(name):
@@ -81,14 +92,127 @@ def is_loopback(host):
         return False
 
 
+def ttyd_bin():
+    """The ttyd executable, or None.
+
+    `FREEBUFF_TTYD` wins over PATH, and a value that is not executable means
+    "no ttyd" without falling back: that is how a test or an operator says
+    the feature is unavailable on a machine that happens to have it installed.
+    """
+    configured = os.environ.get("FREEBUFF_TTYD")
+    if configured:
+        return configured if os.access(configured, os.X_OK) else None
+    return shutil.which("ttyd")
+
+
+def tmux_bin():
+    """Like `tmux_bin` in the bash tool: FREEBUFF_TMUX, then PATH."""
+    return os.environ.get("FREEBUFF_TMUX") or shutil.which("tmux")
+
+
+def free_port():
+    """A loopback port the kernel says is free right now.
+
+    ttyd takes `-p 0` but never reports which port it bound, so pick one and
+    let the readiness probe catch the unlikely race.
+    """
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def port_open(port):
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            return True
+    except OSError:
+        return False
+
+
 class Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, handler, root, token, read_only):
+    def __init__(self, address, handler, root, token, read_only,
+                 ttyd=None, ttyd_wanted=False, interactive=False):
         super().__init__(address, handler)
         self.root = root
         self.token = token
         self.read_only = read_only
+        self.ttyd = ttyd
+        self.ttyd_wanted = ttyd_wanted
+        self.interactive = interactive
+        # name -> (port, process); one viewer per session, started on demand.
+        self.viewers = {}
+        self.viewers_lock = threading.Lock()
+
+    def viewer(self, name):
+        """(port, proc, error): the running viewer for NAME or a new one.
+
+        One ttyd per session while its tab is open, so a second click reuses
+        it instead of starting a second fleet member. `-o` makes ttyd exit
+        when its single client disconnects, so a closed tab leaves nothing
+        behind.
+        """
+        with self.viewers_lock:
+            current = self.viewers.get(name)
+            if current is not None and current[1].poll() is None:
+                return current[0], current[1], None
+            self.viewers.pop(name, None)
+            tmux = tmux_bin()
+            if not tmux:
+                return None, None, "tmux not found; set FREEBUFF_TMUX"
+            port = free_port()
+            argv = [
+                self.ttyd, "-p", str(port),
+                # Loopback only: ttyd is never exposed beyond this host.
+                "-i", "127.0.0.1",
+                "-c", "%s:%s" % (TTYD_USER, self.token),
+                "-o",
+            ]
+            if self.interactive:
+                argv.append("-W")
+            argv += [tmux, "attach", "-t", "fb-" + name]
+            try:
+                proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.PIPE)
+            except OSError as exc:
+                return None, None, "cannot start ttyd: %s" % exc
+            error = self._wait_listening(proc, port)
+            if error:
+                return None, None, error
+            self.viewers[name] = (port, proc)
+            return port, proc, None
+
+    @staticmethod
+    def _wait_listening(proc, port):
+        deadline = time.monotonic() + TTYD_READY_SECONDS
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                try:
+                    message = proc.stderr.read().decode("utf-8", "replace")
+                except (OSError, ValueError):
+                    message = ""
+                proc.stderr.close()
+                message = message.strip() or "status %d" % proc.returncode
+                return "ttyd exited: %s" % message
+            if port_open(port):
+                return None
+            time.sleep(0.05)
+        proc.terminate()
+        return "ttyd did not listen on 127.0.0.1:%d" % port
+
+    def shutdown_viewers(self):
+        with self.viewers_lock:
+            viewers, self.viewers = self.viewers, {}
+        for _, proc in viewers.values():
+            if proc.poll() is None:
+                proc.terminate()
+        for _, proc in viewers.values():
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
 
 class Server6(Server):
@@ -211,6 +335,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self._dashboard(extra)
             if segments == ["api", "sessions"]:
                 return self._proxy(["sessions", "--json"], 500, extra)
+            # /tty/<name>: the dashboard's terminal link. The name is
+            # unquoted already, so valid_name runs before anything else.
+            if len(segments) == 2 and segments[0] == "tty":
+                return self._terminal(segments[1], extra)
             # Validate the name before it can reach a path or a subprocess.
             # Take everything between the prefix and /pane so that a crafted
             # `../etc` is a 400, not a 404 that never looked at the name.
@@ -271,6 +399,39 @@ class Handler(BaseHTTPRequestHandler):
                 and len(path) > len(prefix) + len(suffix)):
             return unquote(path[len(prefix):-len(suffix)])
         return None
+
+    def _terminal(self, name, extra):
+        """Answer the terminal link by starting (or reusing) a ttyd viewer.
+
+        The browser is redirected to the viewer's own loopback URL; the ttyd
+        port carries basic auth derived from this server's token, so the
+        redirect never exposes an unauthenticated terminal.
+        """
+        if not valid_name(name):
+            return self._json(400, {"error": "invalid name"}, extra=extra)
+        if not self.server.ttyd:
+            return self._json(503, {"error": TTYD_MISSING}, extra=extra)
+        if not self._known(name):
+            return self._json(404, {"error": "unknown session"}, extra=extra)
+        if not self._running(name):
+            return self._json(
+                409, {"error": "fb-%s is not running" % name}, extra=extra)
+        port, _, error = self.server.viewer(name)
+        if error:
+            return self._json(500, {"error": error}, extra=extra)
+        self._send(302, b"", "text/plain; charset=utf-8",
+                   extra=extra + [("Location", "http://127.0.0.1:%d/" % port)])
+
+    def _running(self, name):
+        tmux = tmux_bin()
+        if not tmux:
+            return False
+        try:
+            result = subprocess.run([tmux, "has-session", "-t", "fb-" + name],
+                                    capture_output=True, timeout=CLI_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return result.returncode == 0
 
     def _known(self, name):
         """Whether the inventory knows this name: its worktree exists.
@@ -348,7 +509,14 @@ class Handler(BaseHTTPRequestHandler):
         # page the browser gets is byte-for-byte what `gui --snapshot` writes.
         with tempfile.TemporaryDirectory(prefix="freebuff-gui-") as tmp:
             path = os.path.join(tmp, "dashboard.html")
-            result = self._run(["gui", "--snapshot", path])
+            argv = ["gui", "--snapshot", path]
+            if self.server.ttyd:
+                # The renderer owns the markup; it only has to know that a
+                # terminal link exists and where it points.
+                argv.append("--terminal-links")
+            elif self.server.ttyd_wanted:
+                argv += ["--terminal-note", TTYD_MISSING]
+            result = self._run(argv)
             if result.returncode != 0:
                 message = (result.stderr or result.stdout).decode(
                     "utf-8", "replace").strip() or "snapshot failed"
@@ -378,6 +546,10 @@ def parse_args(argv):
                         help="bearer token; generated and printed once if omitted")
     parser.add_argument("--read-only", action="store_true",
                         help="refuse every POST with 403")
+    parser.add_argument("--ttyd", action="store_true",
+                        help="add a terminal link per session, served by ttyd")
+    parser.add_argument("--interactive", action="store_true",
+                        help="let the ttyd viewer type (needs --ttyd)")
     return parser.parse_args(argv)
 
 
@@ -393,6 +565,17 @@ def main(argv=None):
     if not os.path.isfile(TOOL):
         print("gui: missing %s" % TOOL, file=sys.stderr)
         return 2
+    if args.interactive and not args.ttyd:
+        print("gui: --interactive needs --ttyd", file=sys.stderr)
+        return 2
+    if args.interactive and args.read_only:
+        print("gui: --interactive cannot be combined with --read-only: a "
+              "read-only server must not offer a writable terminal",
+              file=sys.stderr)
+        return 2
+    # Missing ttyd is not fatal: the dashboard renders without terminal
+    # links and says why, instead of failing the whole server.
+    ttyd = ttyd_bin() if args.ttyd else None
 
     generated = not args.token
     token = args.token or secrets.token_urlsafe(24)
@@ -401,7 +584,8 @@ def main(argv=None):
         httpd = server_class(
             (args.host, args.port), Handler,
             root=os.path.abspath(args.root), token=token,
-            read_only=args.read_only)
+            read_only=args.read_only, ttyd=ttyd,
+            ttyd_wanted=args.ttyd, interactive=args.interactive)
     except OSError as exc:
         print("gui: cannot listen on %s:%s: %s" % (args.host, args.port, exc),
               file=sys.stderr)
@@ -414,16 +598,30 @@ def main(argv=None):
           flush=True)
     print("root=%s" % os.path.abspath(args.root), flush=True)
     print("read_only=%s" % ("yes" if args.read_only else "no"), flush=True)
+    if args.ttyd:
+        print("ttyd=%s" % ("yes" if ttyd else "missing"), flush=True)
+        if ttyd:
+            print("ttyd_path=%s" % ttyd, flush=True)
+            print("interactive=%s" % ("yes" if args.interactive else "no"),
+                  flush=True)
+        else:
+            print("note=%s" % TTYD_MISSING, flush=True)
     if generated:
         print("token=%s" % token, file=sys.stderr)
         print("generated token: shown once, pass it with --token next time",
               file=sys.stderr)
+
+    # A viewer is a child process, so a SIGTERM (a supervisor stopping the
+    # server) has to unwind through the cleanup below instead of exiting
+    # outright and leaving ttyd behind.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        httpd.shutdown_viewers()
         httpd.server_close()
     return 0
 

@@ -31,6 +31,8 @@ anything, and it never modifies the main worktree.
   still works without it with `--title`/`--url` or `--no-gh`.
 - `python3` is optional and used only by `gui --serve`; every other command
   works without it.
+- `ttyd` is optional and used only by `gui --serve --ttyd` (or
+  `FREEBUFF_TTYD`); without it the dashboard simply has no terminal links.
 
 ## Install
 
@@ -283,9 +285,11 @@ temporary file, so the server owns no second markup, and `/api/sessions` is
 spawn-freebuff-agent gui --serve                    # http://127.0.0.1:7788
 spawn-freebuff-agent gui --serve --port 8080 --token "$TOKEN"
 spawn-freebuff-agent gui --serve --read-only
+spawn-freebuff-agent gui --serve --ttyd             # terminal link per card
 ```
 
 - `GET /` renders one card per session, including `worktree=missing` orphans.
+- `GET /tty/<name>` redirects to a ttyd viewer for that session, with `--ttyd`.
 - `GET /api/sessions` returns `sessions --json` verbatim.
 - `GET /api/session/<name>/pane` returns `status NAME --json`, or 404 when the
   name has no worktree.
@@ -298,6 +302,46 @@ spawn-freebuff-agent gui --serve --read-only
   `^[A-Za-z0-9_-]+$` or a body that is not JSON, 404 for an unknown session
   (no worktree, the pane route's rule), 403 in read-only mode, 409 when the CLI
   refuses, 413 for a body over 64 KiB.
+
+### Live terminal through ttyd
+
+`gui --serve --ttyd` adds a `terminal` link to every session card that has a
+worktree. Following it is `GET /tty/<name>`, which starts one ttyd for that
+session on demand and redirects the browser to it:
+
+```
+ttyd -p PORT -i 127.0.0.1 -c fb:TOKEN -o tmux attach -t fb-<name>
+```
+
+- **Read-only by default.** ttyd is read-only unless `-W` is passed, so a
+  default viewer carries no write flag at all. ttyd 1.7.x has no `-R`: it was
+  removed when read-only became the default, which is why the issue that asked
+  for `-R` is implemented as "no `-W`". `--interactive` adds `-W` and is the
+  only way to type into an agent from a browser.
+- **Loopback and authenticated.** `-i 127.0.0.1` keeps the viewer on this host
+  and `-c fb:<token>` derives basic auth from the server token, so the redirect
+  never points at an unauthenticated port. The browser asks once for the
+  credential: user `fb`, password the GUI token.
+- **One viewer per session.** A second click reuses the running ttyd instead of
+  starting another, `-o` makes ttyd exit when its tab disconnects, and the
+  server terminates any viewer still running when it stops (including on
+  `SIGTERM`).
+- **`--read-only` refuses `--interactive`** at startup with exit 2 rather than
+  silently downgrading it.
+- **Codes:** `302` to the viewer, `409` when `fb-<name>` is not running, `404`
+  for a name with no worktree, `400` for a name that fails the same validation
+  as every other route, and `503` when ttyd is missing.
+- **Without ttyd** the server still starts: the dashboard renders with no
+  terminal links and one line saying why, instead of returning a 500.
+
+`FREEBUFF_TTYD` names the binary. When it is set, PATH is not consulted, so
+pointing it at a path that does not exist means "no ttyd" — useful on a
+machine that has one installed but should not offer it.
+
+Maintenance caveat: ttyd's last tag is 1.7.7 (March 2024). The repository still
+receives commits, but distro packages lag, so check `ttyd --version` before
+relying on a packaged build. The integration is optional for exactly that
+reason: without ttyd everything else behaves as before.
 
 An action is one CLI call and nothing else: it answers `202` with the CLI's own
 `key=value` lines, so there is no second result vocabulary to keep in step. On
