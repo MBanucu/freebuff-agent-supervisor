@@ -99,6 +99,15 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       fb-* sessions whose worktree no longer exists. Busy and approval
       panes are skipped. Worktrees and branches are never removed.
 
+  spawn-freebuff-agent gui --serve [--port N] [--host H] [--token T] [--read-only]
+      Serve a read-only dashboard and JSON API from python3's standard
+      library: GET / (the session cards), GET /api/sessions (sessions
+      --json, verbatim) and GET /api/session/<name>/pane (status --json).
+      Binds 127.0.0.1:7788 by default; a non-loopback host is refused unless
+      --token is given. Without --token one is generated and printed once.
+      --read-only answers every POST with 403. No TLS: put a reverse proxy
+      in front for LAN or Tailscale access.
+
 Environment:
   FREEBUFF_BIN        freebuff executable (default: freebuff on PATH)
   FREEBUFF_TMUX       tmux executable (default: tmux on PATH, then nix-shell)
@@ -1209,6 +1218,37 @@ gc() {
     done
 }
 
+gui() {
+    # gui --serve [--port N] [--host H] [--token T] [--read-only]
+    # The server itself is gui/server.py; python3 stays optional so the rest
+    # of the CLI works on a host that does not have it.
+    local serve=0 py dir
+    local passthrough=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --serve) serve=1; shift ;;
+            --port|--host|--token)
+                [ $# -ge 2 ] || die "gui: $1 needs a value"
+                passthrough+=("$1" "$2"); shift 2 ;;
+            --read-only) passthrough+=(--read-only); shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "gui: unsupported argument: $1" ;;
+        esac
+    done
+    [ "$serve" = 1 ] || die "gui: --serve is required"
+    py=$(command -v python3 2>/dev/null || true)
+    [ -n "$py" ] ||
+        die "gui: --serve needs python3 (pkg install python on Termux); the rest of the CLI works without it"
+    case "$0" in
+        */*) dir=$(cd "$(dirname "$0")" && pwd) ;;
+        *) dir=$(cd "$(dirname "$(command -v "$0" 2>/dev/null || printf '%s' "$0")")" && pwd) ;;
+    esac
+    [ -f "$dir/gui/server.py" ] ||
+        die "gui: gui/server.py is missing next to the tool"
+    exec "$py" "$dir/gui/server.py" --root "$ROOT" \
+        ${passthrough[@]+"${passthrough[@]}"}
+}
+
 attach() {
     local name=${1:-} tmux
     [ -n "$name" ] || die "attach: NAME is required"
@@ -1323,6 +1363,7 @@ case "$cmd" in
     watch) watch "$@" ;;
     autostop) autostop "$@" ;;
     gc) gc "$@" ;;
+    gui) gui "$@" ;;
     stop) stop "$@" ;;
     -h|--help|help) usage ;;
     '') usage; exit 2 ;;
