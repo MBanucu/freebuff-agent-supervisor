@@ -80,6 +80,7 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       --no-gh     do not ask gh for the PR
 
   spawn-freebuff-agent gui --serve [--port N] [--host H] [--token T] [--read-only]
+                              [--ttyd [--interactive]]
       Serve the dashboard and JSON API from python3's standard library:
       GET / is the --snapshot page, GET /api/sessions is `sessions --json`
       verbatim and GET /api/session/<name>/pane is `status --json`. POST
@@ -90,6 +91,12 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       one is generated and printed once. Every POST needs the token even on
       loopback; --read-only answers them 403. No TLS: put a reverse proxy in
       front for LAN or Tailscale access.
+      --ttyd          add a terminal link per session; GET /tty/<name> starts
+                      one loopback ttyd of `tmux attach -t fb-<name>` on
+                      demand and redirects to it. Read-only unless
+                      --interactive, which adds ttyd's -W.
+      --interactive   let the browser type into the agent; refused with
+                      --read-only
 
   spawn-freebuff-agent attach NAME
       Attach to the tmux session (detach with Ctrl-b d).
@@ -121,6 +128,7 @@ Spawn parallel Freebuff agents in isolated git worktrees.
 Environment:
   FREEBUFF_BIN        freebuff executable (default: freebuff on PATH)
   FREEBUFF_TMUX       tmux executable (default: tmux on PATH, then nix-shell)
+  FREEBUFF_TTYD       ttyd executable for gui --ttyd (default: ttyd on PATH)
   FREEBUFF_SUPERVISOR_ROOT  repository root override (tests)
   GH_BIN              gh executable (default: gh on PATH)
 
@@ -361,11 +369,13 @@ state_class() {
 }
 
 snapshot_html() {
-    # snapshot_html FILE JSON WATCH -> one self-contained page. `sessions
-    # --json` is the input: fixed keys, one per line, so the reader below is a
-    # field scan rather than a general JSON parser. WATCH is empty for a one
-    # shot snapshot and a whole number of seconds for the meta refresh.
-    local file="$1" json="$2" watch="$3"
+    # snapshot_html FILE JSON WATCH [LINK_PREFIX] [NOTE] -> one self-contained
+    # page. `sessions --json` is the input: fixed keys, one per line, so the
+    # reader below is a field scan rather than a general JSON parser. WATCH is
+    # empty for a one shot snapshot and a whole number of seconds for the meta
+    # refresh. LINK_PREFIX is `/tty/` when the served page should carry a
+    # terminal link per session; NOTE is one line under the header.
+    local file="$1" json="$2" watch="$3" link_prefix=${4:-} note_text=${5:-}
     local line key value name state idle watcher worktree result branch pr
     local tests="" commit="" wt generated total=0 live=0 trees=0 cards='' card
     local cls pr_html refresh=''
@@ -414,6 +424,12 @@ snapshot_html() {
                 card+="<dt>worktree</dt><dd>$(html_escape "$worktree")</dd>"$'\n'
                 card+="<dt>result</dt><dd>$(html_escape "${result:--}")</dd>"$'\n'
                 card+="<dt>branch</dt><dd><code>$(html_escape "${branch:--}")</code></dd>"$'\n'
+                # A terminal link exists only for a served page with ttyd
+                # behind it, and only for a name the tool accepts.
+                if [ -n "$link_prefix" ] && [ "$worktree" = yes ] &&
+                    valid_name "$name"; then
+                    card+="<dt>terminal</dt><dd><a href=\"$(html_escape "$link_prefix$name")\">open in ttyd</a></dd>"$'\n'
+                fi
                 if [ -n "$pr" ]; then
                     case "$pr" in
                         http://*|https://*)
@@ -482,6 +498,7 @@ body { margin: 0; padding: 1.25rem; background: var(--bg); color: var(--fg);
 .page h1 { margin: 0 0 .15rem; font-size: 1.35rem; }
 .meta { margin: 0 0 1.25rem; color: var(--muted); font-size: .85rem;
   overflow-wrap: anywhere; }
+.note { margin: -0.9rem 0 1.25rem; color: var(--working); font-size: .85rem; }
 .grid { display: grid; gap: .9rem;
   grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); }
 .card { background: var(--card); border: 1px solid var(--line);
@@ -514,6 +531,9 @@ CSS
         printf '<p class="meta">repo %s · generated %s · sessions %s · running %s · worktrees %s · orphans %s</p>\n' \
             "$(html_escape "$ROOT")" "$generated" "$total" "$live" \
             "$trees" "$((total - trees))"
+        if [ -n "$note_text" ]; then
+            printf '<p class="note">%s</p>\n' "$(html_escape "$note_text")"
+        fi
         printf '</header>\n<main class="grid">\n'
         if [ "$total" = 0 ]; then
             printf '<p class="empty">no sessions</p>\n'
@@ -1466,6 +1486,7 @@ gui() {
     # The server itself is gui/server.py; python3 stays optional so the rest
     # of the CLI works on a host that does not have it.
     local snapshot='' watch='' no_gh=0 serve=0 first=1 json args py dir
+    local links='' note_text='' ttyd=0 interactive=0
     local passthrough=()
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -1473,6 +1494,10 @@ gui() {
             --watch) watch=${2:-}; shift 2 ;;
             --no-gh) no_gh=1; shift ;;
             --serve) serve=1; shift ;;
+            --ttyd) ttyd=1; passthrough+=(--ttyd); shift ;;
+            --interactive) interactive=1; passthrough+=(--interactive); shift ;;
+            --terminal-links) links=/tty/; shift ;;
+            --terminal-note) note_text=${2:-}; shift 2 ;;
             --port|--host|--token)
                 [ $# -ge 2 ] || die "gui: $1 needs a value"
                 passthrough+=("$1" "$2"); shift 2 ;;
@@ -1481,6 +1506,10 @@ gui() {
             *) die "gui: unsupported argument: $1" ;;
         esac
     done
+
+    if [ "$serve" = 0 ] && { [ "$ttyd" = 1 ] || [ "$interactive" = 1 ]; }; then
+        die "gui: --ttyd and --interactive belong to --serve"
+    fi
 
     if [ "$serve" = 1 ]; then
         [ -z "$snapshot" ] ||
@@ -1510,7 +1539,7 @@ gui() {
             args+=(--no-gh)
         fi
         json=$(sessions "${args[@]}")
-        snapshot_html "$snapshot" "$json" "$watch"
+        snapshot_html "$snapshot" "$json" "$watch" "$links" "$note_text"
         if [ "$first" = 1 ]; then
             note "snapshot=$snapshot"
             [ -z "$watch" ] || note "watch_seconds=$watch"

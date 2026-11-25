@@ -878,6 +878,182 @@ print("\n".join(s["name"] for s in json.load(sys.stdin)))')
         >"$TMP/gui.nopy" 2>&1; then nopy_rc=0; else nopy_rc=$?; fi
     check test "$nopy_rc" -ne 0
     check contains "$(cat "$TMP/gui.nopy")" 'needs python3'
+
+    # ---- live terminal through ttyd (#20) ----
+    # A fake ttyd records its argv and holds the port open, so the read-only
+    # posture, the credentials, the target and the loopback bind are all
+    # checkable without a real ttyd, a browser or a Freebuff session.
+    TTYD_DIR="$TMP/ttyd"
+    mkdir -p "$TTYD_DIR"
+    cat >"$TMP/bin/ttyd" <<'FAKE_TTYD'
+#!/usr/bin/env bash
+# argv on separate lines, then hold the port so the server's readiness probe
+# succeeds and the HTTP redirect can be observed.
+d=${FAKE_TTYD_DIR:?}
+port=''
+for arg in "$@"; do
+    printf '%s\n' "$arg" >>"$d/ttyd_argv"
+done
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -p) port=$2; shift 2 ;;
+        *) shift ;;
+    esac
+done
+printf '%s\n' "$$" >"$d/ttyd_pid"
+exec python3 - "$port" <<'HOLD'
+import socket, sys, time
+sock = socket.socket()
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(("127.0.0.1", int(sys.argv[1])))
+sock.listen(8)
+time.sleep(120)
+HOLD
+FAKE_TTYD
+    chmod +x "$TMP/bin/ttyd"
+    export FREEBUFF_TTYD="$TMP/bin/ttyd"
+    export FAKE_TTYD_DIR="$TTYD_DIR"
+    : >"$TTYD_DIR/ttyd_argv"
+    : >"$TTYD_DIR/ttyd_pid"
+    fake_session test-999 "$IDLE_PANE"
+
+    bash "$TOOL" --root "$REPO" gui --serve --port 0 --token s3cret --ttyd \
+        >"$TMP/ttyd.out" 2>"$TMP/ttyd.err" &
+    ttyd_gui=$!
+    i=0
+    while [ "$i" -lt 100 ]; do
+        if grep -q '^listening=' "$TMP/ttyd.out" 2>/dev/null; then break; fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    ttyd_base=$(sed -n 's/^listening=//p' "$TMP/ttyd.out" | head -n 1)
+    check test -n "$ttyd_base"
+    check contains "$(cat "$TMP/ttyd.out")" 'ttyd=yes'
+
+    # the served dashboard carries one terminal link per session
+    code=$(curl -sS --max-time 10 -o "$TMP/ttyd.body" -w '%{http_code}' \
+        -H 'Authorization: Bearer s3cret' "$ttyd_base/" || true)
+    check test "$code" = 200
+    check contains "$(cat "$TMP/ttyd.body")" 'href="/tty/test-999"'
+
+    # following it starts ttyd: loopback, basic auth, the tmux target, and
+    # read-only by default (ttyd is read-only unless -W is given)
+    code=$(curl -sS --max-time 10 -D "$TMP/ttyd.headers" -o /dev/null \
+        -w '%{http_code}' -H 'Authorization: Bearer s3cret' \
+        "$ttyd_base/tty/test-999" || true)
+    check test "$code" = 302
+    location=$(sed -n 's/^[Ll]ocation: //p' "$TMP/ttyd.headers" |
+        tr -d '\r' | head -n 1)
+    check contains "$location" 'http://127.0.0.1:'
+    check grep -qxF -- '-i' "$TTYD_DIR/ttyd_argv"
+    check grep -qxF -- '127.0.0.1' "$TTYD_DIR/ttyd_argv"
+    check grep -qxF -- '-c' "$TTYD_DIR/ttyd_argv"
+    check grep -qxF -- 'fb:s3cret' "$TTYD_DIR/ttyd_argv"
+    check grep -qxF -- 'attach' "$TTYD_DIR/ttyd_argv"
+    check grep -qxF -- '-t' "$TTYD_DIR/ttyd_argv"
+    check grep -qxF -- 'fb-test-999' "$TTYD_DIR/ttyd_argv"
+    check test "$(grep -cxF -- '-W' "$TTYD_DIR/ttyd_argv" || true)" = 0
+    check test "$(grep -cxF -- 'fb:s3cret' "$TTYD_DIR/ttyd_argv" || true)" = 1
+
+    # a second click reuses the running viewer instead of starting another
+    spawns=$(wc -l <"$TTYD_DIR/ttyd_argv")
+    code=$(curl -sS --max-time 10 -D "$TMP/ttyd.headers2" -o /dev/null \
+        -w '%{http_code}' -H 'Authorization: Bearer s3cret' \
+        "$ttyd_base/tty/test-999" || true)
+    check test "$code" = 302
+    check test "$(wc -l <"$TTYD_DIR/ttyd_argv")" = "$spawns"
+    check test "$(sed -n 's/^[Ll]ocation: //p' "$TMP/ttyd.headers2" |
+        tr -d '\r' | head -n 1)" = "$location"
+
+    # a session that is not running is refused instead of spawning ttyd
+    fake_clear
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+        -H 'Authorization: Bearer s3cret' "$ttyd_base/tty/test-999" || true)
+    check test "$code" = 409
+    fake_session test-999 "$IDLE_PANE"
+
+    # the name goes through the phase 3 validation before any process
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+        -H 'Authorization: Bearer s3cret' "$ttyd_base/tty/nope" || true)
+    check test "$code" = 404
+    code=$(curl -sS --max-time 10 --path-as-is -o /dev/null -w '%{http_code}' \
+        -H 'Authorization: Bearer s3cret' \
+        "$ttyd_base/tty/..%2fetc" || true)
+    check test "$code" = 400
+
+    # stopping the server reaps the viewer it started
+    viewer_pid=$(cat "$TTYD_DIR/ttyd_pid")
+    check test -n "$viewer_pid"
+    kill "$ttyd_gui" 2>/dev/null || true
+    wait "$ttyd_gui" 2>/dev/null || true
+    reaped=no
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        if kill -0 "$viewer_pid" 2>/dev/null; then sleep 0.2; else reaped=yes; break; fi
+    done
+    check test "$reaped" = yes
+
+    # --interactive drops ttyd's read-only default and adds -W
+    : >"$TTYD_DIR/ttyd_argv"
+    fake_session test-999 "$IDLE_PANE"
+    bash "$TOOL" --root "$REPO" gui --serve --port 0 --token s3cret --ttyd \
+        --interactive >"$TMP/ttyd-i.out" 2>&1 &
+    ttyd_i=$!
+    i=0
+    while [ "$i" -lt 100 ]; do
+        if grep -q '^listening=' "$TMP/ttyd-i.out" 2>/dev/null; then break; fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    i_base=$(sed -n 's/^listening=//p' "$TMP/ttyd-i.out" | head -n 1)
+    check test -n "$i_base"
+    check contains "$(cat "$TMP/ttyd-i.out")" 'interactive=yes'
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+        -H 'Authorization: Bearer s3cret' "$i_base/tty/test-999" || true)
+    check test "$code" = 302
+    check grep -qxF -- '-W' "$TTYD_DIR/ttyd_argv"
+    kill "$ttyd_i" 2>/dev/null || true
+    wait "$ttyd_i" 2>/dev/null || true
+
+    # --read-only plus --interactive is refused, not silently downgraded
+    if FREEBUFF_TTYD="$TMP/bin/ttyd" bash "$TOOL" --root "$REPO" gui \
+        --serve --port 0 --token s3cret --read-only --ttyd --interactive \
+        >"$TMP/ttyd-ro.out" 2>&1; then ro_int=0; else ro_int=$?; fi
+    check test "$ro_int" -ne 0
+    check contains "$(cat "$TMP/ttyd-ro.out")" 'read-only'
+
+    # --interactive alone is a usage error
+    if bash "$TOOL" --root "$REPO" gui --serve --port 0 --interactive \
+        >"$TMP/ttyd-need.out" 2>&1; then need_rc=0; else need_rc=$?; fi
+    check test "$need_rc" -ne 0
+    check contains "$(cat "$TMP/ttyd-need.out")" 'needs --ttyd'
+
+    # no ttyd: the server still runs, the dashboard has no links and says why
+    FREEBUFF_TTYD="$TMP/not-a-ttyd" bash "$TOOL" --root "$REPO" gui \
+        --serve --port 0 --token s3cret --ttyd \
+        >"$TMP/ttyd-miss.out" 2>"$TMP/ttyd-miss.err" &
+    ttyd_miss=$!
+    i=0
+    while [ "$i" -lt 100 ]; do
+        if grep -q '^listening=' "$TMP/ttyd-miss.out" 2>/dev/null; then break; fi
+        sleep 0.1
+        i=$((i + 1))
+    done
+    m_base=$(sed -n 's/^listening=//p' "$TMP/ttyd-miss.out" | head -n 1)
+    check test -n "$m_base"
+    check contains "$(cat "$TMP/ttyd-miss.out")" 'ttyd=missing'
+    code=$(curl -sS --max-time 10 -o "$TMP/ttyd-miss.body" -w '%{http_code}' \
+        -H 'Authorization: Bearer s3cret' "$m_base/" || true)
+    check test "$code" = 200
+    check contains "$(cat "$TMP/ttyd-miss.body")" 'ttyd not found'
+    check test "$(grep -c 'href="/tty/' "$TMP/ttyd-miss.body" || true)" = 0
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+        -H 'Authorization: Bearer s3cret' "$m_base/tty/test-999" || true)
+    check test "$code" = 503
+    kill "$ttyd_miss" 2>/dev/null || true
+    wait "$ttyd_miss" 2>/dev/null || true
+
+    unset FREEBUFF_TTYD FAKE_TTYD_DIR
+    fake_clear
 else
     printf 'skip gui server checks: python3 or curl missing\n' >&2
 fi
