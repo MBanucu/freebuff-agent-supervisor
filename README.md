@@ -277,3 +277,11 @@ What that means here:
 Until then, do not file another upstream one-shot request: it duplicates
 `#947`, and the part that will not change on request is the admission rule
 that keeps third-party harnesses out.
+
+## Contributing
+
+`main` is protected by the ruleset `main: pull requests only`: a pull request
+is required, with zero required approvals so a solo maintainer can still
+self-merge. Deletion and non-fast-forward pushes are blocked, and the ruleset
+has no bypass actors — the maintainer is subject to it too. Work therefore
+arrives as a branch plus a PR, not as a direct push to `main`.
