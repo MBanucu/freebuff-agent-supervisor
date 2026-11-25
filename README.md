@@ -107,15 +107,30 @@ Markers, captured from 0.2.38:
 - busy while a turn is in flight: `Add to the current task (/ for commands)` —
   no idle marker, so it is never mistaken for idle
 - protected: the concurrent-session overlay (`concurrent-session limit`) is
-  rejected outright; approval, rate-limit and `Can't reach Freebuff` strings
-  are treated as working
+  rejected outright and reported as `refused`; the approval/rate-limit strings
+  are only consulted when the resting prompt is absent
+
+The order of those checks matters. `session_state` reads the result file, then
+the concurrent-session overlay, then the busy markers, then the resting prompt,
+and only then the protected strings. The resting prompt outranks them because
+the startup banner `Can't reach Freebuff's servers. Retrying…` lands inside the
+same 12-line window: while it was checked first, a finished session carrying
+that banner reported `working` forever and was never reaped.
 
 A pane with neither marker is reported as `working`, which is the safe
 failure mode: `watch` waits instead of stopping. These markers are TUI chrome
 and can change between Freebuff releases; the result file does not depend on
-them. 0.2.38 ran an off-project shell command (`touch /tmp/...`) without any
-approval prompt, so the approval chrome could not be captured and remains
-unverified in this build.
+them.
+
+**The approval chrome is unverified in 0.2.38.** This build does not ask. It
+ran an off-project `touch /tmp/...`, and then — in a repository with
+`.agents/rules.md` and without `--trust-agents` — an `rm -rf` aimed outside the
+worktree: the pane printed `$ rm -rf ...` and the path was gone, with no prompt
+and no trust dialog. The `approval|approve|Allow once|Run command|permission`
+strings therefore never match a real pane here. They are kept as a conservative
+backstop so a build that does prompt is never mistaken for idle; any pane
+without the resting prompt already reports `working` by fallback, so nothing
+depends on them.
 
 `status` reports both views:
 
@@ -191,8 +206,9 @@ never become usable.
   the Freebuff release; the result file is the stable signal.
 - Concurrent Freebuff sessions share one account; if the service throttles a
   new session, the pane says `Can't reach Freebuff's servers. Retrying...`.
-  The session is left running for inspection, and `gc` will not treat the
-  rate-limit notice as finished.
+  The session is left running for inspection. The banner is drawn above the
+  resting prompt, so such a session reads as `idle` and `gc` only reaps it
+  after `--idle-hours` — it is never reaped on sight.
 - The test suite is deviceless: a fake tmux serves fixture panes and records
   kills, so it covers the result protocol, state transitions, autostop and
   `gc` decisions without a Freebuff session, account slot, `gh` or network.

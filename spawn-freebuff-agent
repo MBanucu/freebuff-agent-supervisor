@@ -239,16 +239,20 @@ session_state() {
         printf 'refused'
         return 0
     fi
-    if printf '%s' "$chrome" | grep -qiE "$PROTECTED_RE"; then
-        printf 'working'
-        return 0
-    fi
     if printf '%s' "$chrome" | grep -qE "$BUSY_RE"; then
         printf 'working'
         return 0
     fi
+    # The resting prompt means no turn is running, so it outranks the
+    # protected strings: the startup `Can't reach Freebuff` banner lands in the
+    # same 12-line window and would otherwise pin a finished session at
+    # `working` forever, which is the leak this tool exists to prevent.
     if printf '%s' "$chrome" | grep -q 'Enter a coding task'; then
         printf 'idle'
+        return 0
+    fi
+    if printf '%s' "$chrome" | grep -qiE "$PROTECTED_RE"; then
+        printf 'working'
         return 0
     fi
     printf 'working'

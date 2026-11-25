@@ -161,6 +161,24 @@ REFUSED_PANE='Your concurrent-session limit across CLI and Desktop is reached.
 Enter: take over  Esc: back to draft'
 APPROVAL_PANE='Run command: git status
 Allow once   Allow always   Deny'
+# Captured from 0.2.38: the startup banner sits inside the 12-line window
+# together with the resting prompt, so the prompt has to win.
+BANNER_IDLE_PANE=' Can.t reach Freebuff.s servers. Retrying… Try another network.
+╭──────────────────╮
+│  ▍Enter a coding task or / for commands
+╰──────────────────╯
+ DeepSeek V4.1 Flash 10/17 • high · /tmp/x/proj · /model to change · Chat: New chat'
+# Same banner with a turn in flight: no busy marker, mid-turn prompt.
+BANNER_BUSY_PANE=' Can.t reach Freebuff.s servers. Retrying… Try another network.
+⎘ • 6s • △▽
+╭──────────────────╮
+│  ▍Add to the current task (/ for commands)'
+# Agent prose mentioning a permission must not outrank the resting prompt.
+PROSE_AT_PROMPT_PANE='No permission was required for that deletion.
+╭──────────────────╮
+│  ▍Enter a coding task or / for commands
+╰──────────────────╯
+ DeepSeek V4.1 Flash • high · /tmp/x/proj · /model to change · Chat: New chat'
 
 fake_session test-999 "$IDLE_PANE" "$(($(date +%s) - 30))"
 out=$(bash "$TOOL" --root "$REPO" status --no-gh test-999)
@@ -205,6 +223,27 @@ if bash "$TOOL" --root "$REPO" watch test-999 --timeout 1 --poll 1 \
     >"$TMP/watch.out" 2>&1; then rc=0; else rc=$?; fi
 check test "$rc" -eq 1
 check contains "$(cat "$TMP/watch.out")" 'state=working'
+
+# a banner above the resting prompt must not pin the session at working
+fake_session test-999 "$BANNER_IDLE_PANE"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh test-999)
+check contains "$out" 'session_state=idle'
+if bash "$TOOL" --root "$REPO" watch test-999 --idle-seconds 0 --poll 0 \
+    --timeout 10 >"$TMP/watch.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+check contains "$(cat "$TMP/watch.out")" 'state=idle'
+
+# the same banner with a turn in flight is still working
+fake_session test-999 "$BANNER_BUSY_PANE"
+if bash "$TOOL" --root "$REPO" watch test-999 --timeout 1 --poll 1 \
+    >"$TMP/watch.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 1
+check contains "$(cat "$TMP/watch.out")" 'state=working'
+
+# prose that mentions a permission at the rendered prompt is idle
+fake_session test-999 "$PROSE_AT_PROMPT_PANE"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh test-999)
+check contains "$out" 'session_state=idle'
 
 # watch: the result file wins over a busy pane
 printf 'state=done\npr=none\n' >"$WT/.agent-result"
