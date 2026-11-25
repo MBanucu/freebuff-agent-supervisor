@@ -37,6 +37,22 @@ contains() {
     printf '%s' "$1" | grep -qF -- "$2"
 }
 
+json_ok() {
+    # json_ok <text> -> 0 when it parses as JSON. Without python3, fall back to
+    # the shape the emitters promise plus the absence of raw tab/CR bytes, so
+    # the check still means something on a bare phone.
+    local text=${1-}
+    if command -v python3 >/dev/null 2>&1; then
+        printf '%s' "$text" | python3 -m json.tool >/dev/null 2>&1
+        return
+    fi
+    case "$text" in
+        '['*']'|'{'*'}') ;;
+        *) return 1 ;;
+    esac
+    ! printf '%s' "$text" | LC_ALL=C grep -q $'[\t\r]'
+}
+
 out=$(bash "$TOOL" --root "$REPO" start --issue 999 --name test-999 \
     --branch test/999 --title 'Test issue' \
     --url 'https://example.test/issues/999' --dry-run)
@@ -369,6 +385,75 @@ mkdir -p "$TMP/no-worktrees"
 out=$(bash "$TOOL" --root "$TMP/no-worktrees" list)
 check contains "$out" 'no worktrees'
 check contains "$out" 'orphans=test-999 ghost'
+rm -f "$WT/.agent-result"
+
+# ---- machine-readable output (#17) ----
+
+# zero sessions is an empty array, not an empty line
+fake_clear
+mkdir -p "$TMP/empty-json"
+out=$(bash "$TOOL" --root "$TMP/empty-json" sessions --json --no-gh)
+check test "$out" = '[]'
+check json_ok "$out"
+
+# two rows: a live session with a worktree, and an orphan with none
+fake_session test-999 "$IDLE_PANE"
+fake_add_session ghost
+printf 'state=blocked\npr=https://example.test/pr/17\ncommit=def5678\ntests=sessions --json\n' \
+    >"$WT/.agent-result"
+out=$(bash "$TOOL" --root "$REPO" sessions --json --no-gh)
+check json_ok "$out"
+check contains "$out" '"name": "test-999"'
+check contains "$out" '"name": "ghost"'
+check test "$(printf '%s\n' "$out" | grep -c '^  {')" = 2
+check contains "$out" '"worktree": "yes"'
+check contains "$out" '"worktree": "missing"'
+# the result file outranks the pane for test-999, the orphan is just idle
+check contains "$out" '"state": "done"'
+check contains "$out" '"state": "idle"'
+check contains "$out" '"result": "blocked"'
+# absent values are null, not the table's `-`
+check test "$(printf '%s\n' "$out" | grep -c '"result": null')" = 1
+check test "$(printf '%s\n' "$out" | grep -c '"branch": null')" = 1
+check test "$(printf '%s\n' "$out" | grep -c '"watcher": null')" = 1
+check contains "$out" '"watcher": "dead"'
+# --no-gh leaves both PR fields null instead of the table's `-`
+check test "$(printf '%s\n' "$out" | grep -c '"pr": null')" = 2
+
+# status --json round-trips the result file
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-999)
+check json_ok "$out"
+check contains "$out" '"state": "blocked"'
+check contains "$out" '"result_state": "blocked"'
+check contains "$out" '"result_pr": "https://example.test/pr/17"'
+check contains "$out" '"result_commit": "def5678"'
+check contains "$out" '"result_tests": "sessions --json"'
+check contains "$out" '"running": true'
+check contains "$out" '"input": "canonical"'
+check contains "$out" '"session_state": "done"'
+check contains "$out" '"dirty": false'
+check contains "$out" '"pane": "'
+
+# quotes, backslashes, tabs, CR and other control bytes are escaped, never raw
+printf 'col1\tcol2\r\nquote " slash \\ esc \001 end\n' >"$FAKE_DIR/pane"
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-999)
+check json_ok "$out"
+check contains "$out" '\t'
+check contains "$out" '\r'
+check contains "$out" '\\'
+check contains "$out" '\"'
+check contains "$out" '\u0001'
+check test "$(printf '%s' "$out" | grep -c $'\t')" = 0
+
+# a session that is gone is running=false with a null pane, not a missing key
+fake_clear
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-999)
+check json_ok "$out"
+check contains "$out" '"running": false'
+check contains "$out" '"session_state": "missing"'
+check contains "$out" '"pane": null'
+
+fake_session test-999 "$IDLE_PANE"
 rm -f "$WT/.agent-result"
 
 # ---- graceful stop (#10) ----
