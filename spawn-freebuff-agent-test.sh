@@ -68,6 +68,14 @@ out=$(bash "$TOOL" --root "$REPO" start --issue 997 --name test-dry \
 check contains "$out" 'autostop=yes idle_seconds=120 poll=5'
 check test ! -e "$REPO/.worktrees/test-dry"
 
+# start --prompt replaces the default brief; the flag must be accepted
+out=$(bash "$TOOL" --root "$REPO" start --issue 996 --name test-prompt \
+    --branch test/prompt --title 'Prompt issue' --url 'https://example.test/996' \
+    --prompt 'custom brief' --dry-run)
+check contains "$out" 'session=fb-test-prompt'
+check test ! -e "$REPO/.worktrees/test-prompt"
+check contains "$(bash "$TOOL" --help 2>&1)" '--prompt TEXT'
+
 bash "$TOOL" --root "$REPO" start --issue 999 --name test-999 \
     --branch test/999 --title 'Test issue' \
     --url 'https://example.test/issues/999' --no-start --sdk-dir "$TMP/sdk" >/dev/null

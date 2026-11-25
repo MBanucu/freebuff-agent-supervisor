@@ -52,6 +52,7 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       --wait-slot [N]    wait up to N seconds (default: 300) for a free slot
                          instead of failing; requires --max-sessions
       --no-start         create the worktree and brief, do not launch
+      --prompt TEXT      send this message instead of the default brief
       --dry-run          print the plan, change nothing
       --help             this text
 
@@ -720,6 +721,7 @@ start() {
                 ;;
             --dry-run) dry=1; shift ;;
             --no-start) nostart=1; shift ;;
+            --prompt) prompt_text=${2:-}; shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) die "start: unsupported argument: $1" ;;
         esac
@@ -854,7 +856,14 @@ start() {
         die "start: TUI did not reach raw input in $session; stopped it, worktree kept ($wt)"
     fi
 
-    "$tmux" send-keys -t "$session" -l "$PROMPT"
+    # A brief that is byte-identical across sessions reads as scripted use to
+    # the vendor, which refuses the message and counts a strike. Name the
+    # session, branch and issue so every send differs by construction;
+    # --prompt replaces the whole message.
+    local sent="$PROMPT Session $name, branch $branch."
+    [ -z "$issue" ] || sent="$sent Issue #$issue."
+    [ -z "$prompt_text" ] || sent=$prompt_text
+    "$tmux" send-keys -t "$session" -l "$sent"
     sleep 0.5
     "$tmux" send-keys -t "$session" C-m
     sleep 2

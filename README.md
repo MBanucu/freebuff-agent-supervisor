@@ -59,6 +59,12 @@ Use `--root /path/to/repo` to target another checkout. The default name is
 `local.properties`; without it, the target repository's `local.properties` is
 copied when present.
 
+`--prompt TEXT` replaces the message typed into the TUI; the brief itself still
+comes from `.task.md`. The default message names the session, its branch and the
+issue number, so no two sessions receive byte-identical text: Freebuff refuses
+repeated identical messages as scripted use and counts a strike against the
+account.
+
 Use `--task-file FILE` when an issue needs a custom scope instead of the
 generic issue brief. `--dry-run` prints the plan and changes nothing;
 `--no-start` creates only the worktree, branch and `.task.md`.
