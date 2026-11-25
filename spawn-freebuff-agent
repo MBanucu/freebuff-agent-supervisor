@@ -22,7 +22,10 @@ RESULT_FILE='.agent-result'
 # The pane is the only completion signal Freebuff offers. Markers are matched
 # against the bottom lines of the visible pane only, so prose in the agent's
 # scrollback cannot keep a finished session alive.
-BUSY_RE='esc to interrupt|[◐◓◑◒]'
+# Verified against Freebuff 0.2.38: a running turn shows `thinking...` /
+# `working...` with a `■ Esc` hint in the bottom-right; `esc to interrupt` and
+# the spinner glyphs are kept for other builds.
+BUSY_RE='esc to interrupt|thinking\.\.\.|working\.\.\.|■ Esc|[◐◓◑◒]'
 PROTECTED_RE='approval|approve|Allow once|Allow always|Run command|permission|rate limit|Can.t reach Freebuff'
 REFUSED_RE='concurrent-session limit|Take over to stop another session'
 

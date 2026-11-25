@@ -145,11 +145,18 @@ fake_clear() {
     : >"$FAKE_DIR/killed"
 }
 
-IDLE_PANE='Welcome to Freebuff
-
-Enter a coding task'
-BUSY_PANE='Working for 12s
-esc to interrupt'
+# Panes as captured from Freebuff 0.2.38.
+IDLE_PANE='╭──────────────────╮
+│  ▍Enter a coding task or / for commands
+╰──────────────────╯
+ DeepSeek V4.1 Flash • high · /tmp/x/proj · /model to change · Chat: New chat'
+BUSY_PANE='thinking...                                      7s  ■ Esc
+╭──────────────────╮
+│  ▍Add to the current task (/ for commands)'
+# A pane with no busy marker and no idle prompt: the fallback must call it working.
+NOMARKER_PANE='⎘ • 6s • △▽
+╭──────────────────╮
+│  ▍Add to the current task (/ for commands)'
 REFUSED_PANE='Your concurrent-session limit across CLI and Desktop is reached.
 Enter: take over  Esc: back to draft'
 APPROVAL_PANE='Run command: git status
@@ -186,6 +193,11 @@ if bash "$TOOL" --root "$REPO" watch test-999 --timeout 1 --poll 1 \
     >"$TMP/watch.out" 2>&1; then rc=0; else rc=$?; fi
 check test "$rc" -eq 1
 check contains "$(cat "$TMP/watch.out")" 'state=refused'
+
+# a pane with neither marker still counts as working
+fake_session test-999 "$NOMARKER_PANE"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh test-999)
+check contains "$out" 'session_state=working'
 
 # watch: an approval prompt is not idle
 fake_session test-999 "$APPROVAL_PANE"

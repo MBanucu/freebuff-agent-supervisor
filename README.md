@@ -97,10 +97,25 @@ idle signal applies.
 bottom lines, and treats the session as idle when the input prompt is visible,
 no busy marker is present, and the pane is unchanged for the window. A shell
 approval prompt, rate-limit notice or the concurrent-session overlay is never
-treated as idle. The current defaults match `esc to interrupt` and spinner
-glyphs for busy, and the approval, rate-limit and concurrent-session strings
-for protected. These markers are TUI chrome and can change between Freebuff
-releases; the result file does not depend on them.
+treated as idle.
+
+Markers, captured from 0.2.38:
+
+- idle: `▍Enter a coding task or / for commands`
+- busy: `thinking...` / `working...` with a `■ Esc` hint, plus `esc to
+  interrupt` and the spinner glyphs from other builds
+- busy while a turn is in flight: `Add to the current task (/ for commands)` —
+  no idle marker, so it is never mistaken for idle
+- protected: the concurrent-session overlay (`concurrent-session limit`) is
+  rejected outright; approval, rate-limit and `Can't reach Freebuff` strings
+  are treated as working
+
+A pane with neither marker is reported as `working`, which is the safe
+failure mode: `watch` waits instead of stopping. These markers are TUI chrome
+and can change between Freebuff releases; the result file does not depend on
+them. 0.2.38 ran an off-project shell command (`touch /tmp/...`) without any
+approval prompt, so the approval chrome could not be captured and remains
+unverified in this build.
 
 `status` reports both views:
 
