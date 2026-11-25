@@ -6,10 +6,16 @@ it shells out to `sessions --json` and `status NAME --json` and returns what
 those print. Standard library only (`http.server`), no third-party packages.
 
 Routes:
-  GET /                        the page `gui --snapshot` writes
-  GET /api/sessions            `sessions --json`, verbatim
-  GET /api/session/N/pane      `status N --json`, verbatim
-  POST anything                403 with --read-only; actions arrive in #22
+  GET  /                       the page `gui --snapshot` writes
+  GET  /api/sessions           `sessions --json`, verbatim
+  GET  /api/session/N/pane     `status N --json`, verbatim
+  POST /api/session/N/stop     `stop N`, plus `--graceful` with ?graceful=1
+  POST /api/session/N/send     `send N TEXT`, text from a JSON body
+  POST /api/gc                 `gc`, plus `--dry-run` with ?dry=1
+
+Every mutating route is one CLI call: 202 with the CLI's own `key=value`
+output, or 409/500 with its exit status and message. Nothing here
+reimplements a decision the CLI makes, so the two cannot drift.
 
 Auth: every request needs the token, compared in constant time. It is
 accepted as `Authorization: Bearer ...`, as the `fb_token` cookie, or as
@@ -41,6 +47,10 @@ from urllib.parse import parse_qs, unquote, urlsplit
 COOKIE = "fb_token"
 NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
 CLI_TIMEOUT = 30
+# `send` text is a short follow-up, not a payload; the cap keeps a wrong or
+# hostile Content-Length from turning a request thread into a sink.
+MAX_BODY = 64 * 1024
+TRUTHY = ("1", "true", "yes", "on")
 TOOL = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "spawn-freebuff-agent",
@@ -48,12 +58,18 @@ TOOL = os.path.join(
 
 
 def valid_name(name):
-    """The one name validator, shared with the mutating routes in #22.
+    """The one name validator, shared by every route that takes a name.
 
     It mirrors `valid_name` in the bash tool and is applied before a name can
     reach a filesystem path or a subprocess argument.
     """
     return bool(name) and NAME_RE.fullmatch(name) is not None
+
+
+def flag(query, key):
+    """A query flag: ?key=1, ?key=true, ?key=yes or ?key=on."""
+    value = (query.get(key) or [""])[0].strip().lower()
+    return value in TRUTHY
 
 
 def is_loopback(host):
@@ -198,19 +214,119 @@ class Handler(BaseHTTPRequestHandler):
             # Validate the name before it can reach a path or a subprocess.
             # Take everything between the prefix and /pane so that a crafted
             # `../etc` is a 400, not a 404 that never looked at the name.
-            prefix, suffix = "/api/session/", "/pane"
-            if (parsed.path.startswith(prefix)
-                    and parsed.path.endswith(suffix)
-                    and len(parsed.path) > len(prefix) + len(suffix)):
-                name = unquote(parsed.path[len(prefix):-len(suffix)])
+            name = self._name_from(parsed.path, "/pane")
+            if name is not None:
                 if not valid_name(name):
                     return self._json(400, {"error": "invalid name"}, extra=extra)
                 return self._proxy(
                     ["status", name, "--json", "--no-gh"], 404, extra)
             return self._json(404, {"error": "no such route"}, extra=extra)
 
-        # POST beyond --read-only: the mutating routes are issue #22.
+        return self._post(parsed, query, extra)
+
+    def _post(self, parsed, query, extra):
+        """The mutating routes, each one a single CLI call.
+
+        `stop`, `send` and `gc` stay the only place that knows what those
+        actions do, so an action answers with their `key=value` lines and
+        their exit status instead of a second result vocabulary.
+        """
+        if parsed.path == "/api/gc":
+            argv = ["gc"]
+            if flag(query, "dry"):
+                argv.append("--dry-run")
+            return self._action(argv, extra)
+
+        for suffix, action in (("/stop", "stop"), ("/send", "send")):
+            name = self._name_from(parsed.path, suffix)
+            if name is None:
+                continue
+            if not valid_name(name):
+                return self._json(400, {"error": "invalid name"}, extra=extra)
+            if not self._known(name):
+                return self._json(404, {"error": "unknown session"}, extra=extra)
+            if action == "stop":
+                argv = ["stop", name]
+                if flag(query, "graceful"):
+                    argv.append("--graceful")
+                return self._action(argv, extra)
+            # `send` takes its text from the body only: a URL is logged, and a
+            # pane command belongs in a request that has to be sent on purpose.
+            text = self._send_text()
+            if text is None:
+                return  # _send_text already answered the request
+            return self._action(["send", name, text], extra)
+
         return self._json(404, {"error": "no such route"}, extra=extra)
+
+    def _name_from(self, path, suffix):
+        """NAME from /api/session/NAME/SUFFIX, or None for another route.
+
+        Everything between the fixed prefix and the suffix is the name, so a
+        crafted `../etc` is rejected by valid_name instead of matching no
+        route at all.
+        """
+        prefix = "/api/session/"
+        if (path.startswith(prefix) and path.endswith(suffix)
+                and len(path) > len(prefix) + len(suffix)):
+            return unquote(path[len(prefix):-len(suffix)])
+        return None
+
+    def _known(self, name):
+        """Whether the inventory knows this name: its worktree exists.
+
+        `stop` on a name with no session prints `stopped=no` and exits 0, so
+        an unknown name has to be answered here or the browser would read a
+        no-op as success. This is the pane route's 404 rule, applied to the
+        actions.
+        """
+        return os.path.isdir(os.path.join(self.server.root, ".worktrees", name))
+
+    def _send_text(self):
+        """The text for `send`, or None after answering the request."""
+        raw_length = self.headers.get("Content-Length")
+        try:
+            length = int(raw_length) if raw_length else 0
+        except ValueError:
+            length = -1
+        if length < 0:
+            self._json(400, {"error": "invalid Content-Length"})
+            return None
+        if length > MAX_BODY:
+            self._json(413, {"error": "body too large"})
+            return None
+        raw = self.rfile.read(length) if length else b""
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError):
+            self._json(400, {"error": "body must be JSON"})
+            return None
+        text = payload.get("text") if isinstance(payload, dict) else None
+        if not isinstance(text, str) or not text.strip():
+            self._json(400, {"error": "body needs a non-empty text string"})
+            return None
+        return text
+
+    def _action(self, argv, extra):
+        """Run one mutating CLI command and return what it printed.
+
+        202 with the CLI's `key=value` lines when it succeeded. On failure the
+        CLI's own message, with its exit status as the HTTP status: 1 means the
+        session was in the wrong state (a graceful stop that is still working,
+        a send to a session that is gone), anything else is a server fault. The
+        browser can then tell "stopped" from "still busy" without a second
+        result vocabulary.
+        """
+        result = self._run(argv)
+        if result.returncode == 0:
+            self._send(202, result.stdout, "text/plain; charset=utf-8", extra)
+            return
+        body = result.stdout + result.stderr
+        if not body.strip():
+            body = ("command failed with status %d\n"
+                    % result.returncode).encode("utf-8")
+        status = 409 if result.returncode == 1 else 500
+        self._send(status, body, "text/plain; charset=utf-8", extra)
 
     # ---- routes -----------------------------------------------------------
 

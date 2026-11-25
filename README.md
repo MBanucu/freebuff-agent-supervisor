@@ -272,7 +272,7 @@ rendered value is HTML-escaped, because branch names, PR URLs, commit subjects
 and the `tests` line are arbitrary text. The page is read-only: it offers no
 buttons that only pretend to act.
 
-## Browser GUI (read-only)
+## Browser GUI
 
 `gui --serve` serves that page over HTTP from python3's standard library, with
 no third-party packages. `GET /` runs the same `gui --snapshot` renderer into a
@@ -289,9 +289,26 @@ spawn-freebuff-agent gui --serve --read-only
 - `GET /api/sessions` returns `sessions --json` verbatim.
 - `GET /api/session/<name>/pane` returns `status NAME --json`, or 404 when the
   name has no worktree.
-- Every POST is 403 with `--read-only`; the mutating routes are a later phase.
+- `POST /api/session/<name>/stop[?graceful=1]` runs `stop NAME`, or
+  `stop NAME --graceful`.
+- `POST /api/session/<name>/send` runs `send NAME TEXT`, with the text taken
+  from a JSON body `{"text": "..."}` and never from the URL.
+- `POST /api/gc[?dry=1]` runs `gc`, or `gc --dry-run`.
 - Codes: 401 for a missing or wrong token, 400 for a name that fails
-  `^[A-Za-z0-9_-]+$`, 404 for an unknown session, 403 in read-only mode.
+  `^[A-Za-z0-9_-]+$` or a body that is not JSON, 404 for an unknown session
+  (no worktree, the pane route's rule), 403 in read-only mode, 409 when the CLI
+  refuses, 413 for a body over 64 KiB.
+
+An action is one CLI call and nothing else: it answers `202` with the CLI's own
+`key=value` lines, so there is no second result vocabulary to keep in step. On
+failure it returns the CLI's exit status and message instead — `409` for exit
+1, which is a session in the wrong state, `500` otherwise. That is what lets a
+browser tell "stopped" from "still busy" after a graceful stop, rather than
+reading a refusal as success. The name is validated before it reaches a path or
+a subprocess, the `send` text is passed as a single argv element and never
+through a shell, and the token is still required on every POST even on loopback,
+so a page in another tab cannot stop an agent. `--read-only` answers these
+routes `403` rather than hiding them, so a caller learns why.
 
 The token is compared in constant time and accepted as
 `Authorization: Bearer T`, as an `fb_token` cookie, or as `?token=T` on a GET
@@ -344,7 +361,7 @@ at all.
 - The test suite is deviceless: a fake tmux serves fixture panes, several
   session names and recorded kills, so it covers the result protocol, state
   transitions, autostop and `gc` decisions, the `sessions` inventory, graceful
-  stop, the capacity pre-flight, and the read-only server's routes, auth and
+  stop, the capacity pre-flight, and the server's routes, auth, actions and
   bind rules without a Freebuff session, account slot, `gh` or network.
   It does not exercise the real TUI; verify marker changes with one controlled
   run when upgrading Freebuff.
