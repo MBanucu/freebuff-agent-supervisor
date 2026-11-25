@@ -145,6 +145,7 @@ session_state=done          # live: done, idle, working, refused or missing
 spawn-freebuff-agent list
 spawn-freebuff-agent sessions
 spawn-freebuff-agent sessions --json
+spawn-freebuff-agent gui --snapshot /tmp/agents.html --watch 5
 spawn-freebuff-agent status 103-example --lines 40
 spawn-freebuff-agent status 103-example --no-gh
 spawn-freebuff-agent status 103-example --json
@@ -239,6 +240,35 @@ git branch -d issue/103-example
 ```
 
 `stop` only kills the tmux session; the worktree and branch remain.
+
+## Static snapshot
+
+`gui --snapshot FILE [--watch N]` writes one self-contained HTML page from
+`sessions --json`: one card per session with name, state, idle time, watcher,
+worktree, result, branch, PR, and — for a session with a worktree — the
+commit and the result file's `tests` line. A done session is green, a working
+one amber, a failed or refused one red, and a session with no worktree carries
+a `no worktree` tag.
+
+```bash
+spawn-freebuff-agent gui --snapshot /tmp/agents.html
+spawn-freebuff-agent gui --snapshot /tmp/agents.html --watch 5
+```
+
+There is no server, no network and no auth: the file is opened directly or
+served by any static host, so it works on a phone and nothing listens to be
+attacked. There are no external assets — CSS is inline and there is no
+script — so `file://` works offline and a strict CSP cannot break the view
+(the page declares `default-src 'none'; style-src 'unsafe-inline'; img-src
+data:`). `--watch N` rewrites the file every N seconds and adds
+`<meta http-equiv="refresh" content="N">`, so an open browser follows along
+without JavaScript. Without it, a single snapshot is written and the command
+exits.
+
+An empty repository renders `no sessions` instead of an empty table. Every
+rendered value is HTML-escaped, because branch names, PR URLs, commit subjects
+and the `tests` line are arbitrary text. The page is read-only: it offers no
+buttons that only pretend to act.
 
 ## The 180x55 rule
 

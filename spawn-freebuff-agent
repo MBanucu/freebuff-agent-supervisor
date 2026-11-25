@@ -72,6 +72,13 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       here instead of only being reapable by gc --all. --json emits the same
       rows as an array of objects.
 
+  spawn-freebuff-agent gui --snapshot FILE [--watch N] [--no-gh]
+      Write one self-contained HTML page from `sessions --json`: one card
+      per session with done-versus-working visible at a glance. No server,
+      no script, no external assets, so it opens from file:// offline.
+      --watch N   rewrite the file every N seconds (adds a meta refresh)
+      --no-gh     do not ask gh for the PR
+
   spawn-freebuff-agent attach NAME
       Attach to the tmux session (detach with Ctrl-b d).
 
@@ -275,6 +282,275 @@ json_nullable_num() {
     else
         printf 'null'
     fi
+}
+
+html_escape() {
+    # html_escape STRING -> text that cannot leave its element. Branch names,
+    # PR URLs, commit subjects and result text are arbitrary, so every value
+    # in the snapshot goes through here; session names are constrained but
+    # are escaped too so no value is trusted.
+    local s=${1-}
+    # The ampersands are backslash-quoted: bash 5.2 replaces an unquoted `&`
+    # in a substitution's replacement with the matched text.
+    s=${s//&/\&amp;}
+    s=${s//</\&lt;}
+    s=${s//>/\&gt;}
+    s=${s//\"/\&quot;}
+    s=${s//\'/\&#39;}
+    printf '%s' "$s"
+}
+
+json_unescape() {
+    # json_unescape STRING -> the decoded content of a JSON string, for
+    # display. Only the escapes json_str emits are decoded; a \uXXXX sequence
+    # is left as written, which is safe because html_escape runs afterwards.
+    local s=${1-} out='' c i
+    for ((i = 0; i < ${#s}; i++)); do
+        c=${s:i:1}
+        if [ "$c" = '\' ] && [ $((i + 1)) -lt ${#s} ]; then
+            i=$((i + 1))
+            c=${s:i:1}
+            case "$c" in
+                n|r|t) c=' ' ;;
+                b|f) c='' ;;
+                '"'|'\'|'/') ;;
+                *) c='\'$c ;;
+            esac
+        fi
+        out+=$c
+    done
+    printf '%s' "$out"
+}
+
+json_scalar() {
+    # json_scalar VALUE -> a decoded value, empty for null
+    local v=${1-}
+    [ "$v" != null ] || return 0
+    case "$v" in
+        \"*\")
+            v=${v:1:${#v}-2}
+            json_unescape "$v"
+            return 0
+            ;;
+    esac
+    printf '%s' "$v"
+}
+
+state_class() {
+    # state_class STATE -> a CSS class, so only known words reach the markup
+    case "${1:-}" in
+        done) printf 'done' ;;
+        working) printf 'working' ;;
+        idle|stopped) printf 'idle' ;;
+        refused) printf 'refused' ;;
+        blocked|failed) printf 'failed' ;;
+        *) printf 'other' ;;
+    esac
+}
+
+snapshot_html() {
+    # snapshot_html FILE JSON WATCH -> one self-contained page. `sessions
+    # --json` is the input: fixed keys, one per line, so the reader below is a
+    # field scan rather than a general JSON parser. WATCH is empty for a one
+    # shot snapshot and a whole number of seconds for the meta refresh.
+    local file="$1" json="$2" watch="$3"
+    local line key value name state idle watcher worktree result branch pr
+    local tests="" commit="" wt generated total=0 live=0 trees=0 cards='' card
+    local cls pr_html refresh=''
+    generated=$(date -u '+%Y-%m-%d %H:%M:%SZ')
+    if [ -n "$watch" ]; then
+        refresh="<meta http-equiv=\"refresh\" content=\"$watch\">"
+    fi
+
+    while IFS= read -r line; do
+        case "$line" in
+            '  {'*)
+                name='' state='' idle='' watcher='' worktree='' result=''
+                branch='' pr=''
+                continue
+                ;;
+            '  }'*)
+                total=$((total + 1))
+                [ "$worktree" = yes ] && trees=$((trees + 1))
+                [ -n "$idle" ] && live=$((live + 1))
+                tests=''
+                commit=''
+                if [ "$worktree" = yes ] && valid_name "$name"; then
+                    wt="$ROOT/.worktrees/$name"
+                    if [ -f "$wt/$RESULT_FILE" ]; then
+                        tests=$(result_key "$wt/$RESULT_FILE" tests)
+                        commit=$(result_key "$wt/$RESULT_FILE" commit)
+                    fi
+                    if [ -z "$commit" ]; then
+                        commit=$(git -C "$wt" log -1 --format='%h %s' \
+                            2>/dev/null || true)
+                    fi
+                fi
+                cls=$(state_class "$state")
+                card="<article class=\"card state-$cls\">"$'\n'
+                card+="<header><h2>$(html_escape "$name")</h2>"
+                if [ "$worktree" != yes ]; then
+                    card+="<span class=\"tag\">no worktree</span>"
+                fi
+                card+="<span class=\"badge\">"
+                card+="$(html_escape "${state:-unknown}")</span></header>"$'\n'
+                card+="<dl>"$'\n'
+                if [ -n "$idle" ]; then
+                    card+="<dt>idle</dt><dd>${idle}s</dd>"$'\n'
+                fi
+                card+="<dt>watcher</dt><dd>$(html_escape "${watcher:--}")</dd>"$'\n'
+                card+="<dt>worktree</dt><dd>$(html_escape "$worktree")</dd>"$'\n'
+                card+="<dt>result</dt><dd>$(html_escape "${result:--}")</dd>"$'\n'
+                card+="<dt>branch</dt><dd><code>$(html_escape "${branch:--}")</code></dd>"$'\n'
+                if [ -n "$pr" ]; then
+                    case "$pr" in
+                        http://*|https://*)
+                            pr_html="<a href=\"$(html_escape "$pr")\">"
+                            pr_html+=$(html_escape "$pr")
+                            pr_html+='</a>'
+                            ;;
+                        *) pr_html=$(html_escape "$pr") ;;
+                    esac
+                else
+                    pr_html='-'
+                fi
+                card+="<dt>pr</dt><dd>$pr_html</dd>"$'\n'
+                if [ -n "$commit" ]; then
+                    card+="<dt>commit</dt><dd><code>$(html_escape "$commit")</code></dd>"$'\n'
+                fi
+                if [ -n "$tests" ]; then
+                    card+="<dt>tests</dt><dd>$(html_escape "$tests")</dd>"$'\n'
+                fi
+                card+='</dl>'$'\n'
+                card+='</article>'$'\n'
+                cards+=$card
+                continue
+                ;;
+            '    "'*) ;;
+            *) continue ;;
+        esac
+        key=${line#    \"}
+        key=${key%%\"*}
+        value=${line#*: }
+        value=${value%,}
+        value=$(json_scalar "$value")
+        case "$key" in
+            name) name=$value ;;
+            state) state=$value ;;
+            idle_seconds) idle=$value ;;
+            watcher) watcher=$value ;;
+            worktree) worktree=$value ;;
+            result) result=$value ;;
+            branch) branch=$value ;;
+            pr) pr=$value ;;
+        esac
+    done <<<"$json"
+
+    {
+        printf '<!DOCTYPE html>\n'
+        printf '<html lang="en">\n<head>\n'
+        printf '<meta charset="utf-8">\n'
+        printf '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        printf '<meta http-equiv="Content-Security-Policy" content="default-src %s; style-src %s; img-src data:">\n' \
+            "'none'" "'unsafe-inline'"
+        printf '<meta name="referrer" content="no-referrer">\n'
+        [ -z "$refresh" ] || printf '%s\n' "$refresh"
+        printf '<title>freebuff agents</title>\n'
+        printf '<style>\n'
+        cat <<'CSS'
+:root { color-scheme: light dark; --bg: #f6f7f9; --fg: #1b1f24;
+  --card: #fff; --muted: #5b6570; --line: #d8dee6; --done: #1a7f37;
+  --working: #9a6700; --idle: #57606a; --failed: #cf222e; }
+@media (prefers-color-scheme: dark) { :root { --bg: #0d1117; --fg: #e6edf3;
+  --card: #161b22; --muted: #9198a1; --line: #30363d; --done: #3fb950;
+  --working: #d29922; --idle: #9198a1; --failed: #f85149; } }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 1.25rem; background: var(--bg); color: var(--fg);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+.page h1 { margin: 0 0 .15rem; font-size: 1.35rem; }
+.meta { margin: 0 0 1.25rem; color: var(--muted); font-size: .85rem;
+  overflow-wrap: anywhere; }
+.grid { display: grid; gap: .9rem;
+  grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); }
+.card { background: var(--card); border: 1px solid var(--line);
+  border-left: 5px solid var(--idle); border-radius: 8px; padding: .8rem 1rem;
+  overflow-wrap: anywhere; }
+.card.state-done { border-left-color: var(--done); }
+.card.state-working { border-left-color: var(--working); }
+.card.state-failed, .card.state-refused { border-left-color: var(--failed); }
+.card header { display: flex; flex-wrap: wrap; gap: .4rem .6rem;
+  align-items: center; margin-bottom: .5rem; }
+.card h2 { margin: 0; font-size: 1.05rem; }
+.badge { margin-left: auto; padding: .05rem .5rem; border-radius: 999px;
+  border: 1px solid currentColor; font-size: .78rem; color: var(--idle); }
+.state-done .badge { color: var(--done); }
+.state-working .badge { color: var(--working); }
+.state-failed .badge, .state-refused .badge { color: var(--failed); }
+.tag { font-size: .75rem; padding: .05rem .4rem; border-radius: 4px;
+  background: var(--bg); border: 1px solid var(--line); color: var(--muted); }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: .15rem .6rem;
+  margin: 0; font-size: .85rem; }
+dt { color: var(--muted); }
+dd { margin: 0; }
+code { font: .85em ui-monospace, SFMono-Regular, Menlo, monospace; }
+a { color: inherit; }
+.empty { color: var(--muted); padding: 2rem 0; }
+footer { margin-top: 1.5rem; color: var(--muted); font-size: .78rem; }
+CSS
+        printf '</style>\n</head>\n<body>\n'
+        printf '<header class="page">\n<h1>freebuff agents</h1>\n'
+        printf '<p class="meta">repo %s · generated %s · sessions %s · running %s · worktrees %s · orphans %s</p>\n' \
+            "$(html_escape "$ROOT")" "$generated" "$total" "$live" \
+            "$trees" "$((total - trees))"
+        printf '</header>\n<main class="grid">\n'
+        if [ "$total" = 0 ]; then
+            printf '<p class="empty">no sessions</p>\n'
+        else
+            printf '%s' "$cards"
+        fi
+        printf '</main>\n'
+        printf '<footer>Read-only snapshot from spawn-freebuff-agent sessions --json. No server, no script.</footer>\n'
+        printf '</body>\n</html>\n'
+    } >"$file.tmp.$$"
+    mv "$file.tmp.$$" "$file"
+}
+
+gui() {
+    # gui --snapshot FILE [--watch N] [--no-gh] -> write the page, and with
+    # --watch keep rewriting it so an open browser follows along. Read-only:
+    # nothing in the page acts, so there is nothing to attack and nothing to
+    # miss when the server this tool does not have is absent.
+    local snapshot='' watch='' no_gh=0 first=1 json args
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --snapshot) snapshot=${2:-}; shift 2 ;;
+            --watch) watch=${2:-}; shift 2 ;;
+            --no-gh) no_gh=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "gui: unsupported argument: $1" ;;
+        esac
+    done
+    [ -n "$snapshot" ] || die "gui: --snapshot FILE is required"
+    if [ -n "$watch" ]; then
+        is_num "$watch" || die "gui: --watch must be a number"
+        [ "$watch" -ge 1 ] || die "gui: --watch must be at least 1 second"
+    fi
+    mkdir -p "$(dirname "$snapshot")"
+    while :; do
+        args=(--json)
+        if [ "$no_gh" = 1 ]; then
+            args+=(--no-gh)
+        fi
+        json=$(sessions "${args[@]}")
+        snapshot_html "$snapshot" "$json" "$watch"
+        if [ "$first" = 1 ]; then
+            note "snapshot=$snapshot"
+            [ -z "$watch" ] || note "watch_seconds=$watch"
+            first=0
+        fi
+        [ -n "$watch" ] || return 0
+        sleep "$watch"
+    done
 }
 
 pr_json_array() {
@@ -1318,6 +1594,7 @@ case "$cmd" in
     status) status "$@" ;;
     list|ls) list_agents "$@" ;;
     sessions|ps) sessions "$@" ;;
+    gui) gui "$@" ;;
     attach) attach "$@" ;;
     send) send "$@" ;;
     watch) watch "$@" ;;
