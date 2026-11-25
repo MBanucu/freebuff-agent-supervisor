@@ -1,0 +1,34 @@
+name: deviceless
+
+# The deviceless suite is the only check this repository can run without a
+# Freebuff account: a fake tmux serves fixture panes, so no session, slot,
+# network or gh is needed. The ruleset on main requires this job by name.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deviceless:
+    name: deviceless
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # The suite never launches Freebuff, but `start` resolves the binary
+      # before it reaches the launch gate, so a stub keeps that path honest
+      # on a runner without the CLI installed.
+      - name: Stub freebuff on PATH
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '#!/usr/bin/env bash\nexit 0\n' >"$RUNNER_TEMP/bin/freebuff"
+          chmod +x "$RUNNER_TEMP/bin/freebuff"
+          printf '%s\n' "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+
+      - name: Run the deviceless suite
+        run: ./spawn-freebuff-agent-test.sh
