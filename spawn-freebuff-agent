@@ -34,7 +34,24 @@ BRIEF_LEDGER_KEEP=20
 # the spinner glyphs are kept for other builds.
 BUSY_RE='esc to interrupt|thinking\.\.\.|working\.\.\.|■ Esc|[◐◓◑◒]'
 PROTECTED_RE='approval|approve|Allow once|Allow always|Run command|permission|rate limit|Can.t reach Freebuff'
-REFUSED_RE='concurrent-session limit|Take over to stop another session'
+# A refusal is not only the concurrent-session overlay. The vendor also
+# answers a brief as a finished turn, above the resting prompt: "Freebuff did
+# not send this message to the model ... the same message sent over and over
+# ... counts as strike 1 today", usually with an account budget line. A
+# session that shows that answer is not healthy and idle: the account was
+# penalised. Keep the phrases specific enough that an agent discussing the
+# policy in its own prose does not match them.
+REFUSED_RE='session limit|Take over to stop another session|did not send this message to the model|Scripted or automated use|sent over and over|automated account or site farming|counts as strike [0-9]+|strike [0-9]+ today|account budget|daily budget|budget (is )?(exhausted|exceeded|reached|remaining|left)|remaining budget|out of (daily )?hours|daily hours (refill|reset)'
+# Only the overlay offers an Enter that takes over another live session, so
+# send refuses to type into a pane carrying one of these strings.
+REFUSAL_OVERLAY_RE='concurrent-session limit|session limit across CLI and Desktop|Take over to stop another session'
+# A refusal is written here as well as to .supervisor.log. The file is what
+# keeps status at refused after the sentence has scrolled away; stop removes
+# it, so a refusal lasts until the session is explicitly stopped.
+REFUSAL_FILE='.refusal'
+# Turn text sits above the visible prompt, so refusal detection reads this
+# many lines of scrollback rather than the 12-line chrome window.
+REFUSAL_WINDOW=40
 
 usage() {
     cat <<'USAGE'
@@ -153,7 +170,13 @@ Notes:
   - A brief is hashed into .supervisor-briefs.jsonl (last 20 kept) before it
     is typed; a repeat inside that window is a hard error and sends nothing,
     because Freebuff treats a repeated message as scripted use and counts a
-    strike against the account.
+    strike against the account. A brief the vendor refused is marked in the
+    same ledger, kept past the window and never sent again.
+  - A refusal (the concurrent-session overlay or the vendor's anti-automation
+    answer in the turn text) is recorded in .worktrees/<name>/.refusal and
+    .supervisor.log. start prints refused=yes with the sentence and exits
+    non-zero; the overlay gets no keys at all, and status keeps refused until
+    stop clears it.
   - Completion is either the agent's .agent-result file (stock brief) or an
     idle pane after the window; the pane heuristic is tied to the TUI.
   - The tool never deletes a worktree or branch. Use git worktree remove and
@@ -272,6 +295,47 @@ result_state() {
         done|blocked|failed) printf '%s' "$state" ;;
         *) printf 'unknown' ;;
     esac
+}
+
+refusal_recorded() {
+    # refusal_recorded WORKTREE -> the recorded refusal sentence, empty when
+    # the session has not been refused. This survives the pane: the vendor's
+    # answer scrolls away while the account stays penalised.
+    local file="$1/$REFUSAL_FILE"
+    [ -f "$file" ] || return 0
+    head -n 1 "$file" 2>/dev/null | tr -d '\r' || true
+}
+
+refusal_sentence() {
+    # refusal_sentence TEXT -> every line of TEXT that matches a refusal,
+    # joined into one line. The anti-automation answer is wrapped prose, so
+    # matching lines are what names the refusal without recording the pane.
+    local text=${1-} line out=''
+    while IFS= read -r line; do
+        printf '%s' "$line" | grep -qiE "$REFUSED_RE" || continue
+        line=$(printf '%s' "$line" | sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//')
+        [ -n "$line" ] || continue
+        out+="${out:+ }$line"
+    done <<<"$text"
+    printf '%s' "$out"
+}
+
+refusal_record() {
+    # refusal_record WORKTREE SENTENCE -> persist the state and the evidence.
+    # The sentence goes to .supervisor.log (not the pane), and .refusal is
+    # what keeps status at refused until stop clears it.
+    local wt="$1" sentence="$2"
+    [ -d "$wt" ] || return 0
+    printf '%s\n' "$sentence" >"$wt/$REFUSAL_FILE"
+    printf 'refused at=%s sentence=%s\n' \
+        "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$sentence" >>"$wt/.supervisor.log"
+}
+
+clear_refusal() {
+    # clear_refusal WORKTREE -> stop is the only thing that clears a refusal
+    local wt="$1"
+    [ -d "$wt" ] || return 0
+    rm -f "$wt/$REFUSAL_FILE"
 }
 
 json_str() {
@@ -591,7 +655,7 @@ pr_json_array() {
 
 session_state() {
     # session_state NAME -> done|refused|working|idle|missing
-    local name="$1" session="fb-$1" tmux pane chrome
+    local name="$1" session="fb-$1" tmux pane chrome sentence
     tmux=$(tmux_bin 2>/dev/null || true)
     [ -n "$tmux" ] || {
         printf 'missing'
@@ -601,18 +665,28 @@ session_state() {
         printf 'missing'
         return 0
     }
+    # A refusal recorded by start outranks the pane: the turn ends, the
+    # sentence scrolls away and the prompt comes back, but the account is
+    # still penalised. stop removes the file.
+    sentence=$(refusal_recorded "$ROOT/.worktrees/$name")
+    if [ -n "$sentence" ]; then
+        printf 'refused'
+        return 0
+    fi
     case "$(result_state "$ROOT/.worktrees/$name")" in
         done|blocked|failed)
             printf 'done'
             return 0
             ;;
     esac
-    pane=$("$tmux" capture-pane -p -t "$session" 2>/dev/null || true)
-    chrome=$(printf '%s\n' "$pane" | tail -n 12)
-    if printf '%s' "$chrome" | grep -qiE "$REFUSED_RE"; then
+    # The refusal can be the turn text above the resting prompt, not just the
+    # 12-line chrome window, so scan enough scrollback to see the answer.
+    pane=$("$tmux" capture-pane -p -t "$session" -S "-$REFUSAL_WINDOW" 2>/dev/null || true)
+    if printf '%s\n' "$pane" | grep -qiE "$REFUSED_RE"; then
         printf 'refused'
         return 0
     fi
+    chrome=$(printf '%s\n' "$pane" | tail -n 12)
     if printf '%s' "$chrome" | grep -qE "$BUSY_RE"; then
         printf 'working'
         return 0
@@ -699,13 +773,19 @@ EOF
 }
 
 wait_ready() {
+    # wait_ready TMUX SESSION -> 0 ready, 2 refused, 1 never ready. A refusal
+    # is checked first: the overlay never draws the resting prompt, and typing
+    # into it would take over another live session instead of starting this one.
     local tmux="$1" session="$2" i tty pane
     for i in $(seq 1 90); do
         if ! "$tmux" has-session -t "$session" 2>/dev/null; then
             return 1
         fi
         tty=$("$tmux" display-message -p -t "$session" '#{pane_tty}' 2>/dev/null || true)
-        pane=$("$tmux" capture-pane -p -t "$session" 2>/dev/null || true)
+        pane=$("$tmux" capture-pane -p -t "$session" -S "-$REFUSAL_WINDOW" 2>/dev/null || true)
+        if printf '%s\n' "$pane" | grep -qiE "$REFUSED_RE"; then
+            return 2
+        fi
         if [ -n "$tty" ] &&
             stty -a -F "$tty" 2>/dev/null | grep -q -- '-icanon' &&
             printf '%s' "$pane" | grep -q 'Enter a coding task'; then
@@ -743,30 +823,82 @@ brief_ledger_seen() {
     grep -F "\"hash\": \"$1\"" "$file" 2>/dev/null | tail -n 1 || true
 }
 
+brief_ledger_trim() {
+    # Keep the last BRIEF_LEDGER_KEEP entries, plus every entry marked refused.
+    # A refused brief is never resent, so its hash has to outlive the window
+    # instead of ageing out and being typed again next week.
+    local file tmp
+    file=$(brief_ledger_file)
+    [ -f "$file" ] || return 0
+    tmp="$file.tmp.$$"
+    awk -v keep="$BRIEF_LEDGER_KEEP" '
+        { line[NR] = $0; if ($0 ~ /"refused": true/) keepit[NR] = 1 }
+        END {
+            first = NR - keep + 1
+            if (first < 1) first = 1
+            for (i = 1; i <= NR; i++) {
+                if (keepit[i] || i >= first) print line[i]
+            }
+        }
+    ' "$file" >"$tmp"
+    mv "$tmp" "$file"
+}
+
 brief_ledger_record() {
-    # brief_ledger_record HASH NAME BRANCH -> one JSON line, then trim to the
-    # last BRIEF_LEDGER_KEEP so the window stays small and recent.
-    local file line
+    # brief_ledger_record HASH NAME BRANCH [REFUSED] -> one JSON line, then
+    # trim. REFUSED marks the text as one the vendor rejected, which the
+    # ledger keeps past the window.
+    local file line refused=${4:-}
     file=$(brief_ledger_file)
     mkdir -p "$(dirname "$file")"
-    line=$(printf '{"at": %s, "name": %s, "branch": %s, "hash": %s}' \
-        "$(json_str "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")" \
-        "$(json_str "${2:-}")" "$(json_str "${3:-}")" "$(json_str "${1:-}")")
+    if [ -n "$refused" ]; then
+        line=$(printf '{"at": %s, "name": %s, "branch": %s, "hash": %s, "refused": true}' \
+            "$(json_str "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")" \
+            "$(json_str "${2:-}")" "$(json_str "${3:-}")" "$(json_str "${1:-}")")
+    else
+        line=$(printf '{"at": %s, "name": %s, "branch": %s, "hash": %s}' \
+            "$(json_str "$(date -u '+%Y-%m-%dT%H:%M:%SZ')")" \
+            "$(json_str "${2:-}")" "$(json_str "${3:-}")" "$(json_str "${1:-}")")
+    fi
     printf '%s\n' "$line" >>"$file"
-    tail -n "$BRIEF_LEDGER_KEEP" "$file" >"$file.tmp.$$"
-    mv "$file.tmp.$$" "$file"
+    brief_ledger_trim
+}
+
+brief_ledger_mark_refused() {
+    # brief_ledger_mark_refused HASH NAME BRANCH -> mark the send that the
+    # vendor refused. This is the same ledger as #48, not a second one: the
+    # hash that was typed is the hash that must never be typed again.
+    local file hash=$1 name=${2:-} branch=${3:-} tmp
+    file=$(brief_ledger_file)
+    mkdir -p "$(dirname "$file")"
+    if [ -f "$file" ] && grep -qF "\"hash\": \"$hash\"" "$file"; then
+        tmp="$file.tmp.$$"
+        awk -v h="\"hash\": \"$hash\"" '
+            index($0, h) && index($0, "\"refused\": true") == 0 {
+                sub(/\}$/, ", \"refused\": true}")
+            }
+            { print }
+        ' "$file" >"$tmp"
+        mv "$tmp" "$file"
+    else
+        brief_ledger_record "$hash" "$name" "$branch" refused
+    fi
+    brief_ledger_trim
 }
 
 refuse_sent_brief() {
-    # refuse_sent_brief HASH -> die when that text was already sent recently.
-    # This runs before the worktree is created, so a refusal costs no worktree
-    # and no keystroke; the vendor's rule and the earlier send are named so the
-    # caller can change the brief instead of retrying blindly.
+    # refuse_sent_brief HASH -> die when that text was already sent recently
+    # or was refused by the vendor at any time. This runs before the worktree
+    # is created, so a refusal costs no worktree and no keystroke; the earlier
+    # send is named so the caller can change the brief instead of retrying.
     local seen at prev
     seen=$(brief_ledger_seen "$1")
     [ -n "$seen" ] || return 0
     at=$(printf '%s' "$seen" | sed -n 's/.*"at": "\([^"]*\)".*/\1/p')
     prev=$(printf '%s' "$seen" | sed -n 's/.*"name": "\([^"]*\)".*/\1/p')
+    if printf '%s' "$seen" | grep -q '"refused": true'; then
+        die "start: refusing a brief Freebuff already refused: its text was sent to ${prev:-another session} at ${at:-an earlier run} (hash $1) and rejected as scripted or automated use. A refused brief is never resent, so nothing was sent and nothing was created. Give this session different text (a different issue, name or --prompt)."
+    fi
     die "start: refusing a duplicate brief: its text was already sent to ${prev:-another session} at ${at:-an earlier run} (hash $1). Freebuff refuses a repeated identical message as scripted or automated use and counts a strike, so nothing was sent and nothing was created. Give this session a different brief, name or issue, or pass a different --prompt."
 }
 
@@ -804,6 +936,7 @@ start() {
     local sdk_dir="" dry=0 nostart=0 autostop=0 idle=120 poll=5
     local idle_set=0 poll_set=0 max_sessions=0 wait_slot=0 slot_wait=300
     local prompt_text="" sent brief_hash_value jitter_max jitter=0
+    local ready_rc=0 pane refusal=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --issue) issue=${2:-}; shift 2 ;;
@@ -966,7 +1099,23 @@ start() {
     printf -v cmd 'TERM=xterm-256color %q --cwd %q --trust-agents' "$fb" "$wt"
     "$tmux" new-session -d -s "$session" -x "$COLS" -y "$ROWS" -c "$wt" "$cmd"
 
-    if ! wait_ready "$tmux" "$session"; then
+    wait_ready "$tmux" "$session" || ready_rc=$?
+    if [ "$ready_rc" -eq 2 ]; then
+        # The overlay is a refusal, not a slow start. Its Enter key takes over
+        # another live session, so no keys are typed at all; the worktree and
+        # the sentence are kept so status reports refused until stop.
+        pane=$("$tmux" capture-pane -p -t "$session" -S "-$REFUSAL_WINDOW" 2>/dev/null || true)
+        refusal=$(refusal_sentence "$pane")
+        [ -n "$refusal" ] || refusal='Freebuff refused the launch'
+        refusal_record "$wt" "$refusal"
+        "$tmux" kill-session -t "$session" 2>/dev/null || true
+        note "session=$session"
+        note 'refused=yes'
+        note "refusal=$refusal"
+        note 'sent=no'
+        die "start: Freebuff refused the launch before the brief was sent: $refusal (no keys typed; worktree kept at $wt)"
+    fi
+    if [ "$ready_rc" -ne 0 ]; then
         printf '%s\n' '--- last pane lines ---'
         "$tmux" capture-pane -p -t "$session" -S -15 2>/dev/null || true
         # A pane that never reached raw input can never accept the brief, so it
@@ -991,6 +1140,24 @@ start() {
     # blocks a retry with text nobody saw.
     brief_ledger_record "$brief_hash_value" "$name" "$branch"
     sleep 2
+
+    # The vendor's anti-automation answer arrives as a finished turn, not as
+    # chrome: the sentence is above the resting prompt and the session looks
+    # idle. Check the turn text before claiming the launch succeeded.
+    pane=$("$tmux" capture-pane -p -t "$session" -S "-$REFUSAL_WINDOW" 2>/dev/null || true)
+    if printf '%s\n' "$pane" | grep -qiE "$REFUSED_RE"; then
+        refusal=$(refusal_sentence "$pane")
+        [ -n "$refusal" ] || refusal='Freebuff refused the brief'
+        refusal_record "$wt" "$refusal"
+        # Reuse the #48 ledger: this exact text was refused, so it must never
+        # be typed again, even after it would have aged out of the window.
+        brief_ledger_mark_refused "$brief_hash_value" "$name" "$branch"
+        note "session=$session"
+        note 'refused=yes'
+        note "refusal=$refusal"
+        note 'resent=no'
+        die "start: Freebuff refused the brief: $refusal (not resent; worktree kept at $wt)"
+    fi
 
     note "session=$session"
     note "started=yes"
@@ -1079,8 +1246,11 @@ status() {
         fi
     else
         sstate=missing
+        # A recorded refusal outlives the session: start stops a refused
+        # launch, but status must keep saying refused until stop clears it.
+        [ -z "$(refusal_recorded "$wt")" ] || sstate=refused
         if [ "$json" = 0 ]; then
-            printf 'running=no\nsession_state=missing\n'
+            printf 'running=no\nsession_state=%s\n' "$sstate"
         fi
     fi
 
@@ -1190,6 +1360,7 @@ list_agents() {
         else
             state=$(result_state "$wt")
             [ -n "$state" ] || state=unknown
+            [ -z "$(refusal_recorded "$wt")" ] || state=refused
         fi
         printf '%-22s %-30s %-26s %-8s %-10s %s\n' \
             "$name" "$branch" "$session" "$running" "$state" "$idle"
@@ -1325,6 +1496,7 @@ sessions() {
         elif [ "$worktree" = yes ]; then
             state=$(result_state "$wt")
             [ -n "$state" ] || state=stopped
+            [ -z "$(refusal_recorded "$wt")" ] || state=refused
         else
             state=-
         fi
@@ -1417,6 +1589,8 @@ reap() {
     else
         note "stopped=no (session already gone) reason=$reason log=$log"
     fi
+    # The stop is what ends a refusal; the sentence stays in the log above.
+    clear_refusal "$wt"
 }
 
 watch_run() {
@@ -1693,13 +1867,19 @@ attach() {
 }
 
 send() {
-    local name=${1:-} text=${2:-} tmux
+    local name=${1:-} text=${2:-} tmux pane
     [ -n "$name" ] || die "send: NAME is required"
     valid_name "$name" || die "send: invalid name"
     [ -n "$text" ] || die "send: TEXT is required"
     tmux=$(tmux_bin) || die "send: tmux not found"
     "$tmux" has-session -t "fb-$name" 2>/dev/null ||
         die "send: session fb-$name is not running"
+    # The overlay's Enter takes over and stops another live session. Never
+    # type into it: a follow-up is not worth killing a sibling agent.
+    pane=$("$tmux" capture-pane -p -t "fb-$name" -S "-$REFUSAL_WINDOW" 2>/dev/null || true)
+    if printf '%s\n' "$pane" | grep -qiE "$REFUSAL_OVERLAY_RE"; then
+        die "send: fb-$name is on the concurrent-session overlay; no keys were sent (Enter would take over another session; stop it first)"
+    fi
     "$tmux" send-keys -t "fb-$name" -l "$text"
     sleep 0.2
     "$tmux" send-keys -t "fb-$name" C-m
@@ -1722,12 +1902,16 @@ stop() {
     tmux=$(tmux_bin) || die "stop: tmux not found"
 
     if ! "$tmux" has-session -t "fb-$name" 2>/dev/null; then
+        # The session may already be gone after a refused launch; stop is
+        # still the action that clears the recorded refusal.
+        clear_refusal "$ROOT/.worktrees/$name"
         note "stopped=no (fb-$name not running)"
         return 0
     fi
 
     if [ "$graceful" = 0 ]; then
         "$tmux" kill-session -t "fb-$name"
+        clear_refusal "$ROOT/.worktrees/$name"
         note "stopped=fb-$name"
         return 0
     fi
