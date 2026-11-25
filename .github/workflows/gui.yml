@@ -1,0 +1,35 @@
+name: gui
+
+# The gui suite drives gui/server.py over loopback with curl: a fake tmux
+# serves the fixture panes, so no Freebuff, account slot, gh or network is
+# needed. It is a separate job from `deviceless` because it is a separate
+# required check, and it is named `gui` so a ruleset can require it.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gui:
+    name: gui
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # The server shells out to the CLI, which resolves the Freebuff binary
+      # at startup; the suite never launches one, so a stub keeps that path
+      # honest on a runner without the CLI installed.
+      - name: Stub freebuff on PATH
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          printf '#!/usr/bin/env bash\nexit 0\n' >"$RUNNER_TEMP/bin/freebuff"
+          chmod +x "$RUNNER_TEMP/bin/freebuff"
+          printf '%s\n' "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
+
+      - name: Run the gui server suite
+        run: ./gui-test.sh
