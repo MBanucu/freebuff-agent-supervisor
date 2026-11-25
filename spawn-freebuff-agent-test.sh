@@ -116,6 +116,7 @@ mkdir -p "$FAKE_DIR" "$TMP/bin"
 : >"$FAKE_DIR/tty"
 : >"$FAKE_DIR/killed"
 : >"$FAKE_DIR/escaped"
+: >"$FAKE_DIR/sent"
 cat >"$TMP/bin/tmux" <<'FAKE'
 #!/usr/bin/env bash
 d=${FAKE_TMUX_DIR:?}
@@ -140,6 +141,13 @@ case "${1:-}" in
             if [ -f "$d/pane_after_escape" ]; then
                 mv "$d/pane_after_escape" "$d/pane"
             fi
+        else
+            # One tab-separated line per call, so a test can prove that a
+            # literal text arrived as a single argument instead of being
+            # split by a shell.
+            line=''
+            for arg in "$@"; do line+="$arg"$'\t'; done
+            printf '%s\n' "$line" >>"$d/sent"
         fi
         ;;
     kill-session)
@@ -166,11 +174,13 @@ fake_session() {
     printf 'fb-%s\n' "$1" >"$FAKE_DIR/session"
     printf '%s\n' "${3:-$(date +%s)}" >"$FAKE_DIR/activity"
     : >"$FAKE_DIR/killed"
+    : >"$FAKE_DIR/sent"
 }
 
 fake_clear() {
     rm -f "$FAKE_DIR/session"
     : >"$FAKE_DIR/killed"
+    : >"$FAKE_DIR/sent"
 }
 
 fake_add_session() {
@@ -698,6 +708,103 @@ print("\n".join(s["name"] for s in json.load(sys.stdin)))')
     check grep -qi '^set-cookie: fb_token=s3cret' "$TMP/gui.headers"
     check grep -qi 'httponly' "$TMP/gui.headers"
 
+    # ---- actions (#22) ----
+    # Each action is one CLI call, so the fake tmux is the observable: it
+    # records kills and the literal send text, and the HTTP layer is checked
+    # for its status, its body and the argv it produced.
+    rm -f "$WT/.agent-result"
+
+    # a graceful stop of an idle session kills fb-test-999 and records why
+    rm -f "$WT/.supervisor.log"
+    fake_session test-999 "$IDLE_PANE"
+    code=$(curl -sS --max-time 30 -o "$TMP/gui.body" -w '%{http_code}' \
+        -X POST -H 'Authorization: Bearer s3cret' \
+        "$base/api/session/test-999/stop?graceful=1" || true)
+    check test "$code" = 202
+    check contains "$(cat "$TMP/gui.body")" 'stopped=fb-test-999'
+    check grep -qxF 'fb-test-999' "$FAKE_DIR/killed"
+    check contains "$(cat "$WT/.supervisor.log")" 'reason=graceful'
+    check contains "$(cat "$WT/.supervisor.log")" 'pane_state=idle'
+
+    # a turn that is still working is a 409 with the CLI's message and the
+    # session survives: "stopped" and "still busy" must not both be 202
+    rm -f "$FAKE_DIR/pane_after_escape"
+    fake_session test-999 "$BUSY_PANE"
+    code=$(curl -sS --max-time 60 -o "$TMP/gui.body" -w '%{http_code}' \
+        -X POST -H 'Authorization: Bearer s3cret' \
+        "$base/api/session/test-999/stop?graceful=1" || true)
+    check test "$code" = 409
+    check contains "$(cat "$TMP/gui.body")" 'still busy'
+    check test ! -s "$FAKE_DIR/killed"
+    check grep -qxF 'fb-test-999' "$FAKE_DIR/session"
+
+    # send passes the text as one argv element: no shell, no word splitting
+    fake_session test-999 "$IDLE_PANE"
+    pwned="$TMP/pwned-$$"
+    send_text="line one; \$(touch $pwned) && echo two"
+    payload=$(printf '{"text": "%s"}' "$send_text")
+    code=$(curl -sS --max-time 10 -o "$TMP/gui.body" -w '%{http_code}' \
+        -X POST -H 'Authorization: Bearer s3cret' \
+        -H 'Content-Type: application/json' -d "$payload" \
+        "$base/api/session/test-999/send" || true)
+    check test "$code" = 202
+    check test -z "$(cat "$TMP/gui.body")"
+    check grep -qF -- "-l"$'\t'"$send_text"$'\t' "$FAKE_DIR/sent"
+    check test ! -e "$pwned"
+
+    # the text is body-only: a query string cannot smuggle one in
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+        -X POST -H 'Authorization: Bearer s3cret' \
+        "$base/api/session/test-999/send?text=fromurl" || true)
+    check test "$code" = 400
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+        -X POST -H 'Authorization: Bearer s3cret' \
+        -H 'Content-Type: application/json' -d '{"text": ""}' \
+        "$base/api/session/test-999/send" || true)
+    check test "$code" = 400
+
+    # every POST needs the token, even on loopback, and a refusal changes nothing
+    : >"$FAKE_DIR/killed"
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X POST \
+        "$base/api/session/test-999/stop?graceful=1" || true)
+    check test "$code" = 401
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X POST \
+        -H 'Authorization: Bearer wrong' \
+        "$base/api/session/test-999/stop?graceful=1" || true)
+    check test "$code" = 401
+    check test ! -s "$FAKE_DIR/killed"
+    check grep -qxF 'fb-test-999' "$FAKE_DIR/session"
+
+    # unknown name is 404; a crafted name is 400 before any path or process
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X POST \
+        -H 'Authorization: Bearer s3cret' "$base/api/session/nope/stop" || true)
+    check test "$code" = 404
+    code=$(curl -sS --max-time 10 --path-as-is -o /dev/null -w '%{http_code}' \
+        -X POST -H 'Authorization: Bearer s3cret' \
+        "$base/api/session/../etc/stop" || true)
+    check test "$code" = 400
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X POST \
+        -H 'Authorization: Bearer s3cret' \
+        "$base/api/session/%2e%2e%2fetc/stop" || true)
+    check test "$code" = 400
+
+    # gc: dry-run reports what it would stop and changes nothing
+    printf 'state=done\npr=none\n' >"$WT/.agent-result"
+    fake_session test-999 "$IDLE_PANE"
+    code=$(curl -sS --max-time 30 -o "$TMP/gui.body" -w '%{http_code}' \
+        -X POST -H 'Authorization: Bearer s3cret' "$base/api/gc?dry=1" || true)
+    check test "$code" = 202
+    check contains "$(cat "$TMP/gui.body")" 'would-stop name=test-999 reason=done'
+    check test ! -s "$FAKE_DIR/killed"
+
+    # and the plain call performs it, with the CLI's own report
+    code=$(curl -sS --max-time 30 -o "$TMP/gui.body" -w '%{http_code}' \
+        -X POST -H 'Authorization: Bearer s3cret' "$base/api/gc" || true)
+    check test "$code" = 202
+    check contains "$(cat "$TMP/gui.body")" 'stop name=test-999 reason=done'
+    check grep -qxF 'fb-test-999' "$FAKE_DIR/killed"
+    rm -f "$WT/.agent-result"
+
     # --read-only answers every POST with 403 and leaves GET alone
     : >"$TMP/gui-ro.out"
     bash "$TOOL" --root "$REPO" gui --serve --port 0 --token s3cret \
@@ -717,6 +824,9 @@ print("\n".join(s["name"] for s in json.load(sys.stdin)))')
     code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X POST \
         -H 'Authorization: Bearer s3cret' \
         "$ro_base/api/session/test-999/stop" || true)
+    check test "$code" = 403
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X POST \
+        -H 'Authorization: Bearer s3cret' "$ro_base/api/gc?dry=1" || true)
     check test "$code" = 403
     code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
         -H 'Authorization: Bearer s3cret' "$ro_base/api/sessions" || true)

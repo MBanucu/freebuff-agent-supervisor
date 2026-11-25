@@ -80,13 +80,16 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       --no-gh     do not ask gh for the PR
 
   spawn-freebuff-agent gui --serve [--port N] [--host H] [--token T] [--read-only]
-      Serve a read-only dashboard and JSON API from python3's standard
-      library: GET / is the --snapshot page, GET /api/sessions is
-      `sessions --json` verbatim and GET /api/session/<name>/pane is
-      `status --json`. Binds 127.0.0.1:7788 by default; a non-loopback host
-      is refused unless --token is given. Without --token one is generated
-      and printed once. --read-only answers every POST with 403. No TLS: put
-      a reverse proxy in front for LAN or Tailscale access.
+      Serve the dashboard and JSON API from python3's standard library:
+      GET / is the --snapshot page, GET /api/sessions is `sessions --json`
+      verbatim and GET /api/session/<name>/pane is `status --json`. POST
+      /api/session/<name>/stop[?graceful=1], /api/session/<name>/send (JSON
+      {"text": ...}) and /api/gc[?dry=1] run the matching CLI command and
+      answer 202 with its key=value output. Binds 127.0.0.1:7788 by default;
+      a non-loopback host is refused unless --token is given. Without --token
+      one is generated and printed once. Every POST needs the token even on
+      loopback; --read-only answers them 403. No TLS: put a reverse proxy in
+      front for LAN or Tailscale access.
 
   spawn-freebuff-agent attach NAME
       Attach to the tmux session (detach with Ctrl-b d).
