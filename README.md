@@ -147,6 +147,7 @@ session_state=done          # live: done, idle, working, refused or missing
 spawn-freebuff-agent list
 spawn-freebuff-agent sessions
 spawn-freebuff-agent sessions --json
+spawn-freebuff-agent gui --snapshot /tmp/agents.html --watch 5
 spawn-freebuff-agent status 103-example --lines 40
 spawn-freebuff-agent status 103-example --no-gh
 spawn-freebuff-agent status 103-example --json
@@ -242,13 +243,41 @@ git branch -d issue/103-example
 
 `stop` only kills the tmux session; the worktree and branch remain.
 
+## Static snapshot
+
+`gui --snapshot FILE [--watch N]` writes one self-contained HTML page from
+`sessions --json`: one card per session with name, state, idle time, watcher,
+worktree, result, branch, PR, and — for a session with a worktree — the
+commit and the result file's `tests` line. A done session is green, a working
+one amber, a failed or refused one red, and a session with no worktree carries
+a `no worktree` tag.
+
+```bash
+spawn-freebuff-agent gui --snapshot /tmp/agents.html
+spawn-freebuff-agent gui --snapshot /tmp/agents.html --watch 5
+```
+
+There is no server, no network and no auth: the file is opened directly or
+served by any static host, so it works on a phone and nothing listens to be
+attacked. There are no external assets — CSS is inline and there is no
+script — so `file://` works offline and a strict CSP cannot break the view
+(the page declares `default-src 'none'; style-src 'unsafe-inline'; img-src
+data:`). `--watch N` rewrites the file every N seconds and adds
+`<meta http-equiv="refresh" content="N">`, so an open browser follows along
+without JavaScript. Without it, a single snapshot is written and the command
+exits.
+
+An empty repository renders `no sessions` instead of an empty table. Every
+rendered value is HTML-escaped, because branch names, PR URLs, commit subjects
+and the `tests` line are arbitrary text. The page is read-only: it offers no
+buttons that only pretend to act.
+
 ## Browser GUI (read-only)
 
-`gui --serve` serves the inventory over HTTP from python3's standard library:
-no third-party packages, no JavaScript and no external assets. It is a thin
-layer over the CLI — `/api/sessions` is `sessions --json` and
-`/api/session/<name>/pane` is `status NAME --json` — so it detects no state of
-its own.
+`gui --serve` serves that page over HTTP from python3's standard library, with
+no third-party packages. `GET /` runs the same `gui --snapshot` renderer into a
+temporary file, so the server owns no second markup, and `/api/sessions` is
+`sessions --json` verbatim — the CLI stays the only source of state.
 
 ```bash
 spawn-freebuff-agent gui --serve                    # http://127.0.0.1:7788

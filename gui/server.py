@@ -6,7 +6,7 @@ it shells out to `sessions --json` and `status NAME --json` and returns what
 those print. Standard library only (`http.server`), no third-party packages.
 
 Routes:
-  GET /                        dashboard, from `sessions --json`
+  GET /                        the page `gui --snapshot` writes
   GET /api/sessions            `sessions --json`, verbatim
   GET /api/session/N/pane      `status N --json`, verbatim
   POST anything                403 with --read-only; actions arrive in #22
@@ -33,11 +33,10 @@ import secrets
 import socket
 import subprocess
 import sys
+import tempfile
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, unquote, urlsplit
-
-import render
 
 COOKIE = "fb_token"
 NAME_RE = re.compile(r"[A-Za-z0-9_-]+")
@@ -229,24 +228,22 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, result.stdout, "application/json", extra)
 
     def _dashboard(self, extra):
-        result = self._run(["sessions", "--json"])
-        if result.returncode != 0:
-            message = (result.stderr or result.stdout).decode(
-                "utf-8", "replace").strip() or "sessions failed"
-            self._json(500, {"error": message}, extra=extra)
-            return
-        try:
-            sessions = json.loads(result.stdout.decode("utf-8"))
-        except (UnicodeDecodeError, ValueError):
-            self._json(500, {"error": "sessions --json did not parse"},
-                       extra=extra)
-            return
-        if not isinstance(sessions, list):
-            self._json(500, {"error": "sessions --json was not an array"},
-                       extra=extra)
-            return
-        page = render.render_dashboard(
-            sessions, read_only=self.server.read_only).encode("utf-8")
+        # Reuse the snapshot renderer instead of keeping a second markup: the
+        # page the browser gets is byte-for-byte what `gui --snapshot` writes.
+        with tempfile.TemporaryDirectory(prefix="freebuff-gui-") as tmp:
+            path = os.path.join(tmp, "dashboard.html")
+            result = self._run(["gui", "--snapshot", path])
+            if result.returncode != 0:
+                message = (result.stderr or result.stdout).decode(
+                    "utf-8", "replace").strip() or "snapshot failed"
+                self._json(500, {"error": message}, extra=extra)
+                return
+            try:
+                with open(path, "rb") as handle:
+                    page = handle.read()
+            except OSError as exc:
+                self._json(500, {"error": "dashboard: %s" % exc}, extra=extra)
+                return
         self._send(200, page, "text/html; charset=utf-8", extra)
 
 
