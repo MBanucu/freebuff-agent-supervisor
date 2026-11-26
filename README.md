@@ -258,7 +258,7 @@ what the pane is doing.
   {
     "name": "test-999",
     "state": "done",
-    "idle_seconds": 30,
+    "idle_seconds": null,
     "watcher": "pid:123",
     "worktree": "yes",
     "result": "blocked",
@@ -275,9 +275,12 @@ tail as a `pane` string, and the classifier's decision as the `evidence`
 object documented under completion.
 
 A missing value is `null` rather than the table's `-`: `idle_seconds` when the
-session is not running, `result` with no `.agent-result`, `branch` and `pr` for
-a session with no worktree, `watcher` with no autostop recorded, and `pane`
-when no session is running. `status` keeps `state` identical to the human
+session is not running or its state is terminal (`done`, `stopped`, `blocked`,
+`failed`) — a finished run has no idle time, so a done card cannot read `idle
+5495s` — `result` with no `.agent-result`, `branch` and `pr` for a session with
+no worktree, `watcher` with no autostop recorded, and `pane` when no session is
+running. Idle time comes back when the session is resumed and is no longer
+terminal. `status` keeps `state` identical to the human
 `state=` line (`unknown` when there is no result file) and adds
 `result_state`, which is `null` in that case, so a consumer can tell "nothing
 written yet" from "unusable state". `pr` in `sessions` is the row's PR URL;
@@ -307,8 +310,9 @@ git branch -d issue/103-example
 ## Static snapshot
 
 `gui --snapshot FILE [--watch N]` writes one self-contained HTML page from
-`sessions --json`: one card per session with name, state, idle time, watcher,
-worktree, result, branch, PR, and — for a session with a worktree — the
+`sessions --json`: one card per session with name, state, idle time (only while
+the session can still take a turn), watcher, worktree, result, branch, PR, and
+— for a session with a worktree — the
 commit and the result file's `tests` line. A done session is green, a working
 one amber, a failed or refused one red, and a session with no worktree carries
 a `no worktree` tag.
