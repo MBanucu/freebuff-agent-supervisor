@@ -18,6 +18,15 @@ Every mutating route is one CLI call: 202 with the CLI's own `key=value`
 output, or 409/500 with its exit status and message. Nothing here
 reimplements a decision the CLI makes, so the two cannot drift.
 
+The served page also carries Stop / Stop (graceful) / gc forms. A form POST
+is cookie-authenticated, so it must carry the per-server `form_nonce` and
+must not present a foreign `Origin`, and a successful action answers 303
+back to `/` (gc: to a one-shot report URL) instead of a replayable body.
+Stop renders a confirmation page from the first POST and runs on the
+second, so a stray click cannot end a live session. A bearer-token POST
+needs no nonce, which is why curl and the CLI keep working, and
+`--read-only` serves no forms and still answers every POST 403.
+
 Auth: every request needs the token, compared in constant time. It is
 accepted as `Authorization: Bearer ...`, as the `fb_token` cookie, or as
 `?token=...` on GET so a browser can bootstrap the cookie. Without --token
@@ -31,6 +40,7 @@ and this server terminates no TLS, so put a reverse proxy in front of it.
 
 import argparse
 import hmac
+import html
 import http.cookies
 import ipaddress
 import json
@@ -56,6 +66,11 @@ CLI_TIMEOUT = 30
 # hostile Content-Length from turning a request thread into a sink.
 MAX_BODY = 64 * 1024
 TRUTHY = ("1", "true", "yes", "on")
+# An action that redirects carries its report in memory, under a one-shot key
+# in the Location, so a refresh cannot replay the POST and the report cannot
+# pile up: it is taken on the next GET, expires, or is evicted oldest first.
+FLASH_MAX = 20
+FLASH_SECONDS = 300
 TOOL = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "spawn-freebuff-agent",
@@ -141,6 +156,14 @@ class Server(ThreadingHTTPServer):
         self.ttyd = ttyd
         self.ttyd_wanted = ttyd_wanted
         self.interactive = interactive
+        # The CSRF secret, one per server process: SameSite=Strict does not
+        # separate two services on 127.0.0.1 (the port is not part of the
+        # site), so a form has to prove it came from this page. It dies with
+        # the process, like the token, and no static snapshot ever sees it.
+        self.form_nonce = secrets.token_urlsafe(24)
+        # one-shot action reports: key -> (monotonic stamp, text)
+        self.flashes = {}
+        self.flashes_lock = threading.Lock()
         # name -> (port, process); one viewer per session, started on demand.
         self.viewers = {}
         self.viewers_lock = threading.Lock()
@@ -202,6 +225,25 @@ class Server(ThreadingHTTPServer):
         proc.terminate()
         return "ttyd did not listen on 127.0.0.1:%d" % port
 
+    def remember_flash(self, text):
+        """Store an action's output and return the key that redirects to it."""
+        key = secrets.token_urlsafe(16)
+        now = time.monotonic()
+        with self.flashes_lock:
+            for stale, (stamp, _) in list(self.flashes.items()):
+                if now - stamp > FLASH_SECONDS:
+                    del self.flashes[stale]
+            while len(self.flashes) >= FLASH_MAX:
+                del self.flashes[next(iter(self.flashes))]
+            self.flashes[key] = (now, text)
+        return key
+
+    def take_flash(self, key):
+        """The stored report for KEY, consumed once; empty when unknown."""
+        with self.flashes_lock:
+            item = self.flashes.pop(key, None)
+        return item[1] if item else ""
+
     def shutdown_viewers(self):
         with self.viewers_lock:
             viewers, self.viewers = self.viewers, {}
@@ -223,6 +265,23 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "freebuff-gui/1"
     sys_version = ""
 
+    # The body is read at most once: a form POST and a JSON body both go
+    # through it, and the stream cannot be rewound.
+    _body_cache = None
+
+    PAGE_STYLE = (
+        "body{margin:0;padding:1.5rem;font:15px/1.5 system-ui,sans-serif;"
+        "color:#1b1f24;background:#f6f7f9}"
+        "h1{font-size:1.2rem;margin:0 0 .6rem}"
+        "p{max-width:42rem;color:#444c56}"
+        "form{display:inline-block;margin:.3rem .5rem .3rem 0}"
+        "button{font:inherit;padding:.35rem .9rem;border:1px solid #d8dee6;"
+        "border-radius:6px;background:#fff;cursor:pointer}"
+        "a{color:inherit}"
+        "pre{white-space:pre-wrap;background:#fff;border:1px solid #d8dee6;"
+        "border-radius:8px;padding:.8rem}"
+    )
+
     # ---- transport helpers ------------------------------------------------
 
     def _send(self, code, body, content_type, extra=()):
@@ -243,6 +302,34 @@ class Handler(BaseHTTPRequestHandler):
     def _json(self, code, payload, extra=()):
         body = (json.dumps(payload) + "\n").encode("utf-8")
         self._send(code, body, "application/json", extra)
+
+    def _redirect(self, location, extra=()):
+        """303 after a form action: the browser follows with a GET.
+
+        A POST that renders its result is replayable by a refresh; a redirect
+        is not, and the action has already happened exactly once.
+        """
+        self._send(303, b"", "text/plain; charset=utf-8",
+                   extra + [("Location", location)])
+
+    def _page(self, code, title, body, extra=()):
+        """A small server-rendered page, for a form's answer.
+
+        No script, no external assets: the same rule as the dashboard, so
+        these pages work with scripting disabled and with a strict CSP.
+        """
+        page = (
+            "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\n"
+            "<meta name=\"viewport\" content=\"width=device-width, "
+            "initial-scale=1\">\n"
+            "<meta http-equiv=\"Content-Security-Policy\" "
+            "content=\"default-src 'none'; style-src 'unsafe-inline'\">\n"
+            "<meta name=\"referrer\" content=\"no-referrer\">\n"
+            "<title>%s</title>\n<style>%s</style>\n</head>\n<body>\n%s\n"
+            "</body></html>\n"
+        ) % (html.escape(title), self.PAGE_STYLE, body)
+        self._send(code, page.encode("utf-8"), "text/html; charset=utf-8",
+                   extra)
 
     def log_message(self, fmt, *args):
         # The request line may carry ?token=; log only the path.
@@ -301,6 +388,7 @@ class Handler(BaseHTTPRequestHandler):
             self._json(500, {"error": "internal error"})
 
     def _route(self, method):
+        self._body_cache = None
         parsed = urlsplit(self.path)
         segments = [unquote(part) for part in parsed.path.split("/") if part]
         query = parse_qs(parsed.query, keep_blank_values=True)
@@ -337,9 +425,39 @@ class Handler(BaseHTTPRequestHandler):
                        extra=extra)
             return
 
+        # A form POST is cookie-authenticated, so the cookie alone is not
+        # proof the request came from a page this server rendered: another
+        # service on 127.0.0.1 is same-site and could send it. The nonce
+        # says the form came from here, and Origin says the browser did too.
+        # A bearer-token caller already had to read the secret and keeps the
+        # nonce-free path curl and the CLI tests rely on.
+        fields, form = {}, False
+        if method == "POST":
+            if not self._same_origin():
+                self._json(403, {"error": "cross-origin POST refused"},
+                           extra=extra)
+                return
+            parsed_fields = self._form_fields()
+            if parsed_fields is None:
+                return
+            fields = parsed_fields
+            nonce = fields.get("nonce", "")
+            form = bool(nonce) and hmac.compare_digest(
+                nonce.encode("utf-8"), self.server.form_nonce.encode("utf-8"))
+            if source == "cookie" and not form:
+                self._json(
+                    403,
+                    {"error": "missing or invalid form nonce; reload the page"},
+                    extra=extra)
+                return
+
         if method == "GET":
             if not segments:
-                return self._dashboard(extra)
+                # The gc report from a redirect is taken once, so a refresh
+                # shows the plain dashboard instead of replaying it.
+                key = (query.get("gc") or [""])[0]
+                return self._dashboard(
+                    extra, self.server.take_flash(key) if key else "")
             if segments == ["api", "sessions"]:
                 return self._proxy(["sessions", "--json"], 500, extra)
             # /tty/<name>: the dashboard's terminal link. The name is
@@ -357,9 +475,9 @@ class Handler(BaseHTTPRequestHandler):
                     ["status", name, "--json", "--no-gh"], 404, extra)
             return self._json(404, {"error": "no such route"}, extra=extra)
 
-        return self._post(parsed, query, extra)
+        return self._post(parsed, query, extra, form)
 
-    def _post(self, parsed, query, extra):
+    def _post(self, parsed, query, extra, form=False):
         """The mutating routes, each one a single CLI call.
 
         `stop`, `send` and `gc` stay the only place that knows what those
@@ -370,7 +488,9 @@ class Handler(BaseHTTPRequestHandler):
             argv = ["gc"]
             if flag(query, "dry"):
                 argv.append("--dry-run")
-            return self._action(argv, extra)
+            # The report is the point of the dry run, and a redirect cannot
+            # carry a body, so it travels under a one-shot key.
+            return self._action(argv, extra, form, flash=form)
 
         for suffix, action in (("/stop", "stop"), ("/send", "send")):
             name = self._name_from(parsed.path, suffix)
@@ -382,9 +502,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(404, {"error": "unknown session"}, extra=extra)
             if action == "stop":
                 argv = ["stop", name]
-                if flag(query, "graceful"):
+                graceful = flag(query, "graceful")
+                if graceful:
                     argv.append("--graceful")
-                return self._action(argv, extra)
+                # One click prepares the stop, the second performs it: a
+                # stray click on a card cannot end a live session.
+                if form and not flag(query, "confirm"):
+                    return self._confirm_stop(name, graceful, extra)
+                return self._action(argv, extra, form)
             # `send` takes its text from the body only: a URL is logged, and a
             # pane command belongs in a request that has to be sent on purpose.
             text = self._send_text()
@@ -393,6 +518,30 @@ class Handler(BaseHTTPRequestHandler):
             return self._action(["send", name, text], extra)
 
         return self._json(404, {"error": "no such route"}, extra=extra)
+
+    def _confirm_stop(self, name, graceful, extra):
+        """The second click before a stop: render it, run nothing.
+
+        Nothing has happened when this page is drawn, so a click on a card's
+        Stop costs nothing. The confirm form is the only POST that reaches
+        `stop`, and it carries the same nonce.
+        """
+        action = "/api/session/%s/stop?confirm=1" % name
+        effect = "This ends the tmux session immediately."
+        if graceful:
+            action = "/api/session/%s/stop?graceful=1&confirm=1" % name
+            effect = ("This ends the turn first and stops the session once "
+                      "the pane is no longer working.")
+        page = (
+            "<h1>Stop fb-%s?</h1>\n"
+            "<p>%s The worktree and branch stay.</p>\n"
+            "<form method=\"post\" action=\"%s\">"
+            "<input type=\"hidden\" name=\"nonce\" value=\"%s\">"
+            "<button type=\"submit\">Yes, stop fb-%s</button></form>\n"
+            "<p><a href=\"/\">cancel</a></p>\n"
+        ) % (html.escape(name), effect, html.escape(action),
+             html.escape(self.server.form_nonce), html.escape(name))
+        self._page(200, "confirm stop", page, extra)
 
     def _name_from(self, path, suffix):
         """NAME from /api/session/NAME/SUFFIX, or None for another route.
@@ -450,8 +599,10 @@ class Handler(BaseHTTPRequestHandler):
         """
         return os.path.isdir(os.path.join(self.server.root, ".worktrees", name))
 
-    def _send_text(self):
-        """The text for `send`, or None after answering the request."""
+    def _read_body(self):
+        """The request body, read once, or None after answering an error."""
+        if self._body_cache is not None:
+            return self._body_cache
         raw_length = self.headers.get("Content-Length")
         try:
             length = int(raw_length) if raw_length else 0
@@ -463,7 +614,54 @@ class Handler(BaseHTTPRequestHandler):
         if length > MAX_BODY:
             self._json(413, {"error": "body too large"})
             return None
-        raw = self.rfile.read(length) if length else b""
+        self._body_cache = self.rfile.read(length) if length else b""
+        return self._body_cache
+
+    def _form_fields(self):
+        """The fields of a URL-encoded form POST, or None after an error.
+
+        That is the only encoding a browser produces without JavaScript, so
+        the JSON body `send` takes never comes through here.
+        """
+        ctype = (self.headers.get("Content-Type") or "").split(";")[0]
+        if ctype.strip().lower() != "application/x-www-form-urlencoded":
+            return {}
+        raw = self._read_body()
+        if raw is None:
+            return None
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return {}
+        return {key: value[0] for key, value in
+                parse_qs(text, keep_blank_values=True).items()}
+
+    def _same_origin(self):
+        """Whether a POST's Origin, when sent, is this server's own origin.
+
+        No Origin means a non-browser caller (curl, the CLI) and is allowed;
+        a browser sends it, so a page on another port of 127.0.0.1 — the
+        same site for cookies — cannot post here as the logged-in user. The
+        scheme is ignored because a TLS proxy terminates https in front and
+        this server still sees its own Host.
+        """
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        try:
+            parsed = urlsplit(origin)
+        except ValueError:
+            return False
+        host = (self.headers.get("Host") or "").strip()
+        if not parsed.netloc or not host:
+            return False
+        return parsed.netloc.lower() == host.lower()
+
+    def _send_text(self):
+        """The text for `send`, or None after answering the request."""
+        raw = self._read_body()
+        if raw is None:
+            return None
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, ValueError):
@@ -475,18 +673,29 @@ class Handler(BaseHTTPRequestHandler):
             return None
         return text
 
-    def _action(self, argv, extra):
+    def _action(self, argv, extra, form=False, flash=False):
         """Run one mutating CLI command and return what it printed.
 
-        202 with the CLI's `key=value` lines when it succeeded. On failure the
-        CLI's own message, with its exit status as the HTTP status: 1 means the
-        session was in the wrong state (a graceful stop that is still working,
-        a send to a session that is gone), anything else is a server fault. The
-        browser can then tell "stopped" from "still busy" without a second
-        result vocabulary.
+        For a non-form caller: 202 with the CLI's `key=value` lines when it
+        succeeded. For a form submission: 303 back to the dashboard, with the
+        output stashed under a one-shot key when FLASH is set (gc's report),
+        so a refresh cannot replay the POST. On failure the CLI's own message,
+        with its exit status as the HTTP status: 1 means the session was in
+        the wrong state (a graceful stop that is still working, a send to a
+        session that is gone), anything else is a server fault. The browser
+        can then tell "stopped" from "still busy" without a second result
+        vocabulary.
         """
         result = self._run(argv)
         if result.returncode == 0:
+            if flash:
+                key = self.server.remember_flash(
+                    result.stdout.decode("utf-8", "replace"))
+                self._redirect("/?gc=" + key, extra)
+                return
+            if form:
+                self._redirect("/", extra)
+                return
             self._send(202, result.stdout, "text/plain; charset=utf-8", extra)
             return
         body = result.stdout + result.stderr
@@ -494,6 +703,12 @@ class Handler(BaseHTTPRequestHandler):
             body = ("command failed with status %d\n"
                     % result.returncode).encode("utf-8")
         status = 409 if result.returncode == 1 else 500
+        if form or flash:
+            page = ("<h1>action failed</h1>\n<pre>%s</pre>\n"
+                    "<p><a href=\"/\">back to the dashboard</a></p>\n"
+                    % html.escape(body.decode("utf-8", "replace")))
+            self._page(status, "action failed", page, extra)
+            return
         self._send(status, body, "text/plain; charset=utf-8", extra)
 
     # ---- routes -----------------------------------------------------------
@@ -511,7 +726,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send(200, result.stdout, "application/json", extra)
 
-    def _dashboard(self, extra):
+    def _dashboard(self, extra, flash_text=""):
         # Reuse the snapshot renderer instead of keeping a second markup: the
         # page the browser gets is byte-for-byte what `gui --snapshot` writes.
         with tempfile.TemporaryDirectory(prefix="freebuff-gui-") as tmp:
@@ -523,6 +738,15 @@ class Handler(BaseHTTPRequestHandler):
                 argv.append("--terminal-links")
             elif self.server.ttyd_wanted:
                 argv += ["--terminal-note", TTYD_MISSING]
+            # Read-only serves no forms at all, so a reader never gets a
+            # button whose only outcome is a 403.
+            if not self.server.read_only:
+                argv += ["--form-nonce", self.server.form_nonce]
+            if flash_text:
+                flash_path = os.path.join(tmp, "flash.txt")
+                with open(flash_path, "w", encoding="utf-8") as handle:
+                    handle.write(flash_text)
+                argv += ["--flash-file", flash_path]
             result = self._run(argv)
             if result.returncode != 0:
                 message = (result.stderr or result.stdout).decode(
