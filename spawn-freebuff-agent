@@ -2614,6 +2614,13 @@ while [ ${#args[@]} -gt 0 ]; do
 done
 set -- "${args[@]}"
 
+# Help is about the tool, not about a checkout: answer it before the root
+# lookup, so `--help` works from any directory (and the suites can run from
+# anywhere, not only from inside the repo).
+case "${1:-}" in
+    -h|--help|help) usage; exit 0 ;;
+esac
+
 if [ -z "$ROOT" ]; then
     ROOT=$(git rev-parse --show-toplevel 2>/dev/null || true)
 fi
