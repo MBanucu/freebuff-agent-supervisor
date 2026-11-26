@@ -116,6 +116,29 @@ finished CI step). Without `setsid` it falls back to `nohup`: that still
 ignores SIGHUP, but the watcher stays in the caller's process group and can
 be killed with it.
 
+### GitHub state
+
+A session is easier to trust when the issue says what it is doing. When `gh` is
+on PATH and the repository has a remote, `start` writes
+`.worktrees/<name>/.supervisor-gh` (the issue and slug — neither is recoverable
+from a live pane later) and moves the issue to `status:working`, leaving one
+comment naming the session, branch and worktree. Every later transition moves
+the same label, so an issue carries exactly one state:
+
+| state | set by |
+| --- | --- |
+| `status:working` | the launch that proved its brief |
+| `status:blocked` | the watcher, when `.agent-result` says blocked |
+| `status:done` | `autostop`, or `stop --graceful`, with the evidence line |
+| `status:failed` | the same paths, when the result says failed |
+| `status:stopped` | `stop`, or any other reason the session ended early |
+
+The labels are created on demand. The sync is a mirror, never the authority:
+every `gh` failure is swallowed, so a flaky API cannot cost a vendor slot or a
+worktree, and the run's own result file still decides the outcome. `--no-gh` on
+`start` and `FREEBUFF_GH_SYNC=0` turn it off; `GH_BIN` selects a different
+executable.
+
 ## Completion
 
 Freebuff 0.2.38 is a TUI and has no one-shot or headless mode; the process
@@ -314,6 +337,10 @@ change here, is in the [upstream
 note](docs/tui-constraints.md#upstream-expect-the-tui-to-stay-the-only-mode).
 
 ## Contributing
+
+Before changing anything, read [`AGENTS.md`](AGENTS.md) for the rules and
+[`docs/development.md`](docs/development.md) for the file map, the recipes for
+adding a subcommand or a check, and how to read a failing run.
 
 `main` is protected by the ruleset `main: pull requests only`: a pull request
 is required, with zero required approvals so a solo maintainer can still

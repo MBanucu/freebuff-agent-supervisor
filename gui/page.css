@@ -1,0 +1,70 @@
+/* The one stylesheet for every page this tool renders. `gui --snapshot`
+   inlines it into the dashboard, and gui/server.py inlines the same file into
+   the stop confirmation and the action-result page, so a colour or a spacing
+   value is changed here once. Only the styles are shared: each renderer keeps
+   its own CSP, because a file:// snapshot has a narrow <meta> tag while the
+   served page travels with headers. */
+:root { color-scheme: light dark; --bg: #f6f7f9; --fg: #1b1f24;
+  --card: #fff; --muted: #5b6570; --line: #d8dee6; --done: #1a7f37;
+  --working: #9a6700; --idle: #57606a; --failed: #cf222e; }
+@media (prefers-color-scheme: dark) { :root { --bg: #0d1117; --fg: #e6edf3;
+  --card: #161b22; --muted: #9198a1; --line: #30363d; --done: #3fb950;
+  --working: #d29922; --idle: #9198a1; --failed: #f85149; } }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 1.25rem; background: var(--bg); color: var(--fg);
+  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+.page h1 { margin: 0 0 .15rem; font-size: 1.35rem; }
+.meta { margin: 0 0 1.25rem; color: var(--muted); font-size: .85rem;
+  overflow-wrap: anywhere; }
+.note { margin: -0.9rem 0 1.25rem; color: var(--working); font-size: .85rem; }
+.grid { display: grid; gap: .9rem;
+  grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); }
+.card { background: var(--card); border: 1px solid var(--line);
+  border-left: 5px solid var(--idle); border-radius: 8px; padding: .8rem 1rem;
+  overflow-wrap: anywhere; }
+.card.state-done { border-left-color: var(--done); }
+.card.state-working { border-left-color: var(--working); }
+.card.state-failed, .card.state-refused { border-left-color: var(--failed); }
+.card header { display: flex; flex-wrap: wrap; gap: .4rem .6rem;
+  align-items: center; margin-bottom: .5rem; }
+.card h2 { margin: 0; font-size: 1.05rem; }
+.badge { margin-left: auto; padding: .05rem .5rem; border-radius: 999px;
+  border: 1px solid currentColor; font-size: .78rem; color: var(--idle); }
+.state-done .badge { color: var(--done); }
+.state-working .badge { color: var(--working); }
+.state-failed .badge, .state-refused .badge { color: var(--failed); }
+.tag { font-size: .75rem; padding: .05rem .4rem; border-radius: 4px;
+  background: var(--bg); border: 1px solid var(--line); color: var(--muted); }
+dl { display: grid; grid-template-columns: max-content 1fr; gap: .15rem .6rem;
+  margin: 0; font-size: .85rem; }
+dt { color: var(--muted); }
+dd { margin: 0; }
+code { font: .85em ui-monospace, SFMono-Regular, Menlo, monospace; }
+a { color: inherit; }
+.actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .6rem; }
+.actions form { display: inline; }
+.actions button { font: inherit; font-size: .82rem; padding: .2rem .7rem;
+  border: 1px solid var(--line); border-radius: 6px; background: var(--bg);
+  color: var(--fg); cursor: pointer; }
+.actions button:hover { border-color: var(--muted); }
+.flash { margin: 0 0 1.25rem; padding: .6rem 1rem; background: var(--card);
+  border: 1px solid var(--line); border-radius: 8px; }
+.flash h2 { margin: 0 0 .4rem; font-size: .95rem; }
+.flash pre { margin: 0; white-space: pre-wrap; font-size: .82rem; }
+.empty { color: var(--muted); padding: 2rem 0; }
+footer { margin-top: 1.5rem; color: var(--muted); font-size: .78rem; }
+/* The action pages are a second markup, never a second stylesheet: a heading,
+   a sentence, one form and an error's <pre>, all in the tokens and dark mode
+   above. They are wrapped in .action-page so these element rules cannot leak
+   into the dashboard's cards. */
+.action-page { max-width: 42rem; }
+.action-page h1 { margin: 0 0 .6rem; font-size: 1.2rem; }
+.action-page p { margin: 0 0 1rem; color: var(--muted); }
+.action-page form { display: inline-block; margin: 0 .5rem .3rem 0; }
+.action-page button { font: inherit; padding: .35rem .9rem;
+  border: 1px solid var(--line); border-radius: 6px; background: var(--card);
+  color: var(--fg); cursor: pointer; }
+.action-page button:hover { border-color: var(--muted); }
+.action-page pre { margin: 0 0 1rem; white-space: pre-wrap;
+  background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+  padding: .8rem; font-size: .82rem; }
