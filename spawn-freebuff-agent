@@ -19,6 +19,9 @@ COLS=180
 ROWS=55
 PROMPT='Read the file .task.md in this directory and execute it autonomously. Do not commit .task.md, .agent-result or local.properties. Follow the PR instructions in it exactly. Do not ask questions; if blocked, open a draft PR and explain.'
 RESULT_FILE='.agent-result'
+# Written next to a worktree at launch: issue and slug, so a transition later
+# (blocked, done, stopped) can label the right issue without asking the pane.
+GH_STATE_FILE='.supervisor-gh'
 # The vendor refuses a message identical to a recent one as scripted use and
 # counts a strike, so every sent brief is hashed here before it is typed. The
 # file lives in the repository root and the last BRIEF_LEDGER_KEEP hashes are
@@ -115,6 +118,7 @@ Spawn parallel Freebuff agents in isolated git worktrees.
                          so a burst does not reach the TUI in one second.
       --no-start         create the worktree and brief, do not launch
       --prompt TEXT      send this message instead of the default brief
+      --no-gh            do not label or comment on the issue
       --dry-run          print the plan, change nothing
       --help             this text
 
@@ -343,7 +347,7 @@ ensure_excludes() {
     file=$(exclude_path)
     mkdir -p "$(dirname "$file")"
     for entry in '.worktrees/' '.task.md' 'local.properties' "$RESULT_FILE" \
-        '.supervisor.log' "$BRIEF_LEDGER"; do
+        '.supervisor.log' "$GH_STATE_FILE" "$BRIEF_LEDGER"; do
         grep -qxF "$entry" "$file" 2>/dev/null || printf '%s\n' "$entry" >>"$file"
     done
 }
@@ -543,6 +547,20 @@ action_form() {
     printf '<button type="submit">%s</button></form>' "$(html_escape "$label")"
 }
 
+stylesheet_file() {
+    # stylesheet_file -> gui/page.css next to the tool. It is the one
+    # stylesheet: this renderer inlines it into the snapshot, and
+    # gui/server.py inlines the same file into the stop confirmation and the
+    # action-result page. Resolved from $0, not ROOT, because the asset ships
+    # with the tool rather than with the repository it inspects.
+    local dir
+    case "$0" in
+        */*) dir=$(cd -- "$(dirname -- "$0")" && pwd) ;;
+        *) dir=$(cd -- "$(dirname -- "$(command -v -- "$0" 2>/dev/null || printf '%s' "$0")")" && pwd) ;;
+    esac
+    printf '%s/gui/page.css' "$dir"
+}
+
 snapshot_html() {
     # snapshot_html FILE JSON WATCH [LINK_PREFIX] [NOTE] [FORM_NONCE] [FLASH]
     # -> one self-contained page. `sessions --json` is the input: fixed keys,
@@ -553,11 +571,16 @@ snapshot_html() {
     # header. FORM_NONCE adds the action forms and is empty for a static
     # snapshot, which stays read-only; FLASH is the output of an action that
     # redirected here (the gc report) and is shown above the cards.
+    # The CSS is inlined from gui/page.css, shared with gui/server.py's action
+    # pages, so the page stays a single file with no external asset.
     local file="$1" json="$2" watch="$3" link_prefix=${4:-} note_text=${5:-}
     local form_nonce=${6:-} flash_text=${7:-}
     local line key value name state idle watcher worktree result branch pr
     local tests="" commit="" wt generated total=0 live=0 trees=0 cards='' card
-    local cls pr_html refresh=''
+    local cls pr_html refresh='' css_file
+    css_file=$(stylesheet_file)
+    [ -f "$css_file" ] ||
+        die "gui: missing $css_file (the shared stylesheet next to the tool)"
     generated=$(date -u '+%Y-%m-%d %H:%M:%SZ')
     if [ -n "$watch" ]; then
         refresh="<meta http-equiv=\"refresh\" content=\"$watch\">"
@@ -687,57 +710,7 @@ snapshot_html() {
         [ -z "$refresh" ] || printf '%s\n' "$refresh"
         printf '<title>freebuff agents</title>\n'
         printf '<style>\n'
-        cat <<'CSS'
-:root { color-scheme: light dark; --bg: #f6f7f9; --fg: #1b1f24;
-  --card: #fff; --muted: #5b6570; --line: #d8dee6; --done: #1a7f37;
-  --working: #9a6700; --idle: #57606a; --failed: #cf222e; }
-@media (prefers-color-scheme: dark) { :root { --bg: #0d1117; --fg: #e6edf3;
-  --card: #161b22; --muted: #9198a1; --line: #30363d; --done: #3fb950;
-  --working: #d29922; --idle: #9198a1; --failed: #f85149; } }
-* { box-sizing: border-box; }
-body { margin: 0; padding: 1.25rem; background: var(--bg); color: var(--fg);
-  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
-.page h1 { margin: 0 0 .15rem; font-size: 1.35rem; }
-.meta { margin: 0 0 1.25rem; color: var(--muted); font-size: .85rem;
-  overflow-wrap: anywhere; }
-.note { margin: -0.9rem 0 1.25rem; color: var(--working); font-size: .85rem; }
-.grid { display: grid; gap: .9rem;
-  grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); }
-.card { background: var(--card); border: 1px solid var(--line);
-  border-left: 5px solid var(--idle); border-radius: 8px; padding: .8rem 1rem;
-  overflow-wrap: anywhere; }
-.card.state-done { border-left-color: var(--done); }
-.card.state-working { border-left-color: var(--working); }
-.card.state-failed, .card.state-refused { border-left-color: var(--failed); }
-.card header { display: flex; flex-wrap: wrap; gap: .4rem .6rem;
-  align-items: center; margin-bottom: .5rem; }
-.card h2 { margin: 0; font-size: 1.05rem; }
-.badge { margin-left: auto; padding: .05rem .5rem; border-radius: 999px;
-  border: 1px solid currentColor; font-size: .78rem; color: var(--idle); }
-.state-done .badge { color: var(--done); }
-.state-working .badge { color: var(--working); }
-.state-failed .badge, .state-refused .badge { color: var(--failed); }
-.tag { font-size: .75rem; padding: .05rem .4rem; border-radius: 4px;
-  background: var(--bg); border: 1px solid var(--line); color: var(--muted); }
-dl { display: grid; grid-template-columns: max-content 1fr; gap: .15rem .6rem;
-  margin: 0; font-size: .85rem; }
-dt { color: var(--muted); }
-dd { margin: 0; }
-code { font: .85em ui-monospace, SFMono-Regular, Menlo, monospace; }
-a { color: inherit; }
-.actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .6rem; }
-.actions form { display: inline; }
-.actions button { font: inherit; font-size: .82rem; padding: .2rem .7rem;
-  border: 1px solid var(--line); border-radius: 6px; background: var(--bg);
-  color: var(--fg); cursor: pointer; }
-.actions button:hover { border-color: var(--muted); }
-.flash { margin: 0 0 1.25rem; padding: .6rem 1rem; background: var(--card);
-  border: 1px solid var(--line); border-radius: 8px; }
-.flash h2 { margin: 0 0 .4rem; font-size: .95rem; }
-.flash pre { margin: 0; white-space: pre-wrap; font-size: .82rem; }
-.empty { color: var(--muted); padding: 2rem 0; }
-footer { margin-top: 1.5rem; color: var(--muted); font-size: .78rem; }
-CSS
+        cat "$css_file"
         printf '</style>\n</head>\n<body>\n'
         printf '<header class="page">\n<h1>freebuff agents</h1>\n'
         printf '<p class="meta">repo %s · generated %s · sessions %s · running %s · worktrees %s · orphans %s</p>\n' \
@@ -1358,9 +1331,55 @@ brief_jitter_max() {
     printf '%s' "$bound"
 }
 
+gh_state_color() {
+    # gh_state_color STATE -> label colour, so the four states look different
+    # on the issues page instead of one grey label moving around.
+    case "$1" in
+        working) printf 'fbca04' ;;
+        blocked) printf 'd93f0b' ;;
+        done) printf '0e8a16' ;;
+        failed) printf 'b60205' ;;
+        *) printf 'ededed' ;;
+    esac
+}
+
+gh_state() {
+    # gh_state WORKTREE STATE [SUMMARY] -> move the issue's status:* label to
+    # STATE and, when SUMMARY is given, leave it as a comment. The session is
+    # the authority; GitHub is a mirror of it, so every failure here is
+    # swallowed: a flaky API must never cost a vendor slot or a worktree.
+    local wt=$1 state=$2 summary=${3:-} f issue slug cur lab
+    local -a args=()
+    f="$wt/$GH_STATE_FILE"
+    [ -f "$f" ] || return 0
+    [ "${FREEBUFF_GH_SYNC:-1}" = 0 ] && return 0
+    command -v "${GH_BIN:-gh}" >/dev/null 2>&1 || return 0
+    issue=$(sed -n 's/^issue=//p' "$f" 2>/dev/null | head -n 1)
+    slug=$(sed -n 's/^slug=//p' "$f" 2>/dev/null | head -n 1)
+    [ -n "$issue" ] && [ -n "$slug" ] || return 0
+    lab="status:$state"
+    "${GH_BIN:-gh}" label create "$lab" -R "$slug" --force \
+        --color "$(gh_state_color "$state")" --description "subagent $state" \
+        >/dev/null 2>&1 || true
+    # One status label at a time: the current set is read first so the others
+    # can be removed without guessing whether they exist.
+    cur=$("${GH_BIN:-gh}" issue view "$issue" -R "$slug" --json labels \
+        --jq '[.labels[].name|select(startswith("status:"))]|join(" ")' \
+        2>/dev/null || true)
+    local l
+    for l in $cur; do
+        [ "$l" = "$lab" ] || args+=(--remove-label "$l")
+    done
+    "${GH_BIN:-gh}" issue edit "$issue" -R "$slug" ${args[@]+"${args[@]}"} \
+        --add-label "$lab" >/dev/null 2>&1 || true
+    [ -z "$summary" ] || "${GH_BIN:-gh}" issue comment "$issue" -R "$slug" \
+        --body "$summary" >/dev/null 2>&1 || true
+    return 0
+}
+
 start() {
     local issue="" name="" branch="" base="main" title="" url="" task_file=""
-    local sdk_dir="" dry=0 nostart=0 autostop=0 idle=120 poll=5
+    local sdk_dir="" dry=0 nostart=0 autostop=0 idle=120 poll=5 no_gh=0
     local idle_set=0 poll_set=0 max_sessions=0 wait_slot=0 slot_wait=300
     local ready_timeout="$READY_TIMEOUT" ready_poll="$READY_POLL"
     local submit_timeout="$SUBMIT_TIMEOUT"
@@ -1377,6 +1396,7 @@ start() {
             --url) url=${2:-}; shift 2 ;;
             --sdk-dir) sdk_dir=${2:-}; shift 2 ;;
             --auto-stop) autostop=1; shift ;;
+            --no-gh) no_gh=1; shift ;;
             --idle-seconds) idle=${2:-}; idle_set=1; shift 2 ;;
             --poll) poll=${2:-}; poll_set=1; shift 2 ;;
             --ready-timeout) ready_timeout=${2:-}; shift 2 ;;
@@ -1644,6 +1664,15 @@ start() {
     note "submit_proof=${SUBMIT_PROOF} elapsed=${SUBMIT_ELAPSED}s"
     note "started=yes"
     "$tmux" capture-pane -p -t "$session" -S -8 2>/dev/null || true
+
+    # The issue number is not recoverable from a live session later (the pane
+    # shows a prompt, not flags), so it is written next to the worktree here
+    # and every later transition reuses it.
+    if [ "$no_gh" != 1 ] && [ -n "$issue" ]; then
+        printf 'issue=%s\nslug=%s\nbranch=%s\nsession=%s\n' \
+            "$issue" "$slug" "$branch" "$session" >"$wt/$GH_STATE_FILE"
+        gh_state "$wt" working "🤖 **subagent working** — session \`$session\`, branch \`$branch\`, worktree \`.worktrees/$name\`. The label moves to \`status:blocked\` / \`status:done\` as it runs; \`spawn-freebuff-agent status $name\` is the local view."
+    fi
 
     if [ "$autostop" = 1 ]; then
         local script log watcher_pid
@@ -2212,6 +2241,16 @@ reap() {
     fi
     # The stop is what ends a refusal; the sentence stays in the log above.
     clear_refusal "$wt"
+
+    local gstate
+    case "$reason" in
+        done|idle) gstate=done ;;
+        blocked) gstate=blocked ;;
+        failed) gstate=failed ;;
+        *) gstate=stopped ;;
+    esac
+    gh_state "$wt" "$gstate" "🤖 **subagent $gstate** — reason \`$reason\`${branch:+, branch \`$branch\`}, pr=${pr}, dirty=${dirty}. Evidence: \`${log#"$ROOT"/}\`${extra:+
+$extra}"
 }
 
 watch_run() {
@@ -2239,6 +2278,8 @@ watch_run() {
                 ;;
             blocked)
                 note 'state=blocked'
+                gh_state "$ROOT/.worktrees/$name" blocked \
+                    "🤖 **subagent blocked** — session \`fb-$name\` is waiting on input; \`spawn-freebuff-agent status $name\` shows the pane." || true
                 return 3
                 ;;
             failed)
@@ -2563,6 +2604,10 @@ stop() {
         "$tmux" kill-session -t "fb-$name"
         clear_refusal "$ROOT/.worktrees/$name"
         note "stopped=fb-$name"
+        # A plain stop is a state change too: the issue must not keep saying
+        # status:working for a session that is gone.
+        gh_state "$ROOT/.worktrees/$name" stopped \
+            "🤖 **subagent stopped** — \`stop $name\` killed \`fb-$name\` before it finished; the worktree and branch are kept."
         return 0
     fi
 
