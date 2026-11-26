@@ -11,8 +11,8 @@ git checkout, or point it at one with `--root`.
 1. creates `.worktrees/<name>` on a new branch from a base ref;
 2. writes the brief to `.task.md` in that worktree;
 3. starts Freebuff in a detached tmux session `fb-<name>` at **180x55**;
-4. waits until the TUI accepts raw input, then sends the "read `.task.md`"
-   prompt;
+4. waits until the TUI accepts raw input, sends the "read `.task.md`" prompt,
+   and requires proof that the turn began (not just that Enter was sent);
 5. shows the pane, branch, result and PR with `status`, and stops it with
    `stop`;
 6. optionally watches the run and stops the session when the agent reports a
@@ -274,7 +274,7 @@ what the pane is doing.
   {
     "name": "test-999",
     "state": "done",
-    "idle_seconds": 30,
+    "idle_seconds": null,
     "watcher": "pid:123",
     "worktree": "yes",
     "result": "blocked",
@@ -291,9 +291,12 @@ tail as a `pane` string, and the classifier's decision as the `evidence`
 object documented under completion.
 
 A missing value is `null` rather than the table's `-`: `idle_seconds` when the
-session is not running, `result` with no `.agent-result`, `branch` and `pr` for
-a session with no worktree, `watcher` with no autostop recorded, and `pane`
-when no session is running. `status` keeps `state` identical to the human
+session is not running or its state is terminal (`done`, `stopped`, `blocked`,
+`failed`) — a finished run has no idle time, so a done card cannot read `idle
+5495s` — `result` with no `.agent-result`, `branch` and `pr` for a session with
+no worktree, `watcher` with no autostop recorded, and `pane` when no session is
+running. Idle time comes back when the session is resumed and is no longer
+terminal. `status` keeps `state` identical to the human
 `state=` line (`unknown` when there is no result file) and adds
 `result_state`, which is `null` in that case, so a consumer can tell "nothing
 written yet" from "unusable state". `pr` in `sessions` is the row's PR URL;
@@ -323,8 +326,9 @@ git branch -d issue/103-example
 ## Static snapshot
 
 `gui --snapshot FILE [--watch N]` writes one self-contained HTML page from
-`sessions --json`: one card per session with name, state, idle time, watcher,
-worktree, result, branch, PR, and — for a session with a worktree — the
+`sessions --json`: one card per session with name, state, idle time (only while
+the session can still take a turn), watcher, worktree, result, branch, PR, and
+— for a session with a worktree — the
 commit and the result file's `tests` line. A done session is green, a working
 one amber, a failed or refused one red, and a session with no worktree carries
 a `no worktree` tag.
@@ -340,7 +344,10 @@ attacked. There are no external assets — CSS is inline and there is no
 script — so `file://` works offline and a strict CSP cannot break the view
 (the page declares `default-src 'none'; style-src 'unsafe-inline'; img-src
 data:; connect-src 'self'` — the last one only so Chrome DevTools' own
-`/.well-known` probe is not blocked and does not fill the console). `--watch N` rewrites the file every N seconds and adds
+`/.well-known` probe is not blocked and does not fill the console). That
+`<meta>` is all a static file can carry: a `file://` page has no headers.
+`gui --serve` keeps it for the same markup and adds the framing, `nosniff` and
+referrer headers a meta tag cannot express (see the threat model). `--watch N` rewrites the file every N seconds and adds
 `<meta http-equiv="refresh" content="N">`, so an open browser follows along
 without JavaScript. Without it, a single snapshot is written and the command
 exits.
@@ -348,7 +355,9 @@ exits.
 An empty repository renders `no sessions` instead of an empty table. Every
 rendered value is HTML-escaped, because branch names, PR URLs, commit subjects
 and the `tests` line are arbitrary text. The page is read-only: it offers no
-buttons that only pretend to act.
+buttons that only pretend to act. `gui --snapshot` never receives a form
+nonce, so a static file has no forms at all; only `gui --serve` adds them (see
+below), because only a server can check the nonce back.
 
 ## Browser GUI
 
@@ -370,14 +379,48 @@ spawn-freebuff-agent gui --serve --ttyd             # terminal link per card
 - `GET /api/session/<name>/pane` returns `status NAME --json`, or 404 when the
   name has no worktree.
 - `POST /api/session/<name>/stop[?graceful=1]` runs `stop NAME`, or
-  `stop NAME --graceful`.
+  `stop NAME --graceful`. A **cookie-authenticated form POST** is answered
+  with a confirmation page and changes nothing; the page's confirm form posts
+  `?confirm=1` and runs the stop, then `303` to `/`. The first POST is the
+  stray-click guard: clicking a card's Stop cannot end a live session.
 - `POST /api/session/<name>/send` runs `send NAME TEXT`, with the text taken
   from a JSON body `{"text": "..."}` and never from the URL.
 - `POST /api/gc[?dry=1]` runs `gc`, or `gc --dry-run`.
-- Codes: 401 for a missing or wrong token, 400 for a name that fails
+- Codes: 401 for a missing or wrong token, 421 for a `Host` this server does
+  not answer for (checked before auth), 400 for a name that fails
   `^[A-Za-z0-9_-]+$` or a body that is not JSON, 404 for an unknown session
-  (no worktree, the pane route's rule), 403 in read-only mode, 409 when the CLI
-  refuses, 413 for a body over 64 KiB.
+  (no worktree, the pane route's rule), 403 in read-only mode, for a missing or
+  wrong form nonce, or for a foreign `Origin`; 409 when the CLI refuses; 413
+  for a body over 64 KiB; 303 after a successful form action.
+
+### Forms, the nonce and Origin
+
+`GET /` renders the actions as plain `<form method="post">` elements, so the
+page works with JavaScript disabled and is testable with curl:
+
+- a `gc --dry-run` form above the cards, only when something is live;
+- `Stop` and `Stop (graceful)` on a running session's card, but not on one
+  whose state is already terminal (`done`, `stopped`, `failed`, `blocked`).
+
+Every form carries a hidden `nonce` field holding a per-server random
+`form_nonce` generated at startup. A POST that authenticated with the cookie
+must present it, compared with `hmac.compare_digest`; a missing or wrong value
+is `403`, not a silent no-op. A POST whose `Origin` header is present and does
+not match the request's `Host` is also `403`, because two services on
+`127.0.0.1` are same-site for a cookie (the port is not part of the site) and
+`SameSite=Strict` therefore does not separate them.
+
+A **bearer-token POST without a nonce still works**: a caller that already
+read the secret keeps the `202` behavior from #22, which is what curl and the
+CLI tests use. The nonce and Origin checks are for the cookie path only.
+
+A successful form action **redirects, never re-renders**: `303 See Other` to
+`/`, so a refresh is a GET and cannot replay the stop. The gc report cannot fit
+in a redirect body, so `gc --dry-run` stashes its output under a one-shot key
+and redirects to `/?gc=<key>`; that GET shows it once, and a refresh shows the
+plain dashboard. `--read-only` renders a page with zero `<form>` elements and
+still answers every POST `403`, so a reader is never offered a button whose
+only outcome is a refusal.
 
 ### Live terminal through ttyd
 
@@ -419,10 +462,13 @@ receives commits, but distro packages lag, so check `ttyd --version` before
 relying on a packaged build. The integration is optional for exactly that
 reason: without ttyd everything else behaves as before.
 
-An action is one CLI call and nothing else: it answers `202` with the CLI's own
-`key=value` lines, so there is no second result vocabulary to keep in step. On
-failure it returns the CLI's exit status and message instead — `409` for exit
-1, which is a session in the wrong state, `500` otherwise. That is what lets a
+An action is one CLI call and nothing else: a non-form caller gets `202` with
+the CLI's own `key=value` lines, a form submission gets `303` to the dashboard
+(on success; the gc report travels under the one-shot key above), so there is
+no second result vocabulary to keep in step. On failure it returns the CLI's
+exit status and message instead — `409` for exit 1, which is a session in the
+wrong state, `500` otherwise — as a page for a form caller and as text for the
+API. That is what lets a
 browser tell "stopped" from "still busy" after a graceful stop, rather than
 reading a refusal as success. The name is validated before it reaches a path or
 a subprocess, the `send` text is passed as a single argv element and never
@@ -497,14 +543,63 @@ whole server (403 on POST), not a property of a token.
   reading it from stderr.
 - **It has no rate limit or lockout.** A wrong token is a 401 and nothing else,
   so guessing is bounded only by the 192-bit secret.
-- **It does not make a browser page trustworthy.** Cookies are scoped by host,
-  not port, so another service on `127.0.0.1` is same-site for `fb_token` and
-  could make the browser send an authenticated POST. Anything else you run on
-  the same host should be treated as able to act on the dashboard. We have not
-  tested that case; it follows from browser cookie rules, not from a check
-  here.
+- **It does not make a browser page trustworthy on its own.** Cookies are
+  scoped by host, not port, so another service on `127.0.0.1` is same-site for
+  `fb_token` and can make the browser send an authenticated POST. The
+  server-rendered forms reduce that: a cookie POST needs the page's per-server
+  nonce and must not present a foreign `Origin`, so a page that never saw this
+  dashboard cannot assemble a valid action. That is defence in depth, not a
+  second identity: the nonce is visible to anything that can read the page
+  (a token holder already reads every pane), and a caller that sends no
+  `Origin` and holds a bearer token bypasses the nonce on purpose for curl
+  compatibility. Treat anything else on the same host as able to read the
+  dashboard if it has the token.
 - **`--read-only` is not a second boundary.** It answers POST with 403 for
   everyone, which is the point, but a token holder still reads every pane.
+
+### Response headers: framing, referrer and the CSP
+
+The served page is interactive, so the server sends the headers a `<meta>` tag
+cannot express. Every response carries them — the dashboard, `/api/*`, the
+`303` after a form action, and the `401`, `403`, `404` and `421` refusals —
+because a refusal is still a document a browser renders.
+
+| Header | Value | What it stops, and what it does not |
+| --- | --- | --- |
+| `Content-Security-Policy` | `default-src 'none'; style-src 'unsafe-inline'; img-src data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'` | Injected markup cannot load or run anything: no script, no object, no external style, no framing, and no injected `<base>` retargeting a form. `style-src 'unsafe-inline'` is required by the page's single inline `<style>`; there is no script, no `unsafe-inline` for script and no `unsafe-eval`. It does **not** stop a token holder — a holder can read every pane and POST every action without a browser — and it does not replace HTML-escaping: escaping is still what keeps pane text from being markup. |
+| `X-Content-Type-Options` | `nosniff` | A browser may not re-interpret a JSON or text answer as HTML or script by sniffing; `Content-Type` is the only type. |
+| `X-Frame-Options` | `DENY` | The older clickjacking control, for a browser that ignores `frame-ancestors`; both are sent. |
+| `Referrer-Policy` | `no-referrer` | No `Referer` leaves the page. A card links to the PR on github.com, and the URL may still carry the bootstrap `?token=` when that link is clicked; without this header the full dashboard URL, secret included, would travel to a third party. |
+
+`form-action 'self'` does not break the POST → `303` flow: the form targets
+this server and the redirect is a navigation, not a second submission. The
+suite asserts it on the wire. The static `--snapshot` page keeps its narrower
+`<meta>` policy, because a file opened over `file://` has no headers; where
+both apply the two policies agree, so the intersection changes nothing.
+
+### Host validation and DNS rebinding
+
+The server answers only the names it serves: `127.0.0.1`, `localhost` and
+`[::1]`, each with or without a port, plus the configured `--host` and any
+`--allow-host NAME` (repeatable). Anything else is `421 Misdirected Request`
+and reaches no route — the check runs before the token check, so not even a
+bearer caller gets an answer under a foreign name.
+
+The reason is DNS rebinding. A page on `evil.example` can re-resolve that name
+to `127.0.0.1`, and its own script then speaks to this server as a same-origin
+peer; every loopback port is the same site for a cookie. The random token is
+still the barrier against reading or acting, but the Host check makes the name
+useless before that: no dashboard to frame, no API to probe for a difference
+between 401 and 200, and no route where a later unauthenticated addition would
+be reachable. It does not protect a token holder and it is not a substitute for
+the token; it closes the one path where the browser, not the attacker, supplies
+the authority.
+
+An absent `Host` is allowed (HTTP/1.0 and some local clients omit it, and a
+missing name is not one an attacker can choose). `--host 0.0.0.0` accepts only
+the loopback names, so reaching a LAN bind by IP needs that address in
+`--allow-host`. A proxy in front must pass a name the server knows: see the
+deployment section.
 
 ### Why POST needs the token even on localhost
 
@@ -551,10 +646,20 @@ agents.example.com {
 
 `caddy` gets a certificate for its own name and forwards `Authorization` and
 `Cookie` unchanged, so the token is still checked by this server, now over TLS.
-nginx is the same idea: `proxy_pass http://127.0.0.1:7788;` and let it own the
-certificate. Tailscale Serve (`tailscale serve --bg 7788` with the default
-loopback bind) gives the dashboard an HTTPS name inside the tailnet, and
-tailnet membership then decides who reaches it — a network control, not a
+Caddy passes the incoming `Host` through unmodified, so the server has to be
+told that name or the request is a 421:
+
+```bash
+spawn-freebuff-agent gui --serve --allow-host agents.example.com
+```
+
+`--allow-host` is repeatable. The form's `Origin` check keeps working, because
+`Origin` and `Host` are then the same name. nginx is the same idea, with
+`proxy_pass http://127.0.0.1:7788;`, `proxy_set_header Host $http_host;` (its
+default is the upstream's address) and the matching `--allow-host`. Tailscale
+Serve (`tailscale serve --bg 7788` with the default loopback bind) gives the
+dashboard an HTTPS name inside the tailnet — pass that name to `--allow-host` —
+and tailnet membership then decides who reaches it: a network control, not a
 replacement for the token.
 
 Two things a proxy does not fix. The server reads no `X-Forwarded-*` header, so
@@ -570,8 +675,16 @@ single-user machine you already trust, and not on a shared network.
 
 **What was tested.** The deviceless suite drives `gui --serve` on loopback with
 curl: 401 without a token, the token as header, query and cookie, the POST
-actions, `--read-only` 403, the refusal of `--host 0.0.0.0` without an explicit
-`--token`, and the ttyd redirect. **Not tested:** TLS or any reverse proxy,
+actions, `--read-only` 403 and a read-only page with no forms, the cookie path
+(`403` without a nonce, `403` with a nonce and a foreign `Origin`, the
+confirmation page that changes nothing, the confirm POST's `303` to `/`, and
+the card reading `stopped` afterwards), the gc `303`/one-shot report, the
+bearer POST without a nonce still answering `202`, the refusal of
+`--host 0.0.0.0` without an explicit `--token`, the ttyd redirect, the four
+security headers on `200`, `401`, `403`, `404`, `421` and `303`, a foreign
+`Host` answered `421` even without a token, the loopback names and
+`--allow-host` accepted, and `form-action 'self'` with the POST → `303` flow.
+**Not tested:** TLS or any reverse proxy,
 Tailscale, a real LAN client, and the same-site cookie case above. Those
 paragraphs describe the source and the operator's job, not a tested path;
 confirm them with your own proxy before relying on them.
@@ -602,6 +715,33 @@ branch in place. The elapsed time and pane tail are what distinguishes a slow
 cold start from a hung TUI; raise `--ready-timeout` for the former. The concurrent-session overlay is a refusal instead: no keys are typed
 (its Enter would take over another live session), `start` prints `refused=yes`
 with the sentence and exits non-zero, and the worktree is kept.
+
+**A ready pane can still swallow the Enter.** That failure looks healthy: the
+composer clears, the session rests at the idle prompt, the worktree is clean
+and `session_state` says `idle`, so the old `start` printed `started=yes` for a
+run that never began. The keystroke is therefore not proof. After typing,
+`start` captures the pane every `--ready-poll` seconds until
+`--submit-timeout` seconds (default 20) have passed, and requires both:
+
+- the input line has cleared — it shows `Enter a coding task` or `Add to the
+  current task`, not the brief still waiting for Enter; and
+- a turn is in flight (`thinking...` / `working...` / the mid-turn composer)
+  **or** the `Chat:` title changed from the one captured before the send.
+
+It is a predicate with a deadline, so an accepted send is reported on the
+first check — `sent=yes submit_proof=turn-began elapsed=0.0s` — and no fixed
+sleep is paid. A changed title is `submit_proof=chat-title`: the client took
+the brief and named the chat before the busy chrome was drawn.
+
+A brief that never proves submission prints `sent=no`,
+`submit_proof=none`, `resent=no` and the pane lines the check read, records
+`submit=no elapsed=...` in `.supervisor.log`, stops the session and exits
+non-zero with the worktree and branch kept, like every other failed launch.
+It is never retyped: an automatic resend is how a duplicate turn starts, and a
+repeated identical message is what the vendor's scripted-use filter counts as
+a strike. The brief's hash reaches the ledger only once the send is proven, so
+a swallowed brief — which nobody saw — does not block a deliberate retry with
+the same text.
 
 Because every session shares one account, `start` checks capacity before it
 spends a worktree: `--max-sessions N` refuses to start while N `fb-*` sessions
@@ -674,10 +814,11 @@ agents.
 - The test suite is deviceless: a fake tmux serves fixture panes, several
   session names and recorded kills, so it covers the result protocol, state
   transitions (including an unclassifiable pane becoming `unknown` with its
-  evidence and the `--explain` dump), autostop and `gc` decisions, the
-  `sessions` inventory, graceful stop, the capacity pre-flight, and the
-  server's routes, auth, actions and bind rules without a Freebuff session,
-  account slot, `gh` or network.
+  evidence and the `--explain` dump),   autostop and `gc` decisions, the
+  `sessions` inventory, graceful stop, the capacity pre-flight, the submission
+  proof (an accepted turn, a changed chat title, a swallowed Enter and a brief
+  left in the input line), and the server's routes, auth, actions and bind
+  rules without a Freebuff session, account slot, `gh` or network.
   It does not exercise the real TUI; verify marker changes with one controlled
   run when upgrading Freebuff.
 

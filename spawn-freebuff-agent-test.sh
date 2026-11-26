@@ -173,11 +173,16 @@ case "${1:-}" in
             line=''
             for arg in "$@"; do line+="$arg"$'\t'; done
             printf '%s\n' "$line" >>"$d/sent"
-            # A refusal that arrives as a finished turn: the pane is healthy
-            # when start checks readiness, then carries the sentence after
-            # the Enter that submitted the brief.
-            if [ "${!#}" = C-m ] && [ -f "$d/pane_after_send" ]; then
-                mv "$d/pane_after_send" "$d/pane"
+            # After Enter the pane shows what the TUI did with the brief. A
+            # fixture file overrides it (a refusal, a swallowed Enter); by
+            # default the send was accepted, so the pane becomes a turn in
+            # flight, which is what start now requires before started=yes.
+            if [ "${!#}" = C-m ]; then
+                if [ -f "$d/pane_after_send" ]; then
+                    mv "$d/pane_after_send" "$d/pane"
+                elif [ -f "$d/turn_pane" ]; then
+                    cp "$d/turn_pane" "$d/pane"
+                fi
             fi
         fi
         ;;
@@ -268,6 +273,30 @@ BANNER_IDLE_PANE=' Can.t reach Freebuff.s servers. Retrying… Try another netwo
 │  ▍Enter a coding task or / for commands
 ╰──────────────────╯
  DeepSeek V4.1 Flash 10/17 • high · /tmp/x/proj · /model to change · Chat: New chat'
+# A submitted brief: the composer is empty again, the turn is in flight and
+# the chat title now names the task instead of `New chat`.
+TURN_PANE='thinking...                                      7s  ■ Esc
+╭──────────────────╮
+│  ▍Add to the current task (/ for commands)
+╰──────────────────╯
+ DeepSeek V4.1 Flash • high · /tmp/x/proj · /model to change · Chat: Read .task.md'
+# The swallowed Enter (#39), exactly as observed: the composer is empty again
+# and the session rests at the idle prompt with the title untouched.
+SWALLOWED_PANE='╭──────────────────╮
+│  ▍Enter a coding task or / for commands
+╰──────────────────╯
+ DeepSeek V4.1 Flash • high · /tmp/x/proj · /model to change · Chat: New chat'
+# An Enter that never arrived: the brief is still drawn in the input line.
+TYPED_PANE='╭──────────────────╮
+│  ▍Read the file .task.md in this directory and execute it…
+╰──────────────────╯
+ DeepSeek V4.1 Flash • high · /tmp/x/proj · /model to change · Chat: New chat'
+# The client took the brief and named the chat, but the turn chrome has not
+# been drawn yet: the changed title is the only proof the send was accepted.
+TITLE_ONLY_PANE='╭──────────────────╮
+│  ▍Enter a coding task or / for commands
+╰──────────────────╯
+ DeepSeek V4.1 Flash • high · /tmp/x/proj · /model to change · Chat: Read .task.md'
 # Same banner with a turn in flight: no busy marker, mid-turn prompt.
 BANNER_BUSY_PANE=' Can.t reach Freebuff.s servers. Retrying… Try another network.
 ⎘ • 6s • △▽
@@ -279,6 +308,9 @@ PROSE_AT_PROMPT_PANE='No permission was required for that deletion.
 │  ▍Enter a coding task or / for commands
 ╰──────────────────╯
  DeepSeek V4.1 Flash • high · /tmp/x/proj · /model to change · Chat: New chat'
+
+# The default outcome of an Enter: the brief was taken and a turn is running.
+printf '%s\n' "$TURN_PANE" >"$FAKE_DIR/turn_pane"
 
 fake_session test-999 "$IDLE_PANE" "$(($(date +%s) - 30))"
 out=$(bash "$TOOL" --root "$REPO" status --no-gh test-999)
@@ -552,6 +584,9 @@ check test "$(printf '%s\n' "$out" | awk '$1 == "ghost" { print $5 }')" = missin
 check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $5 }')" = yes
 check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $4 }')" = "pid:$$"
 check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $6 }')" = blocked
+# a live session whose result file is terminal shows no idle (#57)
+check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $3 }')" = -
+check test "$(printf '%s\n' "$out" | awk '$1 == "ghost" { print $3 }')" != -
 check contains "$out" 'sessions=2 running=2 worktrees=1 orphans=1'
 
 # a watcher that was recorded but has gone is not reported as alive
@@ -559,9 +594,11 @@ printf 'autostop=pid:999999\n' >>"$WT/.supervisor.log"
 out=$(bash "$TOOL" --root "$REPO" sessions --no-gh)
 check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $4 }')" = dead
 
-# list names the orphan, so it cannot be reaped without ever being seen
+# list names the orphan, so it cannot be reaped without ever being seen;
+# its IDLE column follows the same terminal rule (#57)
 out=$(bash "$TOOL" --root "$REPO" list)
 check contains "$out" 'orphans=ghost'
+check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $6 }')" = -
 
 # even a root with no worktrees reports the orphan instead of only "no worktrees"
 mkdir -p "$TMP/no-worktrees"
@@ -595,6 +632,9 @@ check contains "$out" '"worktree": "missing"'
 check contains "$out" '"state": "blocked"'
 check contains "$out" '"state": "idle"'
 check contains "$out" '"result": "blocked"'
+# a terminal run carries no idle time; the live orphan still has one (#57)
+check test "$(printf '%s\n' "$out" | grep -c '"idle_seconds": null')" = 1
+check test "$(printf '%s\n' "$out" | grep -c '"idle_seconds": [0-9]')" = 1
 # absent values are null, not the table's `-`
 check test "$(printf '%s\n' "$out" | grep -c '"result": null')" = 1
 check test "$(printf '%s\n' "$out" | grep -c '"branch": null')" = 1
@@ -614,6 +654,7 @@ check contains "$out" '"result_tests": "sessions --json"'
 check contains "$out" '"running": true'
 check contains "$out" '"input": "canonical"'
 check contains "$out" '"session_state": "blocked"'
+check contains "$out" '"idle_seconds": null'
 check contains "$out" '"dirty": false'
 check contains "$out" '"pane": "'
 
@@ -627,6 +668,38 @@ check contains "$out" '\\'
 check contains "$out" '\"'
 check contains "$out" '\u0001'
 check test "$(printf '%s' "$out" | grep -c $'\t')" = 0
+
+# ---- idle only while a session can be idle (#57) ----
+
+# done, blocked and failed are all terminal: the result file outranks the
+# pane, so a live TUI at the resting prompt must not report an idle time.
+fake_session test-999 "$IDLE_PANE" "$(($(date +%s) - 5495))"
+for result in done blocked failed; do
+    printf 'state=%s\n' "$result" >"$WT/.agent-result"
+    out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-999)
+    check json_ok "$out"
+    check contains "$out" "\"state\": \"$result\""
+    check contains "$out" '"idle_seconds": null'
+    out=$(bash "$TOOL" --root "$REPO" status --no-gh test-999)
+    check contains "$out" "state=$result"
+    check test "$(printf '%s\n' "$out" | grep -c '^idle_seconds=')" = 0
+    out=$(bash "$TOOL" --root "$REPO" sessions --json --no-gh)
+    check test "$(printf '%s\n' "$out" | grep -c '"idle_seconds": null')" = 1
+    out=$(bash "$TOOL" --root "$REPO" sessions --no-gh)
+    check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $3 }')" = -
+done
+
+# resuming a session makes it idle again: the same 5495-second activity
+# delta is reported once the result file no longer claims the run is over.
+rm -f "$WT/.agent-result"
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-999)
+check contains "$out" '"state": "unknown"'
+check contains "$out" '"session_state": "idle"'
+check test "$(printf '%s\n' "$out" | grep -c '"idle_seconds": [0-9]')" = 1
+out=$(bash "$TOOL" --root "$REPO" status --no-gh test-999)
+check contains "$out" 'idle_seconds='
+out=$(bash "$TOOL" --root "$REPO" sessions --json --no-gh)
+check test "$(printf '%s\n' "$out" | grep -c '"idle_seconds": null')" = 0
 
 # a session that is gone is running=false with a null pane, not a missing key
 fake_clear
@@ -671,6 +744,21 @@ check contains "$SNAP" 'no worktree'
 # the result file outranks the busy pane: blocked is red, working is amber
 check contains "$SNAP" 'card state-failed'
 check contains "$SNAP" 'card state-working'
+# a done card carries no idle line; a live working card still carries one (#57)
+card_of() {
+    awk -v want="<h2>$1</h2>" '
+        /<article class="card/ { buf=$0; hit=0; next }
+        { buf=buf "\n" $0 }
+        index($0, want) { hit=1 }
+        /<\/article>/ { if (hit) print buf; buf=""; hit=0 }
+    '
+}
+done_card=$(printf '%s\n' "$SNAP" | card_of test-999)
+check test -n "$done_card"
+check test "$(printf '%s' "$done_card" | grep -c '<dt>idle</dt>')" = 0
+live_card=$(printf '%s\n' "$SNAP" | card_of test-two)
+check test -n "$live_card"
+check test "$(printf '%s' "$live_card" | grep -c '<dt>idle</dt>')" = 1
 # arbitrary text is escaped, never markup
 check contains "$SNAP" 'ok &lt;b&gt;&amp;&quot;quoted&quot;&lt;/b&gt;'
 check test "$(printf '%s' "$SNAP" | grep -c '<b>')" = 0
@@ -793,7 +881,13 @@ fake_clear
 : >"$FAKE_DIR/sent"
 
 launch_brief() {
-    # launch_brief NAME ISSUE [extra...]: one start that reaches the send
+    # launch_brief NAME ISSUE [extra...]: one start that reaches the send.
+    # An accepted launch leaves the fake pane on a turn in flight, so a next
+    # launch would never become ready. Reset only that leftover turn: a pane
+    # a caller set on purpose (the concurrent-session overlay) is kept.
+    if [ "$(cat "$FAKE_DIR/pane" 2>/dev/null)" = "$TURN_PANE" ]; then
+        printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+    fi
     bash "$TOOL" --root "$REPO" start --issue "$2" --name "$1" \
         --branch "test/$1" --title T --url U ${3+"${@:3}"}
 }
@@ -1063,6 +1157,87 @@ WARM_WT="$REPO/.worktrees/test-warm"
 check contains "$(cat "$WARM_WT/.supervisor.log")" \
     'ready=yes elapsed=0.0s timeout=30s poll=0.5s'
 check test -z "$(grep 'waiting-for-ready' "$WARM_WT/.supervisor.log" || true)"
+
+# ---- submission proof: the Enter is not proof (#39) ----
+
+# Accepted: the composer clears and the turn is in flight. Exactly one
+# literal send and one Enter are typed, and the proof is recorded.
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+fake_clear
+: >"$FAKE_DIR/sent"
+if bash "$TOOL" --root "$REPO" start --issue 1016 --name test-proof-ok \
+    --branch test/proof-ok --title T --url U --ready-timeout 30 \
+    --ready-poll 0.5 --submit-timeout 5 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+check contains "$(cat "$TMP/start.out")" 'sent=yes'
+check contains "$(cat "$TMP/start.out")" 'submit_proof=turn-began'
+check contains "$(cat "$TMP/start.out")" 'started=yes'
+check test "$(grep -c -- '-l' "$FAKE_DIR/sent")" = 1
+check test "$(grep -c 'C-m' "$FAKE_DIR/sent")" = 1
+check test -z "$(grep 'resent=yes' "$TMP/start.out" || true)"
+check contains "$(cat "$REPO/.worktrees/test-proof-ok/.supervisor.log")" \
+    'submit=yes proof=turn-began'
+
+# A changed chat title is the other proof: the brief was consumed even before
+# the busy chrome is drawn, so the launch is reported as sent.
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+printf '%s\n' "$TITLE_ONLY_PANE" >"$FAKE_DIR/pane_after_send"
+fake_clear
+: >"$FAKE_DIR/sent"
+if bash "$TOOL" --root "$REPO" start --issue 1017 --name test-proof-title \
+    --branch test/proof-title --title T --url U --ready-timeout 30 \
+    --ready-poll 0.5 --submit-timeout 5 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+check contains "$(cat "$TMP/start.out")" 'sent=yes'
+check contains "$(cat "$TMP/start.out")" 'submit_proof=chat-title'
+check test "$(grep -c -- '-l' "$FAKE_DIR/sent")" = 1
+check test "$(grep -c 'C-m' "$FAKE_DIR/sent")" = 1
+
+# Swallowed: the composer clears but no turn begins and the title is
+# unchanged. start must say sent=no, show the pane it read, stop the
+# half-started session, exit non-zero and never retype the brief.
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+printf '%s\n' "$SWALLOWED_PANE" >"$FAKE_DIR/pane_after_send"
+fake_clear
+: >"$FAKE_DIR/sent"
+: >"$FAKE_DIR/killed"
+if bash "$TOOL" --root "$REPO" start --issue 1018 --name test-proof-swallow \
+    --branch test/proof-swallow --title T --url U --ready-timeout 30 \
+    --ready-poll 0.5 --submit-timeout 2 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -ne 0
+check contains "$(cat "$TMP/start.out")" 'sent=no'
+check contains "$(cat "$TMP/start.out")" 'submit_proof=none'
+check contains "$(cat "$TMP/start.out")" 'resent=no'
+check contains "$(cat "$TMP/start.out")" '--- pane lines the check read ---'
+check contains "$(cat "$TMP/start.out")" 'Enter a coding task'
+check test -z "$(grep 'started=yes' "$TMP/start.out" || true)"
+check test "$(grep -c -- '-l' "$FAKE_DIR/sent")" = 1
+check test "$(grep -c 'C-m' "$FAKE_DIR/sent")" = 1
+check grep -qxF 'fb-test-proof-swallow' "$FAKE_DIR/killed"
+check contains "$(cat "$REPO/.worktrees/test-proof-swallow/.supervisor.log")" \
+    'submit=no elapsed=2.0s timeout=2s'
+check test -d "$REPO/.worktrees/test-proof-swallow"
+# Nobody saw the swallowed text, so the ledger does not block a deliberate
+# retry with the same brief.
+check test -z "$(grep -F 'test-proof-swallow' "$REPO/.supervisor-briefs.jsonl" || true)"
+
+# An Enter that never arrived leaves the brief in the input line: that is not
+# submission either, and it is reported the same way.
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+printf '%s\n' "$TYPED_PANE" >"$FAKE_DIR/pane_after_send"
+fake_clear
+: >"$FAKE_DIR/sent"
+: >"$FAKE_DIR/killed"
+if bash "$TOOL" --root "$REPO" start --issue 1019 --name test-proof-typed \
+    --branch test/proof-typed --title T --url U --ready-timeout 30 \
+    --ready-poll 0.5 --submit-timeout 2 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -ne 0
+check contains "$(cat "$TMP/start.out")" 'sent=no'
+check contains "$(cat "$TMP/start.out")" 'submit_proof=none'
+check contains "$(cat "$TMP/start.out")" 'Read the file .task.md'
+check test "$(grep -c -- '-l' "$FAKE_DIR/sent")" = 1
+check grep -qxF 'fb-test-proof-typed' "$FAKE_DIR/killed"
+fake_clear
 rm -f "$FAKE_DIR/fast_sleep"
 fake_clear
 
@@ -1550,11 +1725,16 @@ for ready in slow hung warm; do
     git -C "$REPO" worktree remove --force "$REPO/.worktrees/test-$ready" \
         >/dev/null 2>&1 || true
 done
+for proof in ok title swallow typed; do
+    git -C "$REPO" worktree remove --force "$REPO/.worktrees/test-proof-$proof" \
+        >/dev/null 2>&1 || true
+done
 git -C "$REPO" branch -D test/999 test/custom test/dead \
     test/test-brief-a test/test-brief-b test/test-brief-c \
     test/test-auto-pid test/auto-survive \
     test/test-refuse-overlay test/test-refuse-turn test/test-refuse-next \
     test/slow test/hung test/warm \
+    test/proof-ok test/proof-title test/proof-swallow test/proof-typed \
     >/dev/null 2>&1 || true
 
 if [ "$failed" -ne 0 ]; then
