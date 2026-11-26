@@ -156,6 +156,12 @@ case "${1:-}" in
             line=''
             for arg in "$@"; do line+="$arg"$'\t'; done
             printf '%s\n' "$line" >>"$d/sent"
+            # A refusal that arrives as a finished turn: the pane is healthy
+            # when start checks readiness, then carries the sentence after
+            # the Enter that submitted the brief.
+            if [ "${!#}" = C-m ] && [ -f "$d/pane_after_send" ]; then
+                mv "$d/pane_after_send" "$d/pane"
+            fi
         fi
         ;;
     kill-session)
@@ -222,6 +228,19 @@ NOMARKER_PANE='⎘ • 6s • △▽
 │  ▍Add to the current task (/ for commands)'
 REFUSED_PANE='Your concurrent-session limit across CLI and Desktop is reached.
 Enter: take over  Esc: back to draft'
+# The anti-automation refusal is a finished turn, not chrome: the sentence
+# sits above the resting prompt, so a chrome-only check reads this as idle.
+STRIKE_PANE='Freebuff did not send this message to the model. It breaks the usage policy (Scripted or automated use): it is the same message sent over and over, or automated account or site farming. It counts as strike 1 today. Strikes reset at midnight, when your daily hours refill.
+╭──────────────────╮
+│  ▍Enter a coding task or / for commands
+╰──────────────────╯
+ DeepSeek V4.1 Flash • high · /tmp/x/proj · /model to change · Chat: New chat'
+# The account budget line is part of the same refusal vocabulary.
+BUDGET_PANE='Your account budget for today is exhausted.
+╭──────────────────╮
+│  ▍Enter a coding task or / for commands
+╰──────────────────╯
+ DeepSeek V4.1 Flash • high · /tmp/x/proj · /model to change · Chat: New chat'
 APPROVAL_PANE='Run command: git status
 Allow once   Allow always   Deny'
 # Captured from 0.2.38: the startup banner sits inside the 12-line window
@@ -274,6 +293,20 @@ if bash "$TOOL" --root "$REPO" watch test-999 --timeout 1 --poll 1 \
     >"$TMP/watch.out" 2>&1; then rc=0; else rc=$?; fi
 check test "$rc" -eq 1
 check contains "$(cat "$TMP/watch.out")" 'state=refused'
+
+# a refusal in the turn text above the resting prompt is refused, not idle
+fake_session test-999 "$STRIKE_PANE"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh test-999)
+check contains "$out" 'session_state=refused'
+if bash "$TOOL" --root "$REPO" watch test-999 --timeout 1 --poll 1 \
+    >"$TMP/watch.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 1
+check contains "$(cat "$TMP/watch.out")" 'state=refused'
+
+# the account budget line is refusal vocabulary too
+fake_session test-999 "$BUDGET_PANE"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh test-999)
+check contains "$out" 'session_state=refused'
 
 # a pane with neither marker still counts as working
 fake_session test-999 "$NOMARKER_PANE"
@@ -699,6 +732,87 @@ out=$(bash "$TOOL" --root "$REPO" start --issue 1006 --name test-brief-j \
 check contains "$out" 'jitter_max=4s'
 check contains "$out" 'brief_hash='
 check test ! -e "$REPO/.worktrees/test-brief-j"
+
+# ---- refusal vocabulary and refusal state (#47) ----
+
+# The overlay refuses before the brief: no keys at all, refused=yes, a
+# non-zero exit, and the sentence recorded instead of the pane.
+printf '%s\n' "$REFUSED_PANE" >"$FAKE_DIR/pane"
+: >"$FAKE_DIR/sent"
+: >"$FAKE_DIR/killed"
+if launch_brief test-refuse-overlay 1007 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -ne 0
+check contains "$(cat "$TMP/start.out")" 'refused=yes'
+check contains "$(cat "$TMP/start.out")" 'concurrent-session limit'
+check test ! -s "$FAKE_DIR/sent"
+check grep -qxF 'fb-test-refuse-overlay' "$FAKE_DIR/killed"
+REFUSE_WT="$REPO/.worktrees/test-refuse-overlay"
+check test -f "$REFUSE_WT/.refusal"
+check contains "$(cat "$REFUSE_WT/.refusal")" 'concurrent-session limit'
+check contains "$(cat "$REFUSE_WT/.supervisor.log")" 'refused at='
+check contains "$(cat "$REFUSE_WT/.supervisor.log")" 'concurrent-session limit'
+check test -z "$(grep -F 'pane:' "$REFUSE_WT/.supervisor.log" || true)"
+
+# the session is gone, but status keeps the refusal until stop clears it
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh test-refuse-overlay)
+check contains "$out" 'session_state=refused'
+out=$(bash "$TOOL" --root "$REPO" stop test-refuse-overlay)
+check contains "$out" 'stopped=no'
+check test ! -f "$REFUSE_WT/.refusal"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh test-refuse-overlay)
+check test -z "$(printf '%s\n' "$out" | grep 'session_state=refused' || true)"
+
+# The anti-automation refusal arrives as a finished turn after the send. The
+# fake pane flips only on Enter, so readiness sees a healthy prompt and start
+# must notice the refusal afterwards instead of printing started=yes.
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+printf '%s\n' "$STRIKE_PANE" >"$FAKE_DIR/pane_after_send"
+: >"$FAKE_DIR/sent"
+if launch_brief test-refuse-turn 1008 --prompt 'strike me once' \
+    >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -ne 0
+check contains "$(cat "$TMP/start.out")" 'refused=yes'
+check contains "$(cat "$TMP/start.out")" 'sent over and over'
+check test -s "$FAKE_DIR/sent"
+TURN_WT="$REPO/.worktrees/test-refuse-turn"
+check test -f "$TURN_WT/.refusal"
+check contains "$(cat "$TURN_WT/.supervisor.log")" 'sent over and over'
+check contains "$(cat "$REPO/.supervisor-briefs.jsonl")" '"refused": true'
+check test -z "$(grep -F 'pane:' "$TURN_WT/.supervisor.log" || true)"
+
+# the pane is back at the resting prompt, but the refusal survives it
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh test-refuse-turn)
+check contains "$out" 'session_state=refused'
+
+# A refused brief is kept in the #48 ledger past the 20-entry window, so a
+# later retry with the same text is refused locally with nothing sent.
+for i in $(seq 1 25); do
+    printf '{"at": "seed2", "name": "seed2", "branch": "seed2", "hash": "seed2%s"}\n' \
+        "$i" >>"$REPO/.supervisor-briefs.jsonl"
+done
+if launch_brief test-refuse-next 1010 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+check test "$(grep -c . "$REPO/.supervisor-briefs.jsonl" || true)" = 21
+: >"$FAKE_DIR/sent"
+if launch_brief test-refuse-retry 1011 --prompt 'strike me once' \
+    >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 1
+check contains "$(cat "$TMP/start.out")" 'already refused'
+check contains "$(cat "$TMP/start.out")" 'never resent'
+check test ! -s "$FAKE_DIR/sent"
+check test ! -e "$REPO/.worktrees/test-refuse-retry"
+
+# send never types into the overlay either
+fake_session test-refuse-send "$REFUSED_PANE"
+: >"$FAKE_DIR/sent"
+if bash "$TOOL" --root "$REPO" send test-refuse-send 'hello' \
+    >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -ne 0
+check contains "$(cat "$TMP/start.out")" 'concurrent-session overlay'
+check test ! -s "$FAKE_DIR/sent"
+fake_clear
 
 # ---- remaining checks ----
 
@@ -1172,8 +1286,13 @@ for brief in a b c; do
     git -C "$REPO" worktree remove --force "$REPO/.worktrees/test-brief-$brief" \
         >/dev/null 2>&1 || true
 done
+for refused in overlay turn next; do
+    git -C "$REPO" worktree remove --force "$REPO/.worktrees/test-refuse-$refused" \
+        >/dev/null 2>&1 || true
+done
 git -C "$REPO" branch -D test/999 test/custom test/dead \
     test/test-brief-a test/test-brief-b test/test-brief-c \
+    test/test-refuse-overlay test/test-refuse-turn test/test-refuse-next \
     >/dev/null 2>&1 || true
 
 if [ "$failed" -ne 0 ]; then

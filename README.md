@@ -126,13 +126,23 @@ Markers, captured from 0.2.38:
   interrupt` and the spinner glyphs from other builds
 - busy while a turn is in flight: `Add to the current task (/ for commands)` —
   no idle marker, so it is never mistaken for idle
-- protected: the concurrent-session overlay (`concurrent-session limit`) is
-  rejected outright and reported as `refused`; the approval/rate-limit strings
-  are only consulted when the resting prompt is absent
+- refused: the concurrent-session overlay (`concurrent-session limit`,
+  `Take over to stop another session`) and the vendor's anti-automation answer
+  (`Scripted or automated use`, `sent over and over`, `strike N today`, an
+  account budget line). That answer is turn text above the resting prompt, so
+  the refusal vocabulary is matched across 40 lines of scrollback, not only the
+  12-line chrome window. A refusal is recorded in
+  `.worktrees/<name>/.refusal` and `.supervisor.log`; `status` keeps reporting
+  `refused` after the sentence scrolls away, until `stop` clears it. Because
+  this is prose matching, a custom `--prompt` that quotes the refusal
+  vocabulary can itself look like a refusal; the stock brief does not contain
+  those phrases.
+- protected: the approval/rate-limit strings are only consulted when the
+  resting prompt is absent
 
-The order of those checks matters. `session_state` reads the result file, then
-the concurrent-session overlay, then the busy markers, then the resting prompt,
-and only then the protected strings. The resting prompt outranks them because
+The order of those checks matters. `session_state` reads a recorded refusal,
+then the result file, then the refusal vocabulary across the window, then the
+busy markers, then the resting prompt, and only then the protected strings. The resting prompt outranks them because
 the startup banner `Can't reach Freebuff's servers. Retrying…` lands inside the
 same 12-line window: while it was checked first, a finished session carrying
 that banner reported `working` forever and was never reaped.
@@ -524,9 +534,11 @@ and silently ignores the prompt. `start` waits for `-icanon` and the
 `Enter a coding task` line before sending anything, and fails with the last
 pane lines if the TUI never becomes ready.
 
-A pane that never becomes ready — for example the concurrent-session overlay —
-can never accept the brief, so `start` prints the last pane lines and stops
-that session, leaving the worktree and branch in place.
+A pane that never becomes ready can never accept the brief, so `start` prints
+the last pane lines and stops that session, leaving the worktree and branch in
+place. The concurrent-session overlay is a refusal instead: no keys are typed
+(its Enter would take over another live session), `start` prints `refused=yes`
+with the sentence and exits non-zero, and the worktree is kept.
 
 Because every session shares one account, `start` checks capacity before it
 spends a worktree: `--max-sessions N` refuses to start while N `fb-*` sessions
@@ -558,6 +570,12 @@ this repository, not a policy argument.
   created.
 - **Jittered launches.** Under a multi-slot `--max-sessions`, sends are spaced
   by a random delay instead of arriving in one second.
+- **A refused send is recorded, not retried.** `start` checks the pane before
+  typing (the overlay gets no keys at all) and after the send. A refusal prints
+  `refused=yes` with the sentence and exits non-zero; the sentence goes to
+  `.supervisor.log`, and the hash is marked `"refused": true` in the same
+  ledger. Refused hashes are kept past the 20-entry window and are never sent
+  again.
 
 If Freebuff refuses a send anyway, the strike is the vendor's decision and the
 account's cost; this tool cannot undo it. Do not add randomised filler or
@@ -568,10 +586,11 @@ agents.
 ## Safety
 
 - The tool writes only under `.worktrees/` in the target repository, plus
-  `.supervisor-briefs.jsonl` in its root (the last 20 sent-brief hashes) and
-  `.git/info/exclude` entries for `.worktrees/`, `.task.md`,
-  `.agent-result`, `.supervisor.log`, `.supervisor-briefs.jsonl` and
-  `local.properties`.
+  `.supervisor-briefs.jsonl` in its root (the last 20 sent-brief hashes, plus
+  any refused hash) and `.git/info/exclude` entries for `.worktrees/`,
+  `.task.md`, `.agent-result`, `.supervisor.log`, `.supervisor-briefs.jsonl`
+  and `local.properties`. A refusal also writes
+  `.worktrees/<name>/.refusal`, which `stop` removes.
 - A running agent uses its normal shell approvals. Do not attach and type while
   it is working; use `send` for a deliberate follow-up.
 - Auto-stop and `gc` only kill `fb-<name>`, after appending the pane tail,
