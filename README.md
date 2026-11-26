@@ -401,8 +401,11 @@ below), because only a server can check the nonce back.
 
 `gui --serve` serves that page over HTTP from python3's standard library, with
 no third-party packages. `GET /` runs the same `gui --snapshot` renderer into a
-temporary file, so the server owns no second markup, and `/api/sessions` is
-`sessions --json` verbatim — the CLI stays the only source of state.
+temporary file, so the dashboard owns no second markup, and `/api/sessions` is
+`sessions --json` verbatim — the CLI stays the only source of state. The stop
+confirmation and action-result pages are a second markup, not a second
+stylesheet: both renderers inline `gui/page.css`, so a colour or a spacing
+value changes in one file.
 
 ```bash
 spawn-freebuff-agent gui --serve                    # http://127.0.0.1:7788

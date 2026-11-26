@@ -547,6 +547,20 @@ action_form() {
     printf '<button type="submit">%s</button></form>' "$(html_escape "$label")"
 }
 
+stylesheet_file() {
+    # stylesheet_file -> gui/page.css next to the tool. It is the one
+    # stylesheet: this renderer inlines it into the snapshot, and
+    # gui/server.py inlines the same file into the stop confirmation and the
+    # action-result page. Resolved from $0, not ROOT, because the asset ships
+    # with the tool rather than with the repository it inspects.
+    local dir
+    case "$0" in
+        */*) dir=$(cd -- "$(dirname -- "$0")" && pwd) ;;
+        *) dir=$(cd -- "$(dirname -- "$(command -v -- "$0" 2>/dev/null || printf '%s' "$0")")" && pwd) ;;
+    esac
+    printf '%s/gui/page.css' "$dir"
+}
+
 snapshot_html() {
     # snapshot_html FILE JSON WATCH [LINK_PREFIX] [NOTE] [FORM_NONCE] [FLASH]
     # -> one self-contained page. `sessions --json` is the input: fixed keys,
@@ -557,11 +571,16 @@ snapshot_html() {
     # header. FORM_NONCE adds the action forms and is empty for a static
     # snapshot, which stays read-only; FLASH is the output of an action that
     # redirected here (the gc report) and is shown above the cards.
+    # The CSS is inlined from gui/page.css, shared with gui/server.py's action
+    # pages, so the page stays a single file with no external asset.
     local file="$1" json="$2" watch="$3" link_prefix=${4:-} note_text=${5:-}
     local form_nonce=${6:-} flash_text=${7:-}
     local line key value name state idle watcher worktree result branch pr
     local tests="" commit="" wt generated total=0 live=0 trees=0 cards='' card
-    local cls pr_html refresh=''
+    local cls pr_html refresh='' css_file
+    css_file=$(stylesheet_file)
+    [ -f "$css_file" ] ||
+        die "gui: missing $css_file (the shared stylesheet next to the tool)"
     generated=$(date -u '+%Y-%m-%d %H:%M:%SZ')
     if [ -n "$watch" ]; then
         refresh="<meta http-equiv=\"refresh\" content=\"$watch\">"
@@ -691,57 +710,7 @@ snapshot_html() {
         [ -z "$refresh" ] || printf '%s\n' "$refresh"
         printf '<title>freebuff agents</title>\n'
         printf '<style>\n'
-        cat <<'CSS'
-:root { color-scheme: light dark; --bg: #f6f7f9; --fg: #1b1f24;
-  --card: #fff; --muted: #5b6570; --line: #d8dee6; --done: #1a7f37;
-  --working: #9a6700; --idle: #57606a; --failed: #cf222e; }
-@media (prefers-color-scheme: dark) { :root { --bg: #0d1117; --fg: #e6edf3;
-  --card: #161b22; --muted: #9198a1; --line: #30363d; --done: #3fb950;
-  --working: #d29922; --idle: #9198a1; --failed: #f85149; } }
-* { box-sizing: border-box; }
-body { margin: 0; padding: 1.25rem; background: var(--bg); color: var(--fg);
-  font: 15px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
-.page h1 { margin: 0 0 .15rem; font-size: 1.35rem; }
-.meta { margin: 0 0 1.25rem; color: var(--muted); font-size: .85rem;
-  overflow-wrap: anywhere; }
-.note { margin: -0.9rem 0 1.25rem; color: var(--working); font-size: .85rem; }
-.grid { display: grid; gap: .9rem;
-  grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); }
-.card { background: var(--card); border: 1px solid var(--line);
-  border-left: 5px solid var(--idle); border-radius: 8px; padding: .8rem 1rem;
-  overflow-wrap: anywhere; }
-.card.state-done { border-left-color: var(--done); }
-.card.state-working { border-left-color: var(--working); }
-.card.state-failed, .card.state-refused { border-left-color: var(--failed); }
-.card header { display: flex; flex-wrap: wrap; gap: .4rem .6rem;
-  align-items: center; margin-bottom: .5rem; }
-.card h2 { margin: 0; font-size: 1.05rem; }
-.badge { margin-left: auto; padding: .05rem .5rem; border-radius: 999px;
-  border: 1px solid currentColor; font-size: .78rem; color: var(--idle); }
-.state-done .badge { color: var(--done); }
-.state-working .badge { color: var(--working); }
-.state-failed .badge, .state-refused .badge { color: var(--failed); }
-.tag { font-size: .75rem; padding: .05rem .4rem; border-radius: 4px;
-  background: var(--bg); border: 1px solid var(--line); color: var(--muted); }
-dl { display: grid; grid-template-columns: max-content 1fr; gap: .15rem .6rem;
-  margin: 0; font-size: .85rem; }
-dt { color: var(--muted); }
-dd { margin: 0; }
-code { font: .85em ui-monospace, SFMono-Regular, Menlo, monospace; }
-a { color: inherit; }
-.actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .6rem; }
-.actions form { display: inline; }
-.actions button { font: inherit; font-size: .82rem; padding: .2rem .7rem;
-  border: 1px solid var(--line); border-radius: 6px; background: var(--bg);
-  color: var(--fg); cursor: pointer; }
-.actions button:hover { border-color: var(--muted); }
-.flash { margin: 0 0 1.25rem; padding: .6rem 1rem; background: var(--card);
-  border: 1px solid var(--line); border-radius: 8px; }
-.flash h2 { margin: 0 0 .4rem; font-size: .95rem; }
-.flash pre { margin: 0; white-space: pre-wrap; font-size: .82rem; }
-.empty { color: var(--muted); padding: 2rem 0; }
-footer { margin-top: 1.5rem; color: var(--muted); font-size: .78rem; }
-CSS
+        cat "$css_file"
         printf '</style>\n</head>\n<body>\n'
         printf '<header class="page">\n<h1>freebuff agents</h1>\n'
         printf '<p class="meta">repo %s · generated %s · sessions %s · running %s · worktrees %s · orphans %s</p>\n' \
