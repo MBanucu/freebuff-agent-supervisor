@@ -3,6 +3,10 @@
 # for the project; a fake tmux stands in for sessions, so no Freebuff, gh,
 # network or phone is needed.
 set -euo pipefail
+# An unguarded command that fails ends the suite under `set -e`. Say which one:
+# without this a CI run stops with no FAIL line and only the last stderr write
+# for company, which is what took a whole suite rerun to explain (#32).
+trap 'rc=$?; printf "error: line %s exited %s\n" "${BASH_LINENO[0]}" "$rc" >&2' ERR
 
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd) || exit 1
 TOOL="$ROOT/spawn-freebuff-agent"
@@ -843,11 +847,18 @@ check test "$(printf '%s\n' "$out" | awk '$1 == "test-auto-pid" { print $4 }')" 
 # watcher must still answer kill -0.
 if command -v setsid >/dev/null 2>&1 && setsid -w true 2>/dev/null; then
     SURVIVE_WT="$REPO/.worktrees/test-auto-survive"
-    setsid -w bash -c 'echo $$ >"$1"; shift; exec "$@"' _ \
+    # The previous launch left its turn in the pane; readiness needs the
+    # resting prompt, and a leftover busy pane would spend the whole
+    # --ready-timeout before failing for the wrong reason. Reset it, keep the
+    # gate short, and report the start's own output when it does fail.
+    printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+    if setsid -w bash -c 'echo $$ >"$1"; shift; exec "$@"' _ \
         "$TMP/survive.pgid" bash "$TOOL" --root "$REPO" start --issue 1016 \
         --name test-auto-survive --branch test/auto-survive --title T --url U \
-        --auto-stop --idle-seconds 3600 --poll 60 \
-        >"$TMP/start.out" 2>&1
+        --auto-stop --idle-seconds 3600 --poll 60 --ready-timeout 10 \
+        >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+    check test "$rc" -eq 0
+    [ "$rc" -eq 0 ] || printf 'start out:\n%s\n' "$(cat "$TMP/start.out")" >&2
     survive_pgid=$(cat "$TMP/survive.pgid")
     survive_pid=$(sed -n 's/^autostop=pid:\([0-9]*\)$/\1/p' \
         "$SURVIVE_WT/.supervisor.log" | tail -n 1)
