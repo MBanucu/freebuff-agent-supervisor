@@ -138,7 +138,20 @@ case "${1:-}" in
     display-message)
         fmt="${!#}"
         case "$fmt" in
-            *pane_tty*) printf '%s\n' "$d/tty" ;;
+            *pane_tty*)
+                # Opt-in: ready_after N makes the pane report no tty for N
+                # checks, so a cold launch can be simulated as a poll count
+                # instead of a real 45-second wait.
+                if [ -f "$d/ready_after" ]; then
+                    left=$(cat "$d/ready_after" 2>/dev/null || printf '0')
+                    if [ "$left" -gt 0 ]; then
+                        printf '%s\n' "$((left - 1))" >"$d/ready_after"
+                        exit 0
+                    fi
+                    rm -f "$d/ready_after"
+                fi
+                printf '%s\n' "$d/tty"
+                ;;
             *session_activity*) cat "$d/activity" 2>/dev/null || printf '0\n' ;;
             *) printf '0\n' ;;
         esac
@@ -814,6 +827,89 @@ check contains "$(cat "$TMP/start.out")" 'concurrent-session overlay'
 check test ! -s "$FAKE_DIR/sent"
 fake_clear
 
+# ---- readiness gate: a deadline, not a fixed 45 s (#46) ----
+
+# The gate's verdict must not depend on the wall clock in a suite: with this
+# flag the fake sleep returns at once, so a "cold" launch is a poll count
+# instead of a 90 s wait. Without the flag it is the real sleep.
+REAL_SLEEP=$(command -v sleep)
+cat >"$TMP/bin/sleep" <<FAKE
+#!/usr/bin/env bash
+if [ -f "\${FAKE_TMUX_DIR:?}/fast_sleep" ]; then exit 0; fi
+exec "$REAL_SLEEP" "\$@"
+FAKE
+chmod +x "$TMP/bin/sleep"
+: >"$FAKE_DIR/fast_sleep"
+
+out=$(bash "$TOOL" --root "$REPO" start --issue 1012 --name test-ready-dry \
+    --branch test/ready-dry --title T --url U \
+    --ready-timeout 30 --ready-poll 0.25 --dry-run)
+check contains "$out" 'ready_timeout=30s ready_poll=0.25s'
+check contains "$(bash "$TOOL" --help 2>&1)" '--ready-timeout N'
+check test ! -e "$REPO/.worktrees/test-ready-dry"
+if bash "$TOOL" --root "$REPO" start --issue 1012 --name test-ready-bad \
+    --branch test/ready-bad --title T --url U --ready-poll 0 \
+    --dry-run >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 1
+check contains "$(cat "$TMP/start.out")" '--ready-poll must be a positive number'
+
+# The old budget was 90 polls of 0.5 s. A pane that only reports a tty after
+# 100 polls used to be killed just before it became ready; the new default
+# deadline lets the same launch through, and the wait leaves a trace.
+printf '100\n' >"$FAKE_DIR/ready_after"
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+fake_clear
+: >"$FAKE_DIR/sent"
+if bash "$TOOL" --root "$REPO" start --issue 1013 --name test-slow \
+    --branch test/slow --title T --url U >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+check contains "$(cat "$TMP/start.out")" 'started=yes'
+check contains "$(cat "$TMP/start.out")" 'waiting-for-ready=yes'
+SLOW_WT="$REPO/.worktrees/test-slow"
+check contains "$(cat "$SLOW_WT/.supervisor.log")" 'waiting-for-ready=yes elapsed=45.0s'
+check contains "$(cat "$SLOW_WT/.supervisor.log")" \
+    'ready=yes elapsed=50.0s timeout=120s poll=0.5s'
+check test -s "$FAKE_DIR/sent"
+rm -f "$FAKE_DIR/ready_after"
+fake_clear
+
+# A pane that stays up but never draws the resting prompt is a hung TUI: the
+# wait gives up inside its own timeout, names the flag that raises it, and
+# still prints the last pane lines and the elapsed seconds.
+printf '%s\n' "$BUSY_PANE" >"$FAKE_DIR/pane"
+: >"$FAKE_DIR/killed"
+if bash "$TOOL" --root "$REPO" start --issue 1014 --name test-hung \
+    --branch test/hung --title T --url U \
+    --ready-timeout 5 --ready-poll 0.5 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 1
+check contains "$(cat "$TMP/start.out")" 'did not reach raw input'
+check contains "$(cat "$TMP/start.out")" '--ready-timeout 5'
+check contains "$(cat "$TMP/start.out")" 'after 5.0s'
+check contains "$(cat "$TMP/start.out")" '--- last pane lines ---'
+check contains "$(cat "$TMP/start.out")" 'thinking...'
+check grep -qxF 'fb-test-hung' "$FAKE_DIR/killed"
+HUNG_WT="$REPO/.worktrees/test-hung"
+check contains "$(cat "$HUNG_WT/.supervisor.log")" \
+    'ready=timeout elapsed=5.0s timeout=5s poll=0.5s'
+check test -d "$HUNG_WT"
+
+# A warm pane is ready on the first check: no poll is paid and the log has no
+# waiting line, only the outcome.
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+fake_clear
+if bash "$TOOL" --root "$REPO" start --issue 1015 --name test-warm \
+    --branch test/warm --title T --url U \
+    --ready-timeout 30 --ready-poll 0.5 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+check contains "$(cat "$TMP/start.out")" 'started=yes'
+check test -z "$(grep 'waiting-for-ready' "$TMP/start.out" || true)"
+WARM_WT="$REPO/.worktrees/test-warm"
+check contains "$(cat "$WARM_WT/.supervisor.log")" \
+    'ready=yes elapsed=0.0s timeout=30s poll=0.5s'
+check test -z "$(grep 'waiting-for-ready' "$WARM_WT/.supervisor.log" || true)"
+rm -f "$FAKE_DIR/fast_sleep"
+fake_clear
+
 # ---- remaining checks ----
 
 if bash "$TOOL" --root "$REPO" start --issue 999 --name test-999 \
@@ -1290,9 +1386,14 @@ for refused in overlay turn next; do
     git -C "$REPO" worktree remove --force "$REPO/.worktrees/test-refuse-$refused" \
         >/dev/null 2>&1 || true
 done
+for ready in slow hung warm; do
+    git -C "$REPO" worktree remove --force "$REPO/.worktrees/test-$ready" \
+        >/dev/null 2>&1 || true
+done
 git -C "$REPO" branch -D test/999 test/custom test/dead \
     test/test-brief-a test/test-brief-b test/test-brief-c \
     test/test-refuse-overlay test/test-refuse-turn test/test-refuse-next \
+    test/slow test/hung test/warm \
     >/dev/null 2>&1 || true
 
 if [ "$failed" -ne 0 ]; then

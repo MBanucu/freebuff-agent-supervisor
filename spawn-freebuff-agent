@@ -52,6 +52,18 @@ REFUSAL_FILE='.refusal'
 # Turn text sits above the visible prompt, so refusal detection reads this
 # many lines of scrollback rather than the 12-line chrome window.
 REFUSAL_WINDOW=40
+# Readiness gate: the TUI accepts the brief only once it is in raw mode and
+# draws its resting prompt. A cold first launch in a fresh worktree pays for
+# the banner, the trust prompt and the session scan, which outran the old
+# fixed 45s gate, so the default deadline is generous and both values are
+# per-start flags. A warm pane is ready on the first check and pays no poll.
+READY_TIMEOUT=120
+READY_POLL=0.5
+# Note the wait every this many polls, so a slow launch leaves a trace in
+# .supervisor.log instead of looking like a hang.
+READY_NOTE_POLLS=10
+# Set by wait_ready: seconds spent polling, for the log and the failure line.
+READY_ELAPSED=0.0
 
 usage() {
     cat <<'USAGE'
@@ -72,6 +84,10 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       --auto-stop        stop fb-<name> after the agent finishes
       --idle-seconds N   idle window for --auto-stop (default: 120)
       --poll N           watcher poll interval in seconds (default: 5)
+      --ready-timeout N  seconds to wait for the TUI to take raw input
+                         (default: 120); a cold first launch can need more
+                         than the old fixed 45s
+      --ready-poll N     seconds between readiness checks (default: 0.5)
       --max-sessions N   refuse to start while N fb-* sessions are live
       --wait-slot [N]    wait up to N seconds (default: 300) for a free slot
                          instead of failing; requires --max-sessions
@@ -164,7 +180,11 @@ Environment:
 
 Notes:
   - The TUI needs a 180x55 pane. Smaller panes stay in canonical mode and
-    silently ignore the prompt; this tool waits for -icanon before sending.
+    silently ignore the prompt; this tool waits for -icanon before sending,
+    re-checking every --ready-poll seconds for up to --ready-timeout.
+  - A wait that gives up names the timeout it used, prints the last pane
+    lines and records elapsed seconds in .supervisor.log, so a slow cold
+    launch is distinguishable from a hung TUI.
   - A running agent runs shell commands with its normal approvals. Do not
     attach and type while it is working.
   - A brief is hashed into .supervisor-briefs.jsonl (last 20 kept) before it
@@ -197,6 +217,17 @@ is_num() {
     case "${1:-}" in
         ''|*[!0-9]*) return 1 ;;
         *) return 0 ;;
+    esac
+}
+
+is_duration() {
+    # is_duration VALUE -> 0 for a positive number of seconds. Decimals are
+    # allowed because --ready-poll defaults to 0.5 and sleep accepts fractions
+    # on every target; zero is refused so a poll cannot busy-loop.
+    case "${1:-}" in
+        ''|*[!0-9.]*|*.*.*) return 1 ;;
+        *[1-9]*) return 0 ;;
+        *) return 1 ;;
     esac
 }
 
@@ -772,28 +803,72 @@ blocked, and do not commit it.
 EOF
 }
 
+ready_polls() {
+    # ready_polls TIMEOUT POLL -> poll intervals that fit in TIMEOUT, rounded
+    # up, so the deadline follows --ready-timeout instead of a fixed count.
+    awk -v t="$1" -v p="$2" 'BEGIN {
+        n = t / p; c = int(n); if (n > c) c++; if (c < 1) c = 1
+        printf "%d", c
+    }'
+}
+
+ready_elapsed() {
+    # ready_elapsed POLLS POLL -> seconds spent polling, with one decimal so a
+    # sub-second interval is visible. awk is already used for the brief ledger.
+    awk -v n="$1" -v p="$2" 'BEGIN { printf "%.1f", n * p }'
+}
+
+ready_note() {
+    # ready_note WORKTREE MESSAGE -> a readiness line on stdout and in
+    # .supervisor.log, so a slow launch is evidence instead of silence after
+    # the terminal is gone.
+    local wt="$1"
+    shift
+    note "$*"
+    [ -d "$wt" ] || return 0
+    printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >>"$wt/.supervisor.log"
+}
+
 wait_ready() {
-    # wait_ready TMUX SESSION -> 0 ready, 2 refused, 1 never ready. A refusal
-    # is checked first: the overlay never draws the resting prompt, and typing
-    # into it would take over another live session instead of starting this one.
-    local tmux="$1" session="$2" i tty pane
-    for i in $(seq 1 90); do
+    # wait_ready TMUX SESSION WORKTREE TIMEOUT POLL -> 0 ready, 2 refused,
+    # 1 never ready inside TIMEOUT. A refusal is checked first: the overlay
+    # never draws the resting prompt, and typing into it would take over
+    # another live session instead of starting this one. The wait is a
+    # predicate with a deadline, not a fixed sleep count: it re-checks every
+    # POLL seconds until TIMEOUT has passed, so a warm pane returns on the
+    # first check and a cold launch gets the whole --ready-timeout budget.
+    # READY_ELAPSED is set for the caller's log line and failure message.
+    local tmux="$1" session="$2" wt="$3" timeout="$4" poll="$5"
+    local polls i=0 tty pane
+    polls=$(ready_polls "$timeout" "$poll")
+    while :; do
         if ! "$tmux" has-session -t "$session" 2>/dev/null; then
+            READY_ELAPSED=$(ready_elapsed "$i" "$poll")
             return 1
         fi
         tty=$("$tmux" display-message -p -t "$session" '#{pane_tty}' 2>/dev/null || true)
         pane=$("$tmux" capture-pane -p -t "$session" -S "-$REFUSAL_WINDOW" 2>/dev/null || true)
         if printf '%s\n' "$pane" | grep -qiE "$REFUSED_RE"; then
+            READY_ELAPSED=$(ready_elapsed "$i" "$poll")
             return 2
         fi
         if [ -n "$tty" ] &&
             stty -a -F "$tty" 2>/dev/null | grep -q -- '-icanon' &&
             printf '%s' "$pane" | grep -q 'Enter a coding task'; then
+            READY_ELAPSED=$(ready_elapsed "$i" "$poll")
+            ready_note "$wt" "ready=yes elapsed=${READY_ELAPSED}s timeout=${timeout}s poll=${poll}s"
             return 0
         fi
-        sleep 0.5
+        i=$((i + 1))
+        if [ "$i" -ge "$polls" ]; then
+            READY_ELAPSED=$(ready_elapsed "$i" "$poll")
+            return 1
+        fi
+        if [ $((i % READY_NOTE_POLLS)) -eq 0 ]; then
+            ready_note "$wt" "waiting-for-ready=yes elapsed=$(ready_elapsed "$i" "$poll")s timeout=${timeout}s poll=${poll}s"
+        fi
+        sleep "$poll"
     done
-    return 1
 }
 
 brief_hash() {
@@ -935,6 +1010,7 @@ start() {
     local issue="" name="" branch="" base="main" title="" url="" task_file=""
     local sdk_dir="" dry=0 nostart=0 autostop=0 idle=120 poll=5
     local idle_set=0 poll_set=0 max_sessions=0 wait_slot=0 slot_wait=300
+    local ready_timeout="$READY_TIMEOUT" ready_poll="$READY_POLL"
     local prompt_text="" sent brief_hash_value jitter_max jitter=0
     local ready_rc=0 pane refusal=""
     while [ $# -gt 0 ]; do
@@ -950,6 +1026,8 @@ start() {
             --auto-stop) autostop=1; shift ;;
             --idle-seconds) idle=${2:-}; idle_set=1; shift 2 ;;
             --poll) poll=${2:-}; poll_set=1; shift 2 ;;
+            --ready-timeout) ready_timeout=${2:-}; shift 2 ;;
+            --ready-poll) ready_poll=${2:-}; shift 2 ;;
             --max-sessions) max_sessions=${2:-}; shift 2 ;;
             --wait-slot)
                 wait_slot=1
@@ -975,6 +1053,9 @@ start() {
     [ -n "$branch" ] || die "start: branch is empty"
     is_num "$idle" || die "start: --idle-seconds must be a number"
     is_num "$poll" || die "start: --poll must be a number"
+    is_num "$ready_timeout" || die "start: --ready-timeout must be a number of seconds"
+    [ "$ready_timeout" -ge 1 ] || die "start: --ready-timeout must be at least 1 second"
+    is_duration "$ready_poll" || die "start: --ready-poll must be a positive number of seconds"
     if [ "$autostop" = 0 ] && { [ "$idle_set" = 1 ] || [ "$poll_set" = 1 ]; }; then
         die "start: --idle-seconds and --poll require --auto-stop"
     fi
@@ -1018,6 +1099,7 @@ start() {
         note "brief_hash=$brief_hash_value"
         note "brief_chars=${#sent}"
         [ "$jitter_max" = 0 ] || note "jitter_max=${jitter_max}s"
+        note "ready_timeout=${ready_timeout}s ready_poll=${ready_poll}s"
         note "tmux=${FREEBUFF_TMUX:-tmux} -x $COLS -y $ROWS -c $wt"
         if [ "$autostop" = 1 ]; then
             note "autostop=yes idle_seconds=$idle poll=$poll"
@@ -1099,7 +1181,7 @@ start() {
     printf -v cmd 'TERM=xterm-256color %q --cwd %q --trust-agents' "$fb" "$wt"
     "$tmux" new-session -d -s "$session" -x "$COLS" -y "$ROWS" -c "$wt" "$cmd"
 
-    wait_ready "$tmux" "$session" || ready_rc=$?
+    wait_ready "$tmux" "$session" "$wt" "$ready_timeout" "$ready_poll" || ready_rc=$?
     if [ "$ready_rc" -eq 2 ]; then
         # The overlay is a refusal, not a slow start. Its Enter key takes over
         # another live session, so no keys are typed at all; the worktree and
@@ -1121,7 +1203,8 @@ start() {
         # A pane that never reached raw input can never accept the brief, so it
         # is dead weight. Kill only the session; the worktree and branch stay.
         "$tmux" kill-session -t "$session" 2>/dev/null || true
-        die "start: TUI did not reach raw input in $session; stopped it, worktree kept ($wt)"
+        ready_note "$wt" "ready=timeout elapsed=${READY_ELAPSED}s timeout=${ready_timeout}s poll=${ready_poll}s session=$session"
+        die "start: TUI did not reach raw input in $session after ${READY_ELAPSED}s (--ready-timeout $ready_timeout, --ready-poll $ready_poll); stopped it, worktree kept ($wt). A cold first launch can need a larger --ready-timeout."
     fi
 
     # A brief that is byte-identical across sessions reads as scripted use to
