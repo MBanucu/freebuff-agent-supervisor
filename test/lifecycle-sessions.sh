@@ -190,3 +190,41 @@ check contains "$(cat "$TMP/start.out")" 'stopped it, worktree kept'
 check grep -qxF 'fb-test-dead' "$FAKE_DIR/killed"
 check test -d "$REPO/.worktrees/test-dead"
 fake_clear
+
+# ---- a finished session still holds a vendor slot (#90) ----
+
+# Freebuff counts live TUIs, not runs, so a done session keeps the
+# concurrent-session slot until something stops it. sessions counts those, the
+# JSON marks them per row, and a start refused by the overlay names them, so
+# the next step is `gc` instead of taking over an unrelated session.
+PATH="$TMP/bin:$PATH"
+export PATH
+export FREEBUFF_BIN="$TMP/bin/freebuff"
+: >"$FAKE_DIR/ready"
+RESULT_SAVED=''
+[ -f "$WT/.agent-result" ] && RESULT_SAVED=$(cat "$WT/.agent-result")
+printf 'state=done\n' >"$WT/.agent-result"
+fake_session test-999 "$IDLE_PANE"
+fake_add_session ghost
+out=$(bash "$TOOL" --root "$REPO" sessions --no-gh)
+check contains "$out" 'finished=1'
+out=$(bash "$TOOL" --root "$REPO" sessions --json --no-gh)
+check test "$(printf '%s\n' "$out" | grep -c '"finished": true' || true)" = 1
+# every row carries the key; only a live finished one can be true
+check test "$(printf '%s\n' "$out" | grep -c '"finished": false' || true)" -ge 1
+
+printf '%s\n' "$REFUSED_PANE" >"$FAKE_DIR/pane"
+: >"$FAKE_DIR/sent"
+if launch_brief test-refuse-slot 1018 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -ne 0
+check contains "$(cat "$TMP/start.out")" 'holding_slot=test-999'
+check contains "$(cat "$TMP/start.out")" 'gc'
+check test "$(printf '%s\n' "$(cat "$TMP/start.out")" | grep -c 'holding_slot=' || true)" = 1
+
+# leave the fixture as it was found
+if [ -n "$RESULT_SAVED" ]; then
+    printf '%s\n' "$RESULT_SAVED" >"$WT/.agent-result"
+else
+    rm -f "$WT/.agent-result"
+fi
+fake_clear

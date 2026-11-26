@@ -210,6 +210,19 @@ fake_add_session() {
     printf 'fb-%s\n' "$1" >>"$FAKE_DIR/session"
 }
 
+launch_brief() {
+    # launch_brief NAME ISSUE [extra...]: one start that reaches the send. The
+    # caller puts $TMP/bin on PATH and opts in with : >"$FAKE_DIR/ready".
+    # An accepted launch leaves the fake pane on a turn in flight, so a next
+    # launch would never become ready. Reset only that leftover turn: a pane
+    # a caller set on purpose (the concurrent-session overlay) is kept.
+    if [ "$(cat "$FAKE_DIR/pane" 2>/dev/null)" = "$TURN_PANE" ]; then
+        printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+    fi
+    bash "$TOOL" --root "$REPO" start --issue "$2" --name "$1" \
+        --branch "test/$1" --title T --url U ${3+"${@:3}"}
+}
+
 # Panes as captured from Freebuff 0.2.38.
 IDLE_PANE='╭──────────────────╮
 │  ▍Enter a coding task or / for commands
