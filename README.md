@@ -11,8 +11,8 @@ git checkout, or point it at one with `--root`.
 1. creates `.worktrees/<name>` on a new branch from a base ref;
 2. writes the brief to `.task.md` in that worktree;
 3. starts Freebuff in a detached tmux session `fb-<name>` at **180x55**;
-4. waits until the TUI accepts raw input, then sends the "read `.task.md`"
-   prompt;
+4. waits until the TUI accepts raw input, sends the "read `.task.md`" prompt,
+   and requires proof that the turn began (not just that Enter was sent);
 5. shows the pane, branch, result and PR with `status`, and stops it with
    `stop`;
 6. optionally watches the run and stops the session when the agent reports a
@@ -634,6 +634,33 @@ cold start from a hung TUI; raise `--ready-timeout` for the former. The concurre
 (its Enter would take over another live session), `start` prints `refused=yes`
 with the sentence and exits non-zero, and the worktree is kept.
 
+**A ready pane can still swallow the Enter.** That failure looks healthy: the
+composer clears, the session rests at the idle prompt, the worktree is clean
+and `session_state` says `idle`, so the old `start` printed `started=yes` for a
+run that never began. The keystroke is therefore not proof. After typing,
+`start` captures the pane every `--ready-poll` seconds until
+`--submit-timeout` seconds (default 20) have passed, and requires both:
+
+- the input line has cleared — it shows `Enter a coding task` or `Add to the
+  current task`, not the brief still waiting for Enter; and
+- a turn is in flight (`thinking...` / `working...` / the mid-turn composer)
+  **or** the `Chat:` title changed from the one captured before the send.
+
+It is a predicate with a deadline, so an accepted send is reported on the
+first check — `sent=yes submit_proof=turn-began elapsed=0.0s` — and no fixed
+sleep is paid. A changed title is `submit_proof=chat-title`: the client took
+the brief and named the chat before the busy chrome was drawn.
+
+A brief that never proves submission prints `sent=no`,
+`submit_proof=none`, `resent=no` and the pane lines the check read, records
+`submit=no elapsed=...` in `.supervisor.log`, stops the session and exits
+non-zero with the worktree and branch kept, like every other failed launch.
+It is never retyped: an automatic resend is how a duplicate turn starts, and a
+repeated identical message is what the vendor's scripted-use filter counts as
+a strike. The brief's hash reaches the ledger only once the send is proven, so
+a swallowed brief — which nobody saw — does not block a deliberate retry with
+the same text.
+
 Because every session shares one account, `start` checks capacity before it
 spends a worktree: `--max-sessions N` refuses to start while N `fb-*` sessions
 are live, and `--wait-slot [SECONDS]` (default 300, requires
@@ -705,10 +732,11 @@ agents.
 - The test suite is deviceless: a fake tmux serves fixture panes, several
   session names and recorded kills, so it covers the result protocol, state
   transitions (including an unclassifiable pane becoming `unknown` with its
-  evidence and the `--explain` dump), autostop and `gc` decisions, the
-  `sessions` inventory, graceful stop, the capacity pre-flight, and the
-  server's routes, auth, actions and bind rules without a Freebuff session,
-  account slot, `gh` or network.
+  evidence and the `--explain` dump),   autostop and `gc` decisions, the
+  `sessions` inventory, graceful stop, the capacity pre-flight, the submission
+  proof (an accepted turn, a changed chat title, a swallowed Enter and a brief
+  left in the input line), and the server's routes, auth, actions and bind
+  rules without a Freebuff session, account slot, `gh` or network.
   It does not exercise the real TUI; verify marker changes with one controlled
   run when upgrading Freebuff.
 
