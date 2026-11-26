@@ -534,9 +534,23 @@ and silently ignores the prompt. `start` waits for `-icanon` and the
 `Enter a coding task` line before sending anything, and fails with the last
 pane lines if the TUI never becomes ready.
 
-A pane that never becomes ready can never accept the brief, so `start` prints
-the last pane lines and stops that session, leaving the worktree and branch in
-place. The concurrent-session overlay is a refusal instead: no keys are typed
+The wait is a predicate with a deadline, not a fixed count: `start` re-checks
+every `--ready-poll` seconds (default 0.5) until `--ready-timeout` seconds
+(default 120) have passed. The old gate was 90 polls — a fixed 45 seconds —
+and a cold first launch in a fresh worktree (the banner, the trust prompt, the
+session list scan) outran it, so `start` killed a pane that was about to become
+ready. A warm pane still returns on the first check and pays no poll. Both
+values are in `start --help` and in the `--dry-run` plan (`ready_timeout=120s
+ready_poll=0.5s`).
+
+While it waits, `start` notes `waiting-for-ready=yes elapsed=Ns` every ten
+polls, and records the outcome in `.worktrees/<name>/.supervisor.log`:
+`ready=yes` or `ready=timeout`, each with the elapsed seconds, the timeout and
+the poll interval. A pane that never becomes ready can never accept the
+brief, so `start` prints the last pane lines, stops that session, and fails in
+a message naming the `--ready-timeout` that was used, leaving the worktree and
+branch in place. The elapsed time and pane tail are what distinguishes a slow
+cold start from a hung TUI; raise `--ready-timeout` for the former. The concurrent-session overlay is a refusal instead: no keys are typed
 (its Enter would take over another live session), `start` prints `refused=yes`
 with the sentence and exits non-zero, and the worktree is kept.
 
