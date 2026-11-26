@@ -361,6 +361,17 @@ result_state() {
     esac
 }
 
+state_is_terminal() {
+    # state_is_terminal STATE -> 0 when the run is over and the session can no
+    # longer take a turn. Idle time is meaningless there: a done card reading
+    # `idle 5495s` is a contradiction, not a clock (#57). `refused` is not in
+    # this set: stop clears the refusal and the pane is still live.
+    case "${1:-}" in
+        done|blocked|failed|stopped) return 0 ;;
+    esac
+    return 1
+}
+
 refusal_recorded() {
     # refusal_recorded WORKTREE -> the recorded refusal sentence, empty when
     # the session has not been refused. This survives the pane: the vendor's
@@ -1727,7 +1738,13 @@ status() {
         fi
         evidence=$(classify_state "$name" "$window")
         sstate=$(evidence_field "$evidence" state)
-        idle=$(idle_seconds "$name" || true)
+        # Only a session that can still be idle has an idle time. The result
+        # file outranks the pane, so `state` is the terminal answer even while
+        # the TUI process stays alive; `session_state` carries the same verdict
+        # on a branch that reports blocked and failed distinctly (#32).
+        if ! state_is_terminal "$state" && ! state_is_terminal "$sstate"; then
+            idle=$(idle_seconds "$name" || true)
+        fi
         pane=$("$tmux" capture-pane -p -t "$session" -S "-$lines" 2>/dev/null || true)
         if [ "$json" = 0 ]; then
             printf 'running=yes\ninput=%s\n' "$mode"
@@ -1872,11 +1889,13 @@ list_agents() {
         if [ -n "$tmux" ] && "$tmux" has-session -t "$session" 2>/dev/null; then
             running=yes
             state=$(session_state "$name")
-            activity=$(session_activity "$name" 2>/dev/null || true)
-            if is_num "$activity"; then
-                idle_secs=$((now - activity))
-                [ "$idle_secs" -ge 0 ] || idle_secs=0
-                idle="${idle_secs}s"
+            if ! state_is_terminal "$state"; then
+                activity=$(session_activity "$name" 2>/dev/null || true)
+                if is_num "$activity"; then
+                    idle_secs=$((now - activity))
+                    [ "$idle_secs" -ge 0 ] || idle_secs=0
+                    idle="${idle_secs}s"
+                fi
             fi
         else
             state=$(result_state "$wt")
@@ -2008,11 +2027,15 @@ sessions() {
             running=yes
             live=$((live + 1))
             state=$(session_state "$name")
-            activity=$(session_activity "$name" 2>/dev/null || true)
-            if is_num "$activity"; then
-                idle_secs=$((now - activity))
-                [ "$idle_secs" -ge 0 ] || idle_secs=0
-                idle="${idle_secs}s"
+            # A finished run has no idle time, even while its TUI process is
+            # still alive: null in JSON, `-` in the table, no idle on the card.
+            if ! state_is_terminal "$state"; then
+                activity=$(session_activity "$name" 2>/dev/null || true)
+                if is_num "$activity"; then
+                    idle_secs=$((now - activity))
+                    [ "$idle_secs" -ge 0 ] || idle_secs=0
+                    idle="${idle_secs}s"
+                fi
             fi
         elif [ "$worktree" = yes ]; then
             state=$(result_state "$wt")

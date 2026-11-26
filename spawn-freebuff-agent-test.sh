@@ -558,6 +558,9 @@ check test "$(printf '%s\n' "$out" | awk '$1 == "ghost" { print $5 }')" = missin
 check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $5 }')" = yes
 check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $4 }')" = "pid:$$"
 check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $6 }')" = blocked
+# a live session whose result file is terminal shows no idle (#57)
+check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $3 }')" = -
+check test "$(printf '%s\n' "$out" | awk '$1 == "ghost" { print $3 }')" != -
 check contains "$out" 'sessions=2 running=2 worktrees=1 orphans=1'
 
 # a watcher that was recorded but has gone is not reported as alive
@@ -565,9 +568,11 @@ printf 'autostop=pid:999999\n' >>"$WT/.supervisor.log"
 out=$(bash "$TOOL" --root "$REPO" sessions --no-gh)
 check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $4 }')" = dead
 
-# list names the orphan, so it cannot be reaped without ever being seen
+# list names the orphan, so it cannot be reaped without ever being seen;
+# its IDLE column follows the same terminal rule (#57)
 out=$(bash "$TOOL" --root "$REPO" list)
 check contains "$out" 'orphans=ghost'
+check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $6 }')" = -
 
 # even a root with no worktrees reports the orphan instead of only "no worktrees"
 mkdir -p "$TMP/no-worktrees"
@@ -601,6 +606,9 @@ check contains "$out" '"worktree": "missing"'
 check contains "$out" '"state": "done"'
 check contains "$out" '"state": "idle"'
 check contains "$out" '"result": "blocked"'
+# a terminal run carries no idle time; the live orphan still has one (#57)
+check test "$(printf '%s\n' "$out" | grep -c '"idle_seconds": null')" = 1
+check test "$(printf '%s\n' "$out" | grep -c '"idle_seconds": [0-9]')" = 1
 # absent values are null, not the table's `-`
 check test "$(printf '%s\n' "$out" | grep -c '"result": null')" = 1
 check test "$(printf '%s\n' "$out" | grep -c '"branch": null')" = 1
@@ -620,6 +628,7 @@ check contains "$out" '"result_tests": "sessions --json"'
 check contains "$out" '"running": true'
 check contains "$out" '"input": "canonical"'
 check contains "$out" '"session_state": "done"'
+check contains "$out" '"idle_seconds": null'
 check contains "$out" '"dirty": false'
 check contains "$out" '"pane": "'
 
@@ -633,6 +642,38 @@ check contains "$out" '\\'
 check contains "$out" '\"'
 check contains "$out" '\u0001'
 check test "$(printf '%s' "$out" | grep -c $'\t')" = 0
+
+# ---- idle only while a session can be idle (#57) ----
+
+# done, blocked and failed are all terminal: the result file outranks the
+# pane, so a live TUI at the resting prompt must not report an idle time.
+fake_session test-999 "$IDLE_PANE" "$(($(date +%s) - 5495))"
+for result in done blocked failed; do
+    printf 'state=%s\n' "$result" >"$WT/.agent-result"
+    out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-999)
+    check json_ok "$out"
+    check contains "$out" "\"state\": \"$result\""
+    check contains "$out" '"idle_seconds": null'
+    out=$(bash "$TOOL" --root "$REPO" status --no-gh test-999)
+    check contains "$out" "state=$result"
+    check test "$(printf '%s\n' "$out" | grep -c '^idle_seconds=')" = 0
+    out=$(bash "$TOOL" --root "$REPO" sessions --json --no-gh)
+    check test "$(printf '%s\n' "$out" | grep -c '"idle_seconds": null')" = 1
+    out=$(bash "$TOOL" --root "$REPO" sessions --no-gh)
+    check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $3 }')" = -
+done
+
+# resuming a session makes it idle again: the same 5495-second activity
+# delta is reported once the result file no longer claims the run is over.
+rm -f "$WT/.agent-result"
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-999)
+check contains "$out" '"state": "unknown"'
+check contains "$out" '"session_state": "idle"'
+check test "$(printf '%s\n' "$out" | grep -c '"idle_seconds": [0-9]')" = 1
+out=$(bash "$TOOL" --root "$REPO" status --no-gh test-999)
+check contains "$out" 'idle_seconds='
+out=$(bash "$TOOL" --root "$REPO" sessions --json --no-gh)
+check test "$(printf '%s\n' "$out" | grep -c '"idle_seconds": null')" = 0
 
 # a session that is gone is running=false with a null pane, not a missing key
 fake_clear
@@ -677,6 +718,21 @@ check contains "$SNAP" 'no worktree'
 # the result file outranks the busy pane, so done versus working is visible
 check contains "$SNAP" 'card state-done'
 check contains "$SNAP" 'card state-working'
+# a done card carries no idle line; a live working card still carries one (#57)
+card_of() {
+    awk -v want="<h2>$1</h2>" '
+        /<article class="card/ { buf=$0; hit=0; next }
+        { buf=buf "\n" $0 }
+        index($0, want) { hit=1 }
+        /<\/article>/ { if (hit) print buf; buf=""; hit=0 }
+    '
+}
+done_card=$(printf '%s\n' "$SNAP" | card_of test-999)
+check test -n "$done_card"
+check test "$(printf '%s' "$done_card" | grep -c '<dt>idle</dt>')" = 0
+live_card=$(printf '%s\n' "$SNAP" | card_of test-two)
+check test -n "$live_card"
+check test "$(printf '%s' "$live_card" | grep -c '<dt>idle</dt>')" = 1
 # arbitrary text is escaped, never markup
 check contains "$SNAP" 'ok &lt;b&gt;&amp;&quot;quoted&quot;&lt;/b&gt;'
 check test "$(printf '%s' "$SNAP" | grep -c '<b>')" = 0
