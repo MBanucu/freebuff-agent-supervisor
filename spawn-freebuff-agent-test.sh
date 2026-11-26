@@ -235,7 +235,8 @@ IDLE_PANE='╭──────────────────╮
 BUSY_PANE='thinking...                                      7s  ■ Esc
 ╭──────────────────╮
 │  ▍Add to the current task (/ for commands)'
-# A pane with no busy marker and no idle prompt: the fallback must call it working.
+# A pane with no busy marker and no idle prompt: no rule can classify it, so
+# it is `unknown` with evidence instead of the old working fallback.
 NOMARKER_PANE='⎘ • 6s • △▽
 ╭──────────────────╮
 │  ▍Add to the current task (/ for commands)'
@@ -321,10 +322,90 @@ fake_session test-999 "$BUDGET_PANE"
 out=$(bash "$TOOL" --root "$REPO" status --no-gh test-999)
 check contains "$out" 'session_state=refused'
 
-# a pane with neither marker still counts as working
+# a pane no rule can classify is unknown, not working
 fake_session test-999 "$NOMARKER_PANE"
 out=$(bash "$TOOL" --root "$REPO" status --no-gh test-999)
+check contains "$out" 'session_state=unknown'
+
+# --explain names the decision, every marker it checked and the pane it read
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --explain test-999)
+check contains "$out" 'session_state=unknown'
+check contains "$out" 'explain: rule=no-rule-matched'
+check contains "$out" 'explain: no rule matched the window'
+check contains "$out" 'explain: check: refusal-prose'
+check contains "$out" 'explain: check: busy-marker'
+check contains "$out" 'explain: check: resting-prompt'
+check contains "$out" 'explain: check: protected-window'
+check contains "$out" 'explain: check: stable-window: yes'
+check contains "$out" 'explain: stable_scans=2'
+check contains "$out" 'explain: window=3 lines sha256='
+check contains "$out" 'explain: pane:'
+check contains "$out" '⎘ • 6s • △▽'
+# a known state names the rule that won and the line it matched
+fake_session test-999 "$IDLE_PANE"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --explain test-999)
+check contains "$out" 'session_state=idle'
+check contains "$out" 'explain: rule=resting-prompt'
+check contains "$out" 'explain: matched='
+check contains "$out" 'Enter a coding task'
+check contains "$out" 'explain: stable_scans=1'
+check contains "$out" 'explain: pane:'
+fake_session test-999 "$BUSY_PANE"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --explain test-999)
 check contains "$out" 'session_state=working'
+check contains "$out" 'explain: rule=busy-marker'
+check contains "$out" 'thinking...'
+check contains "$out" 'explain: check: busy-marker pattern='
+fake_session test-999 "$APPROVAL_PANE"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --explain test-999)
+check contains "$out" 'session_state=working'
+check contains "$out" 'explain: rule=protected-window'
+fake_session test-999 "$STRIKE_PANE"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --explain test-999)
+check contains "$out" 'session_state=refused'
+check contains "$out" 'explain: rule=refusal-prose'
+printf 'state=done\npr=none\n' >"$WT/.agent-result"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --explain test-999)
+check contains "$out" 'session_state=done'
+check contains "$out" 'explain: rule=result-file'
+rm -f "$WT/.agent-result"
+fake_clear
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --explain test-999)
+check contains "$out" 'session_state=missing'
+check contains "$out" 'explain: rule=no-session'
+
+# the unknown window survives two scans and a repaint with new spacing/time
+fake_session test-999 "$NOMARKER_PANE"
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-999)
+check json_ok "$out"
+check contains "$out" '"session_state": "unknown"'
+check contains "$out" '"rule": "no-rule-matched"'
+check contains "$out" '"stable_scans": 2'
+sha1=$(printf '%s\n' "$out" |
+    sed -n 's/.*"window_sha256": "\([0-9a-f]*\)".*/\1/p')
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-999)
+sha2=$(printf '%s\n' "$out" |
+    sed -n 's/.*"window_sha256": "\([0-9a-f]*\)".*/\1/p')
+check test -n "$sha1"
+check test "$sha1" = "$sha2"
+fake_session test-999 '⎘ • 9s • △▽
+╭──────────────────╮
+│      ▍Add to the current task (/ for commands)'
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-999)
+sha3=$(printf '%s\n' "$out" |
+    sed -n 's/.*"window_sha256": "\([0-9a-f]*\)".*/\1/p')
+check contains "$out" '"session_state": "unknown"'
+check test "$sha3" = "$sha1"
+
+# an unknown pane is watched, not reaped
+if bash "$TOOL" --root "$REPO" watch test-999 --timeout 1 --poll 1 \
+    >"$TMP/watch.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 1
+check contains "$(cat "$TMP/watch.out")" 'state=unknown'
+fake_session test-999 "$NOMARKER_PANE"
+out=$(bash "$TOOL" --root "$REPO" gc --idle-hours 1 --dry-run)
+check contains "$out" 'skip name=test-999 reason=unknown'
+check test ! -s "$FAKE_DIR/killed"
 
 # watch: an approval prompt is not idle
 fake_session test-999 "$APPROVAL_PANE"

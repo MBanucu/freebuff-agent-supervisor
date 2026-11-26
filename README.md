@@ -142,15 +142,22 @@ Markers, captured from 0.2.38:
 
 The order of those checks matters. `session_state` reads a recorded refusal,
 then the result file, then the refusal vocabulary across the window, then the
-busy markers, then the resting prompt, and only then the protected strings. The resting prompt outranks them because
+busy markers, then the resting prompt, and only then the protected strings;
+when none of them matches it reports `unknown`. The resting prompt outranks them because
 the startup banner `Can't reach Freebuff's servers. Retrying…` lands inside the
 same 12-line window: while it was checked first, a finished session carrying
 that banner reported `working` forever and was never reaped.
 
-A pane with neither marker is reported as `working`, which is the safe
-failure mode: `watch` waits instead of stopping. These markers are TUI chrome
-and can change between Freebuff releases; the result file does not depend on
-them.
+A pane none of those rules claims is `unknown`, not `working`. The old
+fallback made new vendor chrome indistinguishable from a live turn: a pane the
+tool could not read was reported as working forever. `unknown` is only raised
+after the same normalised window is captured twice in a row — a repaint is
+ignored, because ANSI, padding, separator rules and clock-like text are
+stripped before the comparison — so a boot frame or a spinner mid-repaint does
+not raise it. It remains the safe failure mode: `watch` waits, `gc` skips it
+with `reason=unknown`, and `stop --graceful` refuses to kill it. These markers
+are TUI chrome and can change between Freebuff releases; the result file does
+not depend on them.
 
 **The approval chrome is unverified in 0.2.38.** This build does not ask. It
 ran an off-project `touch /tmp/...`, and then — in a repository with
@@ -166,8 +173,31 @@ depends on them.
 
 ```
 state=done                  # from .agent-result
-session_state=done          # live: done, idle, working, refused or missing
+session_state=done          # live: done, idle, working, refused, unknown or missing
 ```
+
+`status --explain` prints the classification decision line by line: the rule
+that won, the line it matched, every marker that was checked, the window's line
+count and hash, how many consecutive scans agreed, and the pane the rule read.
+
+The same block is in `status --json` as an additive `evidence` object:
+
+```json
+"evidence": {
+  "rule": "no-rule-matched",
+  "matched": null,
+  "window_lines": 40,
+  "window_sha256": "9f2c...",
+  "stable_scans": 2
+}
+```
+
+`rule` is one of `recorded-refusal`, `result-file`, `refusal-prose`,
+`busy-marker`, `resting-prompt`, `protected-window`, `no-rule-matched`,
+`unstable-window`, `no-session`. `matched` is the first matching line, cut to
+200 characters. `unstable-window` keeps the old safe `working` answer for a pane
+that changed between the two scans without matching a rule; it is rechecked on
+the next poll rather than reported as `unknown`.
 
 ## Inspect and control
 
@@ -179,6 +209,7 @@ spawn-freebuff-agent gui --snapshot /tmp/agents.html --watch 5
 spawn-freebuff-agent status 103-example --lines 40
 spawn-freebuff-agent status 103-example --no-gh
 spawn-freebuff-agent status 103-example --json
+spawn-freebuff-agent status 103-example --explain
 spawn-freebuff-agent attach 103-example   # detach with Ctrl-b d
 spawn-freebuff-agent send 103-example "Also run the new test"
 spawn-freebuff-agent watch 103-example --idle-seconds 120 --poll 5
@@ -188,8 +219,8 @@ spawn-freebuff-agent stop 103-example --graceful # end the turn first
 spawn-freebuff-agent gc --dry-run
 ```
 
-`watch` prints `state=working|idle|done|refused|missing`, and exits `0` when
-the result file appears or the pane has been idle past the window, `1` on
+`watch` prints `state=working|idle|done|refused|unknown|missing`, and exits `0`
+when the result file appears or the pane has been idle past the window, `1` on
 `--timeout`, and `2` when the session is gone. It never stops anything.
 `autostop` is `watch` followed by a stop and an evidence record; `start
 --auto-stop` runs it detached.
@@ -197,7 +228,8 @@ the result file appears or the pane has been idle past the window, `1` on
 `list` prints the branch, session, running flag, live state and idle time.
 `status` prints the result state, `session_state`, idle seconds, the pane
 tail, the last commit, whether the worktree is dirty, and any open PR for the
-branch.
+branch. `--window N` sets the scrollback the classifier reads (default 40) and
+`--explain` adds the decision trail described under completion.
 
 `sessions` is the inventory: one row per `fb-*` session **and** per worktree,
 with `WORKTREE yes|missing`, the attached `autostop` watcher (`pid:N`, `dead`
@@ -238,8 +270,9 @@ what the pane is doing.
 
 `status NAME --json` is one object with the same fields plus the detail view's:
 `running` and `dirty` as booleans, `input` (`raw|canonical|unknown`),
-`session_state`, `commit`, the `result_*` keys from `.agent-result`, and the
-pane tail as a `pane` string.
+`session_state`, `commit`, the `result_*` keys from `.agent-result`, the pane
+tail as a `pane` string, and the classifier's decision as the `evidence`
+object documented under completion.
 
 A missing value is `null` rather than the table's `-`: `idle_seconds` when the
 session is not running, `result` with no `.agent-result`, `branch` and `pr` for
@@ -260,8 +293,8 @@ commit by accident.
 
 `gc` stops sessions that are `done`, stuck on the concurrent-session overlay,
 idle for more than `--idle-hours` (default 12), or — with `--all` — `fb-*`
-sessions whose worktree no longer exists. Busy and approval panes are skipped
-with a reason, and `--dry-run` only reports. `gc` never removes worktrees or
+sessions whose worktree no longer exists. Busy, approval and `unknown` panes
+are skipped with a reason, and `--dry-run` only reports. `gc` never removes worktrees or
 branches; it prints the cleanup commands instead:
 
 ```bash
@@ -624,9 +657,11 @@ agents.
   after `--idle-hours` — never on sight.
 - The test suite is deviceless: a fake tmux serves fixture panes, several
   session names and recorded kills, so it covers the result protocol, state
-  transitions, autostop and `gc` decisions, the `sessions` inventory, graceful
-  stop, the capacity pre-flight, and the server's routes, auth, actions and
-  bind rules without a Freebuff session, account slot, `gh` or network.
+  transitions (including an unclassifiable pane becoming `unknown` with its
+  evidence and the `--explain` dump), autostop and `gc` decisions, the
+  `sessions` inventory, graceful stop, the capacity pre-flight, and the
+  server's routes, auth, actions and bind rules without a Freebuff session,
+  account slot, `gh` or network.
   It does not exercise the real TUI; verify marker changes with one controlled
   run when upgrading Freebuff.
 

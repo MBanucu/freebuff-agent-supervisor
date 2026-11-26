@@ -52,6 +52,11 @@ REFUSAL_FILE='.refusal'
 # Turn text sits above the visible prompt, so refusal detection reads this
 # many lines of scrollback rather than the 12-line chrome window.
 REFUSAL_WINDOW=40
+# No rule matching a pane used to fall through to `working`, which made new
+# vendor chrome indistinguishable from a live turn. It is now `unknown`, but
+# only once the same normalised window has been seen twice: a boot frame or a
+# mid-repaint changes between scans and is not evidence of a new state.
+UNKNOWN_RESCAN_DELAY=0.4
 # Readiness gate: the TUI accepts the brief only once it is in raw mode and
 # draws its resting prompt. A cold first launch in a fresh worktree pays for
 # the banner, the trust prompt and the session scan, which outran the old
@@ -98,12 +103,16 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       --dry-run          print the plan, change nothing
       --help             this text
 
-  spawn-freebuff-agent status NAME [--lines N] [--no-gh] [--json]
+  spawn-freebuff-agent status NAME [--lines N] [--no-gh] [--json] [--explain]
       Show the session, input mode, result state, pane tail, branch, last
       commit and PR.
       --lines N   pane lines to show (default: 25)
       --no-gh     do not ask gh for the PR
-      --json      emit the same fields as one JSON object
+      --json      emit the same fields as one JSON object, plus an evidence
+                  object naming the rule, the matched line and the window
+      --explain   print the classification decision line by line: every
+                  marker checked and the pane the rule looked at
+      --window N  pane lines the classifier reads (default: 40)
 
   spawn-freebuff-agent list
       List worktrees with session state, running flag and idle time.
@@ -148,7 +157,7 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       Send a follow-up message to a running agent.
 
   spawn-freebuff-agent watch NAME [--idle-seconds N] [--poll N] [--timeout N]
-      Report working/idle/done/refused/missing transitions. Exits 0 when the
+      Report working/idle/done/refused/unknown/missing transitions. Exits 0 when the
       agent is done or the pane has been idle past the window, 1 on timeout,
       2 when the session is gone. Never stops anything.
 
@@ -684,57 +693,215 @@ pr_json_array() {
     printf ']'
 }
 
-session_state() {
-    # session_state NAME -> done|refused|working|idle|missing
-    local name="$1" session="fb-$1" tmux pane chrome sentence
-    tmux=$(tmux_bin 2>/dev/null || true)
-    [ -n "$tmux" ] || {
-        printf 'missing'
-        return 0
-    }
-    "$tmux" has-session -t "$session" 2>/dev/null || {
-        printf 'missing'
-        return 0
-    }
-    # A refusal recorded by start outranks the pane: the turn ends, the
-    # sentence scrolls away and the prompt comes back, but the account is
-    # still penalised. stop removes the file.
-    sentence=$(refusal_recorded "$ROOT/.worktrees/$name")
-    if [ -n "$sentence" ]; then
-        printf 'refused'
-        return 0
+sha256_hex() {
+    # sha256_hex -> a hex digest of stdin, from the first tool present. Only
+    # stability matters (the same window must hash the same twice), so cksum
+    # is a last resort on a machine with none of the hash tools.
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 | cut -d' ' -f1
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 | sed 's/^.*= //'
+    else
+        cksum | cut -d' ' -f1
     fi
-    case "$(result_state "$ROOT/.worktrees/$name")" in
-        done|blocked|failed)
-            printf 'done'
-            return 0
-            ;;
-    esac
+}
+
+normalise_window() {
+    # normalise_window (stdin) -> text a repaint cannot change: no ANSI, no
+    # padding, no clocks. Box-drawing rules are dropped because a redraw can
+    # reflow them; their content lines stay. Two captures of one unclassified
+    # pane hash the same even when the spacing or the elapsed time differs.
+    local LC_ALL=C
+    sed -E \
+        -e $'s/\x1b\\][^\x07]*\x07//g' \
+        -e $'s/\x1b\\[[0-9;?]*[A-Za-z]//g' \
+        -e 's/\r$//' \
+        -e 's/[[:space:]]+/ /g' \
+        -e 's/^ //' -e 's/ $//' \
+        -e 's/[0-9]+(\.[0-9]+)?(ms|s|m|h)([^0-9A-Za-z]|$)/<time>\3/g' \
+        -e 's/(^|[^0-9])[0-9][0-9]?:[0-9][0-9](:[0-9][0-9])?/\1<time>/g' \
+        | sed -E '/^[─━═╭╮╰╯│┃├┤┬┴┼╔╗╚╝║╠╣╦╩╬ ]*$/d'
+}
+
+first_match() {
+    # first_match REGEX TEXT -> the first matching line, trimmed; empty on none
+    local line
+    line=$(printf '%s\n' "$2" | grep -m1 -iE -- "$1" 2>/dev/null || true)
+    line=${line%$'\r'}
+    line=$(printf '%s' "$line" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    printf '%s' "$line"
+}
+
+evidence_field() {
+    # evidence_field BLOCK KEY -> the first KEY= value in an evidence block
+    local block="$1" key="$2" line
+    while IFS= read -r line; do
+        case "$line" in
+            "$key"=*) printf '%s' "${line#"$key"=}"; return 0 ;;
+        esac
+    done <<<"$block"
+}
+
+# classify_chrome fills these, so a rescan can reuse one rule table.
+PANE_STATE=''
+PANE_RULE=''
+PANE_MATCHED=''
+PANE_CHECKS=''
+
+classify_chrome() {
+    # classify_chrome PANE CHROME -> sets PANE_STATE (empty when nothing
+    # matched), PANE_RULE, PANE_MATCHED and the checks that were run. The
+    # order is the tool's existing precedence; only the terminal fallback
+    # changed.
+    local pane="$1" chrome="$2" matched
+    PANE_STATE=''
+    PANE_RULE=''
+    PANE_MATCHED=''
+    PANE_CHECKS=''
+
     # The refusal can be the turn text above the resting prompt, not just the
     # 12-line chrome window, so scan enough scrollback to see the answer.
-    pane=$("$tmux" capture-pane -p -t "$session" -S "-$REFUSAL_WINDOW" 2>/dev/null || true)
-    if printf '%s\n' "$pane" | grep -qiE "$REFUSED_RE"; then
-        printf 'refused'
+    matched=$(first_match "$REFUSED_RE" "$pane")
+    PANE_CHECKS+="check: refusal-prose: $([ -n "$matched" ] && printf yes || printf no)"
+    if [ -n "$matched" ]; then
+        PANE_STATE=refused
+        PANE_RULE=refusal-prose
+        PANE_MATCHED=$matched
         return 0
     fi
-    chrome=$(printf '%s\n' "$pane" | tail -n 12)
-    if printf '%s' "$chrome" | grep -qE "$BUSY_RE"; then
-        printf 'working'
+
+    matched=$(first_match "$BUSY_RE" "$chrome")
+    PANE_CHECKS+=$'\n'"check: busy-marker pattern=\"$BUSY_RE\": $([ -n "$matched" ] && printf yes || printf no)"
+    if [ -n "$matched" ]; then
+        PANE_STATE=working
+        PANE_RULE=busy-marker
+        PANE_MATCHED=$matched
         return 0
     fi
+
     # The resting prompt means no turn is running, so it outranks the
     # protected strings: the startup `Can't reach Freebuff` banner lands in the
     # same 12-line window and would otherwise pin a finished session at
     # `working` forever, which is the leak this tool exists to prevent.
-    if printf '%s' "$chrome" | grep -q 'Enter a coding task'; then
-        printf 'idle'
+    matched=$(first_match 'Enter a coding task' "$chrome")
+    PANE_CHECKS+=$'\n'"check: resting-prompt pattern=\"Enter a coding task\": $([ -n "$matched" ] && printf yes || printf no)"
+    if [ -n "$matched" ]; then
+        PANE_STATE=idle
+        PANE_RULE=resting-prompt
+        PANE_MATCHED=$matched
         return 0
     fi
-    if printf '%s' "$chrome" | grep -qiE "$PROTECTED_RE"; then
-        printf 'working'
+
+    matched=$(first_match "$PROTECTED_RE" "$chrome")
+    PANE_CHECKS+=$'\n'"check: protected-window pattern=\"$PROTECTED_RE\": $([ -n "$matched" ] && printf yes || printf no)"
+    if [ -n "$matched" ]; then
+        PANE_STATE=working
+        PANE_RULE=protected-window
+        PANE_MATCHED=$matched
         return 0
     fi
-    printf 'working'
+}
+
+# The classifier's window, shared by emit_evidence and the status view.
+EV_PANE=''
+EV_LINES=0
+EV_SHA=''
+
+emit_evidence() {
+    # emit_evidence STATE RULE MATCHED SCANS CHECKS -> the evidence block.
+    # The first line is `state=...` because session_state reads only that;
+    # everything after it is what --explain shows line by line.
+    local state="$1" rule="$2" matched="$3" scans="$4" checks="$5"
+    printf 'state=%s\nrule=%s\nmatched=%s\nwindow_lines=%s\nwindow_sha256=%s\nstable_scans=%s\n' \
+        "$state" "$rule" "${matched:0:200}" "$EV_LINES" "$EV_SHA" "$scans"
+    [ -z "$checks" ] || printf '%s\n' "$checks"
+    printf 'pane_begin\n%s\npane_end\n' "$EV_PANE"
+}
+
+classify_state() {
+    # classify_state NAME [WINDOW] -> evidence block; line one is
+    # `state=done|refused|working|idle|unknown|missing`. Read-only: captures
+    # only, never sends, stops or writes. A first scan that no rule claims is
+    # captured again after a pause, and only the same normalised window twice
+    # becomes `unknown`.
+    local name="$1" window="${2:-$REFUSAL_WINDOW}"
+    local session="fb-$name" wt="$ROOT/.worktrees/$name" tmux
+    local sentence result pane chrome norm norm2 base_checks checks
+    tmux=$(tmux_bin 2>/dev/null || true)
+
+    EV_PANE=''
+    EV_LINES=0
+    EV_SHA=''
+
+    if [ -z "$tmux" ] || ! "$tmux" has-session -t "$session" 2>/dev/null; then
+        checks="check: session (fb-$name): no"
+        emit_evidence missing no-session '' 0 "$checks"
+        return 0
+    fi
+    checks="check: session (fb-$name): yes"
+
+    # A refusal recorded by start outranks the pane: the turn ends, the
+    # sentence scrolls away and the prompt comes back, but the account is
+    # still penalised. stop removes the file.
+    sentence=$(refusal_recorded "$wt")
+    checks+=$'\n'"check: recorded-refusal ($REFUSAL_FILE): $([ -n "$sentence" ] && printf yes || printf no)"
+    if [ -n "$sentence" ]; then
+        emit_evidence refused recorded-refusal "$sentence" 0 "$checks"
+        return 0
+    fi
+    base_checks=$checks
+
+    result=$(result_state "$wt")
+    base_checks+=$'\n'"check: result-file ($RESULT_FILE): ${result:-no}"
+    case "$result" in
+        done|blocked|failed)
+            emit_evidence done result-file "$result" 0 "$base_checks"
+            return 0
+            ;;
+    esac
+
+    EV_PANE=$("$tmux" capture-pane -p -t "$session" -S "-$window" 2>/dev/null || true)
+    EV_LINES=$(printf '%s' "$EV_PANE" | awk 'END { print NR }')
+    chrome=$(printf '%s\n' "$EV_PANE" | tail -n 12)
+    classify_chrome "$EV_PANE" "$chrome"
+    if [ -n "$PANE_STATE" ]; then
+        EV_SHA=$(printf '%s\n' "$EV_PANE" | normalise_window | sha256_hex)
+        emit_evidence "$PANE_STATE" "$PANE_RULE" "$PANE_MATCHED" 1 \
+            "$base_checks"$'\n'"$PANE_CHECKS"
+        return 0
+    fi
+
+    # Nothing claimed the first scan. A boot frame or a mid-repaint must not
+    # raise `unknown`: capture again, and let a pane that settled into a known
+    # state be classified by that state.
+    norm=$(printf '%s\n' "$EV_PANE" | normalise_window)
+    sleep "$UNKNOWN_RESCAN_DELAY"
+    EV_PANE=$("$tmux" capture-pane -p -t "$session" -S "-$window" 2>/dev/null || true)
+    EV_LINES=$(printf '%s' "$EV_PANE" | awk 'END { print NR }')
+    chrome=$(printf '%s\n' "$EV_PANE" | tail -n 12)
+    norm2=$(printf '%s\n' "$EV_PANE" | normalise_window)
+    EV_SHA=$(printf '%s\n' "$norm2" | sha256_hex)
+    classify_chrome "$EV_PANE" "$chrome"
+    checks="$base_checks"$'\n'"$PANE_CHECKS"$'\n'"check: stable-window: $([ "$norm" = "$norm2" ] && printf yes || printf no)"
+    if [ -n "$PANE_STATE" ]; then
+        emit_evidence "$PANE_STATE" "$PANE_RULE" "$PANE_MATCHED" 2 "$checks"
+    elif [ "$norm" = "$norm2" ]; then
+        emit_evidence unknown no-rule-matched '' 2 "$checks"
+    else
+        # Changing but unrecognised: not enough evidence to call it unknown.
+        # Keep the old safe failure mode for this scan and look again next poll.
+        emit_evidence working unstable-window '' 2 "$checks"
+    fi
+}
+
+session_state() {
+    # session_state NAME -> done|refused|working|idle|unknown|missing
+    local block first
+    block=$(classify_state "$1")
+    first=${block%%$'\n'*}
+    printf '%s' "${first#state=}"
 }
 
 session_activity() {
@@ -1260,16 +1427,51 @@ start() {
     fi
 }
 
+print_explanation() {
+    # print_explanation BLOCK -> the classifier's decision as `explain:` lines,
+    # including every marker that was checked and the pane it looked at.
+    local block="$1" line win='' in_pane=0 rule
+    while IFS= read -r line; do
+        case "$line" in
+            state=*) ;;
+            rule=*)
+                rule=${line#rule=}
+                printf 'explain: rule=%s\n' "$rule"
+                [ "$rule" != no-rule-matched ] ||
+                    printf 'explain: no rule matched the window\n'
+                ;;
+            matched=*)
+                [ -z "${line#matched=}" ] ||
+                    printf 'explain: matched=%s\n' "${line#matched=}"
+                ;;
+            window_lines=*) win=${line#window_lines=} ;;
+            window_sha256=*)
+                [ -z "${line#window_sha256=}" ] ||
+                    printf 'explain: window=%s lines sha256=%s\n' \
+                        "$win" "${line#window_sha256=}"
+                ;;
+            stable_scans=*) printf 'explain: stable_scans=%s\n' "${line#stable_scans=}" ;;
+            check:*) printf 'explain: %s\n' "$line" ;;
+            pane_begin) in_pane=1; printf 'explain: pane:\n' ;;
+            pane_end) in_pane=0 ;;
+            *) [ "$in_pane" = 0 ] || printf '  | %s\n' "$line" ;;
+        esac
+    done <<<"$block"
+}
+
 status() {
     # status NAME -> key=value lines by default, one JSON object with --json.
     # Both views come from the same fields: the JSON is a serialization of the
-    # human output, not a second detection path.
-    local name="" lines=25 no_gh=0 json=0
+    # human output, not a second detection path. --explain adds the classifier's
+    # decision line by line, from the same evidence block as --json.
+    local name="" lines=25 no_gh=0 json=0 explain=0 window="$REFUSAL_WINDOW"
     while [ $# -gt 0 ]; do
         case "$1" in
             --lines) lines=${2:-}; shift 2 ;;
+            --window) window=${2:-}; shift 2 ;;
             --no-gh) no_gh=1; shift ;;
             --json) json=1; shift ;;
+            --explain) explain=1; shift ;;
             -h|--help) usage; exit 0 ;;
             -*) die "status: unsupported argument: $1" ;;
             *) name=$1; shift ;;
@@ -1280,10 +1482,12 @@ status() {
     case "$lines" in
         ''|*[!0-9]*) die "status: --lines must be a number" ;;
     esac
+    is_num "$window" || die "status: --window must be a number"
 
     local wt="$ROOT/.worktrees/$name" branch session tmux running=0 tty mode=unknown
     local state rstate="" pane="" idle="" sstate="" last_commit dirty=no watcher=""
     local result_pr="" result_commit="" result_tests="" prs="" pr_json=null
+    local evidence="" ev_rule="" ev_matched="" ev_lines="" ev_sha="" ev_scans=""
     [ -d "$wt" ] || die "status: no worktree at $wt"
     branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
     session="fb-$name"
@@ -1319,21 +1523,33 @@ status() {
         else
             mode=canonical
         fi
-        sstate=$(session_state "$name")
+        evidence=$(classify_state "$name" "$window")
+        sstate=$(evidence_field "$evidence" state)
         idle=$(idle_seconds "$name" || true)
         pane=$("$tmux" capture-pane -p -t "$session" -S "-$lines" 2>/dev/null || true)
         if [ "$json" = 0 ]; then
             printf 'running=yes\ninput=%s\n' "$mode"
             printf 'session_state=%s\n' "$sstate"
+            [ "$explain" = 0 ] || print_explanation "$evidence"
             [ -z "$idle" ] || printf 'idle_seconds=%s\n' "$idle"
         fi
     else
+        local sentence
         sstate=missing
+        sentence=$(refusal_recorded "$wt")
         # A recorded refusal outlives the session: start stops a refused
         # launch, but status must keep saying refused until stop clears it.
-        [ -z "$(refusal_recorded "$wt")" ] || sstate=refused
+        if [ -n "$sentence" ]; then
+            sstate=refused
+            printf -v evidence 'state=%s\nrule=recorded-refusal\nmatched=%s\nwindow_lines=0\nwindow_sha256=\nstable_scans=0\ncheck: session (fb-%s): no\ncheck: recorded-refusal (%s): yes\npane_begin\npane_end\n' \
+                "$sstate" "$sentence" "$name" "$REFUSAL_FILE"
+        else
+            printf -v evidence 'state=missing\nrule=no-session\nmatched=\nwindow_lines=0\nwindow_sha256=\nstable_scans=0\ncheck: session (fb-%s): no\npane_begin\npane_end\n' \
+                "$name"
+        fi
         if [ "$json" = 0 ]; then
             printf 'running=no\nsession_state=%s\n' "$sstate"
+            [ "$explain" = 0 ] || print_explanation "$evidence"
         fi
     fi
 
@@ -1372,9 +1588,22 @@ status() {
     fi
 
     if [ "$json" = 0 ]; then
-        [ -z "$pane" ] || printf '%s\n' "$pane"
+        # --explain already dumped the classified window, so the tail is not
+        # repeated; without it the human view is unchanged.
+        [ "$explain" = 1 ] || [ -z "$pane" ] || printf '%s\n' "$pane"
         return 0
     fi
+
+    # The evidence object is additive: `rule` names the decision, `matched`
+    # the line behind it, and the hash names the window, so an unknown pane can
+    # be compared across scans. `unknown` remains the `state` placeholder for
+    # "no result file" as before; the pane classifier's unknown is
+    # `session_state`.
+    ev_rule=$(evidence_field "$evidence" rule)
+    ev_matched=$(evidence_field "$evidence" matched)
+    ev_lines=$(evidence_field "$evidence" window_lines)
+    ev_sha=$(evidence_field "$evidence" window_sha256)
+    ev_scans=$(evidence_field "$evidence" stable_scans)
 
     # `state` mirrors the human `state=` line, including its `unknown`
     # placeholder; `result_state` is null when there is no result file at all,
@@ -1398,6 +1627,13 @@ status() {
     printf '  "commit": %s,\n' "$(json_nullable_str "$last_commit")"
     printf '  "dirty": %s,\n' "$([ "$dirty" = yes ] && printf true || printf false)"
     printf '  "pr": %s,\n' "$pr_json"
+    printf '  "evidence": {\n'
+    printf '    "rule": %s,\n' "$(json_nullable_str "$ev_rule")"
+    printf '    "matched": %s,\n' "$(json_nullable_str "$ev_matched")"
+    printf '    "window_lines": %s,\n' "$(json_nullable_num "$ev_lines")"
+    printf '    "window_sha256": %s,\n' "$(json_nullable_str "$ev_sha")"
+    printf '    "stable_scans": %s\n' "$(json_nullable_num "$ev_scans")"
+    printf '  },\n'
     printf '  "pane": %s\n' "$(json_nullable_str "$pane")"
     printf '}\n'
 }
@@ -1844,6 +2080,12 @@ gc() {
                     note "skip name=$name reason=idle idle_seconds=$idle_secs"
                 fi
                 ;;
+            unknown)
+                # No rule matched, so nothing is known about this pane. Skipping
+                # it is the same safe choice as a busy pane: gc never reaps a
+                # session it cannot read.
+                note "skip name=$name reason=unknown"
+                ;;
             *)
                 note "skip name=$name reason=busy"
                 ;;
@@ -2002,13 +2244,16 @@ stop() {
     # Graceful: end the turn with Escape, then wait for the resting prompt, so
     # a kill cannot land between an edit and its commit unnoticed.
     initial=$(session_state "$name")
-    if [ "$initial" = working ]; then
-        "$tmux" send-keys -t "fb-$name" Escape
-        interrupted=yes
-        note 'graceful=escape'
-    else
-        note "graceful=already-$initial"
-    fi
+    case "$initial" in
+        working|unknown)
+            # An unknown pane is unreadable, not finished: interrupt it like a
+            # busy turn and refuse the kill below if it never settles.
+            "$tmux" send-keys -t "fb-$name" Escape
+            interrupted=yes
+            note 'graceful=escape'
+            ;;
+        *) note "graceful=already-$initial" ;;
+    esac
     deadline=$(( $(date +%s) + wait ))
     while :; do
         state=$(session_state "$name")
@@ -2020,8 +2265,8 @@ stop() {
         fi
         sleep 1
     done
-    if [ "$state" = working ]; then
-        note "graceful=no state=working waited=${wait}s"
+    if [ "$state" = working ] || [ "$state" = unknown ]; then
+        note "graceful=no state=$state waited=${wait}s"
         note "still busy: nothing was stopped; use plain 'stop $name' to kill it"
         return 1
     fi
