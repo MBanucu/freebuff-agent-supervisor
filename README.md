@@ -877,6 +877,10 @@ that keeps third-party harnesses out.
 
 ## Contributing
 
+Before changing anything, read [`AGENTS.md`](AGENTS.md) for the rules and
+[`docs/development.md`](docs/development.md) for the file map, the recipes for
+adding a subcommand or a check, and how to read a failing run.
+
 `main` is protected by the ruleset `main: pull requests only`: a pull request
 is required, with zero required approvals so a solo maintainer can still
 self-merge. Deletion and non-fast-forward pushes are blocked, and the ruleset
