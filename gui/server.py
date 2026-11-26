@@ -102,6 +102,12 @@ TOOL = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "spawn-freebuff-agent",
 )
+# The one stylesheet: `gui --snapshot` inlines it, and the action pages below
+# inline the same file, so a colour or a spacing value is changed in one place.
+# Only the styles are shared: each page keeps its own CSP, because a file://
+# snapshot carries a narrow <meta> and this server sends headers.
+STYLE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "page.css")
 # ttyd is read-only by default: `-W` is the flag that lets a client type, so a
 # viewer is read-only exactly when `-W` is absent. ttyd 1.7.x has no `-R`.
 TTYD_USER = "fb"
@@ -228,12 +234,13 @@ def port_open(port):
 class Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, handler, root, token, read_only,
+    def __init__(self, address, handler, root, token, read_only, style,
                  ttyd=None, ttyd_wanted=False, interactive=False,
                  allowed_hosts=frozenset(LOOPBACK_HOSTS)):
         super().__init__(address, handler)
         self.root = root
         self.token = token
+        self.style = style
         self.allowed_hosts = allowed_hosts
         self.read_only = read_only
         self.ttyd = ttyd
@@ -352,19 +359,6 @@ class Handler(BaseHTTPRequestHandler):
     # through it, and the stream cannot be rewound.
     _body_cache = None
 
-    PAGE_STYLE = (
-        "body{margin:0;padding:1.5rem;font:15px/1.5 system-ui,sans-serif;"
-        "color:#1b1f24;background:#f6f7f9}"
-        "h1{font-size:1.2rem;margin:0 0 .6rem}"
-        "p{max-width:42rem;color:#444c56}"
-        "form{display:inline-block;margin:.3rem .5rem .3rem 0}"
-        "button{font:inherit;padding:.35rem .9rem;border:1px solid #d8dee6;"
-        "border-radius:6px;background:#fff;cursor:pointer}"
-        "a{color:inherit}"
-        "pre{white-space:pre-wrap;background:#fff;border:1px solid #d8dee6;"
-        "border-radius:8px;padding:.8rem}"
-    )
-
     # ---- transport helpers ------------------------------------------------
 
     def end_headers(self):
@@ -408,8 +402,12 @@ class Handler(BaseHTTPRequestHandler):
     def _page(self, code, title, body, extra=()):
         """A small server-rendered page, for a form's answer.
 
-        No script, no external assets: the same rule as the dashboard, so
-        these pages work with scripting disabled and with a strict CSP.
+        This is the second markup, not a second stylesheet: the CSS is
+        gui/page.css, the same file `gui --snapshot` inlines into the
+        dashboard, so both pages share one palette and dark mode. Only the
+        layout differs (a heading, a sentence, one form); no script, no
+        external assets, and the page keeps its own narrow CSP because the
+        dashboard's policy arrives as an HTTP header.
         """
         page = (
             "<!DOCTYPE html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\n"
@@ -418,9 +416,10 @@ class Handler(BaseHTTPRequestHandler):
             "<meta http-equiv=\"Content-Security-Policy\" "
             "content=\"default-src 'none'; style-src 'unsafe-inline'\">\n"
             "<meta name=\"referrer\" content=\"no-referrer\">\n"
-            "<title>%s</title>\n<style>%s</style>\n</head>\n<body>\n%s\n"
+            "<title>%s</title>\n<style>\n%s</style>\n</head>\n<body>\n"
+            "<main class=\"action-page\">\n%s\n</main>\n"
             "</body></html>\n"
-        ) % (html.escape(title), self.PAGE_STYLE, body)
+        ) % (html.escape(title), self.server.style, body)
         self._send(code, page.encode("utf-8"), "text/html; charset=utf-8",
                    extra)
 
@@ -902,6 +901,13 @@ def main(argv=None):
     if not os.path.isfile(TOOL):
         print("gui: missing %s" % TOOL, file=sys.stderr)
         return 2
+    try:
+        with open(STYLE_FILE, encoding="utf-8") as handle:
+            style = handle.read()
+    except OSError as exc:
+        print("gui: cannot read the shared stylesheet %s: %s"
+              % (STYLE_FILE, exc), file=sys.stderr)
+        return 2
     if args.interactive and not args.ttyd:
         print("gui: --interactive needs --ttyd", file=sys.stderr)
         return 2
@@ -922,7 +928,7 @@ def main(argv=None):
         httpd = server_class(
             (args.host, args.port), Handler,
             root=os.path.abspath(args.root), token=token,
-            read_only=args.read_only, ttyd=ttyd,
+            read_only=args.read_only, style=style, ttyd=ttyd,
             ttyd_wanted=args.ttyd, interactive=args.interactive,
             allowed_hosts=allowed)
     except OSError as exc:

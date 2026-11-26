@@ -61,6 +61,33 @@ json_ok() {
     printf '%s' "${1-}" | python3 -m json.tool >/dev/null 2>&1
 }
 
+same_stylesheet() {
+    # same_stylesheet PAGE DASHBOARD: the action page's inline CSS is the
+    # dashboard's own gui/page.css, compared after trimming the <style> tags,
+    # and the heading it renders is still there. One stylesheet, one place to
+    # change a colour; only the markup differs.
+    python3 - "$1" "$2" <<'PY'
+import re
+import sys
+
+
+def style(path):
+    with open(path, encoding="utf-8") as handle:
+        text = handle.read()
+    found = re.search(r"<style>\s*(.*?)\s*</style>", text, re.S)
+    if not found:
+        raise SystemExit("no inline <style> in " + path)
+    return found.group(1)
+
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    page = handle.read()
+assert "Stop fb-test-999?" in page, "confirmation heading missing"
+assert style(sys.argv[1]) == style(sys.argv[2]), \
+    "action page CSS differs from the dashboard's"
+PY
+}
+
 # One inventory row per worktree session and one orphan, compared field by
 # field with what the CLI prints. idle_seconds is skipped because the two
 # calls land seconds apart by design, not because the shape differs.
@@ -299,7 +326,9 @@ code=$(curl -sS --max-time 30 -o "$TMP/confirm.html" -w '%{http_code}' \
     --data-urlencode "nonce=$nonce" \
     "$base/api/session/test-999/stop" || true)
 check test "$code" = 200
-check contains "$(cat "$TMP/confirm.html")" 'Stop fb-test-999?'
+# The heading and the shared stylesheet in one check, so the suite keeps its
+# count: the page a stray click lands on is styled by the dashboard's CSS.
+check same_stylesheet "$TMP/confirm.html" "$TMP/page.html"
 check contains "$(cat "$TMP/confirm.html")" '?confirm=1'
 check grep -qxF 'fb-test-999' "$FAKE_DIR/session"
 check test ! -s "$FAKE_DIR/killed"
