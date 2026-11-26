@@ -69,6 +69,17 @@ READY_POLL=0.5
 READY_NOTE_POLLS=10
 # Set by wait_ready: seconds spent polling, for the log and the failure line.
 READY_ELAPSED=0.0
+# A ready TUI can still swallow the Enter: the brief lands in the composer and
+# is never submitted, the composer clears, and the session rests at the idle
+# prompt looking healthy. So the Enter is not proof. After typing, start waits
+# for the input line to clear and for a turn to begin (or the chat title to
+# change) with the same poll-with-deadline shape as the readiness gate. The
+# brief is never retyped automatically: a swallowed send is reported as
+# sent=no with the pane, not doubled.
+SUBMIT_TIMEOUT=20
+# Set by await_submission: the signal that proved the send and the time it took.
+SUBMIT_PROOF=''
+SUBMIT_ELAPSED=0.0
 
 usage() {
     cat <<'USAGE'
@@ -93,6 +104,10 @@ Spawn parallel Freebuff agents in isolated git worktrees.
                          (default: 120); a cold first launch can need more
                          than the old fixed 45s
       --ready-poll N     seconds between readiness checks (default: 0.5)
+      --submit-timeout N seconds after the Enter to see the turn begin or the
+                         chat title change (default: 20); a brief that never
+                         proves submission is reported as sent=no and the
+                         session is stopped, never retyped
       --max-sessions N   refuse to start while N fb-* sessions are live
       --wait-slot [N]    wait up to N seconds (default: 300) for a free slot
                          instead of failing; requires --max-sessions
@@ -194,6 +209,11 @@ Notes:
   - A wait that gives up names the timeout it used, prints the last pane
     lines and records elapsed seconds in .supervisor.log, so a slow cold
     launch is distinguishable from a hung TUI.
+  - A ready pane can still swallow the Enter. After typing, start waits for
+    the input line to clear and for the turn to begin (or the chat title to
+    change) and prints sent=yes with the signal that proved it. A send that
+    never proves submission prints sent=no with the pane, stops the session
+    and exits non-zero; the brief is not retyped.
   - A running agent runs shell commands with its normal approvals. Do not
     attach and type while it is working.
   - A brief is hashed into .supervisor-briefs.jsonl (last 20 kept) before it
@@ -1038,6 +1058,87 @@ wait_ready() {
     done
 }
 
+composer_line() {
+    # composer_line PANE -> the TUI's input line, the one carrying the `▍`
+    # glyph. A brief that was never submitted is still drawn there; an empty
+    # composer shows the resting or the mid-turn prompt instead.
+    printf '%s\n' "$1" | grep -F '▍' | tail -n 1 || true
+}
+
+chat_title() {
+    # chat_title PANE -> the `Chat: ...` label the chrome draws. A brief the
+    # client accepted names the chat after the task instead of `New chat`.
+    printf '%s\n' "$1" | sed -n 's/.*Chat: //p' | tail -n 1 || true
+}
+
+composer_cleared() {
+    # composer_cleared PANE -> 0 when the input line is empty again. Both the
+    # resting prompt and the mid-turn prompt are empty-composer chrome; the
+    # typed brief still sitting in the line is not, whether the Enter was
+    # swallowed or never arrived.
+    local line
+    line=$(composer_line "$1")
+    case "$line" in
+        *'Enter a coding task'*|*'Add to the current task'*) return 0 ;;
+    esac
+    return 1
+}
+
+turn_began() {
+    # turn_began PANE -> 0 when a turn is in flight. The mid-turn composer
+    # carries no busy marker but it is not a brief waiting for Enter either:
+    # the README already treats `Add to the current task` as busy while a turn
+    # is in flight, so it is proof that the input was submitted.
+    local chrome
+    chrome=$(printf '%s\n' "$1" | tail -n 12)
+    if printf '%s\n' "$chrome" | grep -qiE "$BUSY_RE"; then
+        return 0
+    fi
+    printf '%s\n' "$chrome" | grep -qF 'Add to the current task'
+}
+
+await_submission() {
+    # await_submission TMUX SESSION BEFORE_TITLE TIMEOUT POLL ->
+    # 0 submitted, 2 refused, 1 no proof inside TIMEOUT. The brief has already
+    # been typed and Entered; this reads the pane until it can prove the send
+    # was taken. Proof is the input line clearing plus either a turn in flight
+    # or a changed chat title. A refusal is checked first, because its answer
+    # arrives as a finished turn above the resting prompt. Nothing is retyped
+    # here: a deadline that passes returns 1 and the caller reports sent=no.
+    local tmux="$1" session="$2" before_title="$3" timeout="$4" poll="$5"
+    local polls i=0 pane chrome title
+    polls=$(ready_polls "$timeout" "$poll")
+    SUBMIT_PROOF=''
+    SUBMIT_ELAPSED=0.0
+    while :; do
+        pane=$("$tmux" capture-pane -p -t "$session" -S "-$REFUSAL_WINDOW" 2>/dev/null || true)
+        if printf '%s\n' "$pane" | grep -qiE "$REFUSED_RE"; then
+            SUBMIT_ELAPSED=$(ready_elapsed "$i" "$poll")
+            return 2
+        fi
+        chrome=$(printf '%s\n' "$pane" | tail -n 12)
+        if composer_cleared "$pane"; then
+            if turn_began "$pane"; then
+                SUBMIT_PROOF=turn-began
+                SUBMIT_ELAPSED=$(ready_elapsed "$i" "$poll")
+                return 0
+            fi
+            title=$(chat_title "$chrome")
+            if [ -n "$title" ] && [ "$title" != "$before_title" ]; then
+                SUBMIT_PROOF=chat-title
+                SUBMIT_ELAPSED=$(ready_elapsed "$i" "$poll")
+                return 0
+            fi
+        fi
+        i=$((i + 1))
+        if [ "$i" -ge "$polls" ]; then
+            SUBMIT_ELAPSED=$(ready_elapsed "$i" "$poll")
+            return 1
+        fi
+        sleep "$poll"
+    done
+}
+
 brief_hash() {
     # brief_hash TEXT -> a stable digest of the text about to be typed.
     # sha256sum is coreutils, shasum ships with macOS and cksum is the POSIX
@@ -1178,8 +1279,9 @@ start() {
     local sdk_dir="" dry=0 nostart=0 autostop=0 idle=120 poll=5
     local idle_set=0 poll_set=0 max_sessions=0 wait_slot=0 slot_wait=300
     local ready_timeout="$READY_TIMEOUT" ready_poll="$READY_POLL"
+    local submit_timeout="$SUBMIT_TIMEOUT"
     local prompt_text="" sent brief_hash_value jitter_max jitter=0
-    local ready_rc=0 pane refusal=""
+    local ready_rc=0 submit_rc=0 pane refusal="" title_before
     while [ $# -gt 0 ]; do
         case "$1" in
             --issue) issue=${2:-}; shift 2 ;;
@@ -1195,6 +1297,7 @@ start() {
             --poll) poll=${2:-}; poll_set=1; shift 2 ;;
             --ready-timeout) ready_timeout=${2:-}; shift 2 ;;
             --ready-poll) ready_poll=${2:-}; shift 2 ;;
+            --submit-timeout) submit_timeout=${2:-}; shift 2 ;;
             --max-sessions) max_sessions=${2:-}; shift 2 ;;
             --wait-slot)
                 wait_slot=1
@@ -1223,6 +1326,8 @@ start() {
     is_num "$ready_timeout" || die "start: --ready-timeout must be a number of seconds"
     [ "$ready_timeout" -ge 1 ] || die "start: --ready-timeout must be at least 1 second"
     is_duration "$ready_poll" || die "start: --ready-poll must be a positive number of seconds"
+    is_num "$submit_timeout" || die "start: --submit-timeout must be a number of seconds"
+    [ "$submit_timeout" -ge 1 ] || die "start: --submit-timeout must be at least 1 second"
     if [ "$autostop" = 0 ] && { [ "$idle_set" = 1 ] || [ "$poll_set" = 1 ]; }; then
         die "start: --idle-seconds and --poll require --auto-stop"
     fi
@@ -1267,6 +1372,7 @@ start() {
         note "brief_chars=${#sent}"
         [ "$jitter_max" = 0 ] || note "jitter_max=${jitter_max}s"
         note "ready_timeout=${ready_timeout}s ready_poll=${ready_poll}s"
+        note "submit_timeout=${submit_timeout}s"
         note "tmux=${FREEBUFF_TMUX:-tmux} -x $COLS -y $ROWS -c $wt"
         if [ "$autostop" = 1 ]; then
             note "autostop=yes idle_seconds=$idle poll=$poll"
@@ -1383,19 +1489,27 @@ start() {
         note "jitter=${jitter}s max=${jitter_max}s"
         sleep "$jitter"
     fi
+    # The chat title before the send is the baseline the proof compares
+    # against; `Chat: New chat` becoming the task's name is one of the two
+    # ways a swallowed Enter is told apart from an accepted one.
+    title_before=$(chat_title "$("$tmux" capture-pane -p -t "$session" -S -12 2>/dev/null || true)")
     "$tmux" send-keys -t "$session" -l "$sent"
     sleep 0.5
     "$tmux" send-keys -t "$session" C-m
-    # Recorded once the keys are sent, so a launch that fails earlier never
-    # blocks a retry with text nobody saw.
-    brief_ledger_record "$brief_hash_value" "$name" "$branch"
-    sleep 2
 
-    # The vendor's anti-automation answer arrives as a finished turn, not as
-    # chrome: the sentence is above the resting prompt and the session looks
-    # idle. Check the turn text before claiming the launch succeeded.
-    pane=$("$tmux" capture-pane -p -t "$session" -S "-$REFUSAL_WINDOW" 2>/dev/null || true)
-    if printf '%s\n' "$pane" | grep -qiE "$REFUSED_RE"; then
+    # The Enter is not proof. A pane that is ready can still swallow it: the
+    # composer clears and the session sits at the idle prompt with no turn,
+    # which used to print started=yes. Wait for the input line to clear and
+    # for the turn to begin (or the title to change), bounded by
+    # --submit-timeout. Nothing is retyped: a brief that cannot be proven is
+    # reported, not doubled.
+    await_submission "$tmux" "$session" "$title_before" \
+        "$submit_timeout" "$ready_poll" || submit_rc=$?
+    if [ "$submit_rc" -eq 2 ]; then
+        # The vendor's anti-automation answer arrives as a finished turn, not
+        # as chrome: the sentence is above the resting prompt and the session
+        # looks idle. Check the turn text before claiming the launch succeeded.
+        pane=$("$tmux" capture-pane -p -t "$session" -S "-$REFUSAL_WINDOW" 2>/dev/null || true)
         refusal=$(refusal_sentence "$pane")
         [ -n "$refusal" ] || refusal='Freebuff refused the brief'
         refusal_record "$wt" "$refusal"
@@ -1408,8 +1522,31 @@ start() {
         note 'resent=no'
         die "start: Freebuff refused the brief: $refusal (not resent; worktree kept at $wt)"
     fi
+    if [ "$submit_rc" -ne 0 ]; then
+        # The brief was typed but never submitted. A session that looks alive
+        # and does nothing is the failure this tool exists to prevent, so say
+        # sent=no, show the pane the check read, stop the session and fail.
+        # The worktree and branch stay, like every other failed launch.
+        pane=$("$tmux" capture-pane -p -t "$session" -S -15 2>/dev/null || true)
+        ready_note "$wt" "submit=no elapsed=${SUBMIT_ELAPSED}s timeout=${submit_timeout}s poll=${ready_poll}s session=$session"
+        "$tmux" kill-session -t "$session" 2>/dev/null || true
+        note "session=$session"
+        note 'sent=no'
+        note 'submit_proof=none'
+        note "submit_elapsed=${SUBMIT_ELAPSED}s timeout=${submit_timeout}s"
+        note 'resent=no'
+        printf '%s\n' '--- pane lines the check read ---'
+        printf '%s\n' "$pane"
+        die "start: the brief did not prove submission in $session after ${SUBMIT_ELAPSED}s (--submit-timeout $submit_timeout, --ready-poll $ready_poll): the turn never began and the chat title did not change. No keys were retyped, stopped it, worktree kept ($wt)."
+    fi
 
+    # Recorded only once the send is proven, so a launch that was swallowed
+    # (text nobody saw) never blocks a deliberate retry with that text.
+    brief_ledger_record "$brief_hash_value" "$name" "$branch"
+    ready_note "$wt" "submit=yes proof=${SUBMIT_PROOF} elapsed=${SUBMIT_ELAPSED}s timeout=${submit_timeout}s poll=${ready_poll}s session=$session"
     note "session=$session"
+    note 'sent=yes'
+    note "submit_proof=${SUBMIT_PROOF} elapsed=${SUBMIT_ELAPSED}s"
     note "started=yes"
     "$tmux" capture-pane -p -t "$session" -S -8 2>/dev/null || true
 
