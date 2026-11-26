@@ -1532,7 +1532,7 @@ start() {
         return 0
     fi
 
-    local tmux fb cmd
+    local tmux fb cmd held
     tmux=$(tmux_bin) || die "start: tmux not found; install tmux or set FREEBUFF_TMUX"
     fb=$(freebuff_bin) || die "start: freebuff not found; set FREEBUFF_BIN"
     printf -v cmd 'TERM=xterm-256color %q --cwd %q --trust-agents' "$fb" "$wt"
@@ -1552,6 +1552,17 @@ start() {
         note 'refused=yes'
         note "refusal=$refusal"
         note 'sent=no'
+        # A concurrent-session refusal is about live TUIs, not runs, and the
+        # overlay names neither. Name the finished sessions that hold the slots
+        # and the one command that frees them, so the next step is not a guess:
+        # each of them has already reported its result, so nothing is lost.
+        if printf '%s\n' "$refusal" | grep -qiE "$REFUSAL_OVERLAY_RE"; then
+            held=$(finished_live_names "$tmux")
+            if [ -n "$held" ]; then
+                note "holding_slot=$held"
+                note "hint=free them with: $(basename "$0") gc"
+            fi
+        fi
         die "start: Freebuff refused the launch before the brief was sent: $refusal (no keys typed; worktree kept at $wt)"
     fi
     if [ "$ready_rc" -ne 0 ]; then
@@ -1963,12 +1974,44 @@ live_session_count() {
     printf '%s' "${count:-0}"
 }
 
+finished_live() {
+    # finished_live NAME [TMUX] -> 0 when the TUI is alive but its run is over.
+    # The vendor counts live sessions against the concurrent-session limit, not
+    # runs, so a done, blocked or failed session holds a slot that buys nothing.
+    # `refused` is not in that set: stop is what clears a refusal, and the pane
+    # may still be live under it.
+    local name=$1 tmux=${2:-} state
+    [ -n "$tmux" ] || tmux=$(tmux_bin 2>/dev/null || true)
+    [ -n "$tmux" ] || return 1
+    "$tmux" has-session -t "fb-$name" 2>/dev/null || return 1
+    state=$(session_state "$name")
+    state_is_terminal "$state"
+}
+
+finished_live_names() {
+    # finished_live_names [TMUX] -> the names of finished-but-live sessions,
+    # comma-separated, empty when none. `sessions` counts them and a refused
+    # `start` names them: the overlay says only that the limit was reached, and
+    # the next step is `gc`, not guessing which session to stop.
+    local tmux=${1:-} wt name out=''
+    [ -n "$tmux" ] || tmux=$(tmux_bin 2>/dev/null || true)
+    [ -n "$tmux" ] || return 0
+    for wt in "$ROOT"/.worktrees/*; do
+        [ -d "$wt" ] || continue
+        name=$(basename "$wt")
+        finished_live "$name" "$tmux" || continue
+        out="${out:+$out,}$name"
+    done
+    printf '%s' "$out"
+}
+
 sessions() {
     # sessions -> one table over every fb-* session and every worktree, so a
     # session with no worktree is visible before gc --all reaps it. --json is a
     # serialization of the same rows: one array of objects, `[]` when empty.
     local no_gh=0 json=0 name wt worktree running state idle activity now idle_secs
     local watcher result branch pr prs="" slug="" tmux total=0 live=0 trees=0
+    local finished=no finished_count=0
     local names=() x first=1
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -2045,10 +2088,17 @@ sessions() {
         fi
         running=no
         idle=-
+        finished=no
         if [ -n "$tmux" ] && "$tmux" has-session -t "fb-$name" 2>/dev/null; then
             running=yes
             live=$((live + 1))
             state=$(session_state "$name")
+            # A finished run whose TUI is still alive holds a vendor slot. The
+            # count is what a refused start points at; `gc` is what frees it.
+            if state_is_terminal "$state"; then
+                finished=yes
+                finished_count=$((finished_count + 1))
+            fi
             # A finished run has no idle time, even while its TUI process is
             # still alive: null in JSON, `-` in the table, no idle on the card.
             if ! state_is_terminal "$state"; then
@@ -2079,6 +2129,11 @@ sessions() {
             printf '    "name": %s,\n' "$(json_str "$name")"
             printf '    "state": %s,\n' "$(json_nullable_str "$state")"
             printf '    "idle_seconds": %s,\n' "$(json_nullable_num "$idle_secs")"
+            if [ "$finished" = yes ]; then
+                printf '    "finished": true,\n'
+            else
+                printf '    "finished": false,\n'
+            fi
             printf '    "watcher": %s,\n' "$(json_nullable_str "$watcher")"
             printf '    "worktree": %s,\n' "$(json_str "$worktree")"
             printf '    "result": %s,\n' "$(json_nullable_str "$result")"
@@ -2100,8 +2155,8 @@ sessions() {
     if [ "$json" = 1 ]; then
         printf '\n]\n'
     else
-        printf 'sessions=%s running=%s worktrees=%s orphans=%s\n' \
-            "$total" "$live" "$trees" "$((total - trees))"
+        printf 'sessions=%s running=%s worktrees=%s orphans=%s finished=%s\n' \
+            "$total" "$live" "$trees" "$((total - trees))" "$finished_count"
     fi
 }
 

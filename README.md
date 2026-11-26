@@ -252,7 +252,13 @@ or `-`; the pid is the one `start --auto-stop` wrote to
 `.supervisor.log`), the result state, the branch and the open PR. It starts from
 `tmux list-sessions`, so a session with no worktree appears there instead of
 only being found when `gc --all` kills it; `list` also names such orphans.
-`--no-gh` skips the PR column.
+`--no-gh` skips the PR column. The last line counts what was listed —
+`sessions=`, `running=`, `worktrees=`, `orphans=` and `finished=`, the live
+sessions whose run is already over. Freebuff counts live TUIs against its
+concurrent-session limit, not runs, so a `done` session still holds a slot
+until `gc` stops it. A `start` refused by that overlay names them
+(`holding_slot=a,b`) and prints the command that frees them, instead of leaving
+the next step to guesswork.
 
 ### Machine-readable output
 
@@ -275,6 +281,7 @@ what the pane is doing.
     "name": "test-999",
     "state": "done",
     "idle_seconds": null,
+    "finished": false,
     "watcher": "pid:123",
     "worktree": "yes",
     "result": "blocked",
@@ -296,7 +303,10 @@ session is not running or its state is terminal (`done`, `stopped`, `blocked`,
 5495s` — `result` with no `.agent-result`, `branch` and `pr` for a session with
 no worktree, `watcher` with no autostop recorded, and `pane` when no session is
 running. Idle time comes back when the session is resumed and is no longer
-terminal. `status` keeps `state` identical to the human
+terminal. `finished` is `true` for a session that is still running but whose
+run is over — exactly the ones holding a vendor slot — and `false` otherwise,
+including for a session that has already stopped.
+`status` keeps `state` identical to the human
 `state=` line (`unknown` when there is no result file) and adds
 `result_state`, which is `null` in that case, so a consumer can tell "nothing
 written yet" from "unusable state". `pr` in `sessions` is the row's PR URL;
@@ -320,6 +330,11 @@ branches; it prints the cleanup commands instead:
 git worktree remove .worktrees/103-example
 git branch -d issue/103-example
 ```
+
+A session whose run is over is still a live TUI to the vendor, so it keeps
+holding a concurrent-session slot until something stops it. `sessions` counts
+these as `finished=`, and `gc` is the command that frees them: their result is
+already recorded, so nothing is lost by stopping them.
 
 `stop` only kills the tmux session; the worktree and branch remain.
 
