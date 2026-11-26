@@ -1,17 +1,13 @@
 #!/usr/bin/env bash
-# Curl-based checks for gui/server.py. A temporary git repo and a fake tmux
-# stand in for a supervisor root and its sessions, so nothing here needs
-# Freebuff, an account slot, gh or the network.
+# Curl-based checks for gui/server.py. test/lib.sh owns the temp repo, the
+# fake tmux and the fixtures, so only the server-specific harness lives here.
+# Nothing needs Freebuff, an account slot, gh or the network.
 #
 # The server is started on --port 0 and reports its listening URL; readiness
 # is a poll of that port, never a fixed sleep. Every server started here is
-# killed by the EXIT trap and each one is checked closed afterwards, so a
+# killed by the cleanup hook and each one is checked closed afterwards, so a
 # failing check cannot leave a listener behind.
 set -euo pipefail
-
-ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd) || exit 1
-TOOL="$ROOT/spawn-freebuff-agent"
-TOKEN=s3cret
 
 # The CLI suite keeps working without python3; only the server needs it, so
 # this harness skips instead of failing when the pieces are missing.
@@ -20,11 +16,14 @@ if ! command -v python3 >/dev/null 2>&1 || ! command -v curl >/dev/null 2>&1; th
     exit 0
 fi
 
-TMP=$(mktemp -d) || exit 1
-REPO="$TMP/repo"
-FAKE_DIR="$TMP/fake"
+# The CLI suite keeps working without the shared harness, but the server
+# needs the temp repo and fixtures that test/lib.sh provides.
+. "$(dirname -- "$0")/test/lib.sh"
+
+TOKEN=s3cret
+
 servers=()
-cleanup() {
+cleanup_servers() {
     local pid
     for pid in ${servers[@]+"${servers[@]}"}; do
         kill "$pid" 2>/dev/null || true
@@ -32,26 +31,8 @@ cleanup() {
     for pid in ${servers[@]+"${servers[@]}"}; do
         wait "$pid" 2>/dev/null || true
     done
-    rm -rf "$TMP"
 }
-trap cleanup EXIT
-
-total=0
-failed=0
-
-check() {
-    total=$((total + 1))
-    if "$@"; then
-        return 0
-    fi
-    failed=$((failed + 1))
-    printf 'FAIL %s\n' "$*" >&2
-}
-
-contains() {
-    # contains <text> <needle>
-    printf '%s' "$1" | grep -qF -- "$2"
-}
+TEST_CLEANUP_HOOK=cleanup_servers
 
 # The header set every response must carry, errors and redirects included.
 # Kept as one string so the check is the wire's exact value, not a guess.
@@ -103,85 +84,10 @@ for served, printed in zip(api, cli):
 PY
 }
 
-# A temp repo, one real worktree, and one orphan session with no worktree.
-mkdir -p "$REPO"
-git -C "$REPO" init -q
-git -C "$REPO" config user.email test@example.invalid
-git -C "$REPO" config user.name Test
-git -C "$REPO" config commit.gpgsign false
-printf 'hello\n' >"$REPO/README.md"
-git -C "$REPO" add README.md
-git -C "$REPO" commit -qm init
-git -C "$REPO" branch -M main
-
 bash "$TOOL" --root "$REPO" start --issue 999 --name test-999 \
     --branch test/999 --title 'Test issue' \
     --url 'https://example.test/issues/999' --no-start >/dev/null
 WT="$REPO/.worktrees/test-999"
-
-# Fake tmux: fixture panes, recorded kills, and an activity file for idle.
-mkdir -p "$FAKE_DIR" "$TMP/bin"
-: >"$FAKE_DIR/tty"
-: >"$FAKE_DIR/killed"
-: >"$FAKE_DIR/sent"
-cat >"$TMP/bin/tmux" <<'FAKE'
-#!/usr/bin/env bash
-d=${FAKE_TMUX_DIR:?}
-case "${1:-}" in
-    has-session)
-        grep -qxF -- "${3:-}" "$d/session" 2>/dev/null
-        ;;
-    capture-pane)
-        cat "$d/pane" 2>/dev/null || true
-        ;;
-    display-message)
-        fmt="${!#}"
-        case "$fmt" in
-            *pane_tty*) printf '%s\n' "$d/tty" ;;
-            *session_activity*) cat "$d/activity" 2>/dev/null || printf '0\n' ;;
-            *) printf '0\n' ;;
-        esac
-        ;;
-    send-keys)
-        printf '%s\n' "${3:-}" >>"$d/sent"
-        ;;
-    kill-session)
-        printf '%s\n' "${3:-}" >>"$d/killed"
-        if [ -f "$d/session" ]; then
-            grep -vxF -- "${3:-}" "$d/session" >"$d/session.tmp" 2>/dev/null || true
-            mv "$d/session.tmp" "$d/session"
-        fi
-        ;;
-    list-sessions)
-        cat "$d/session" 2>/dev/null || true
-        ;;
-    *)
-        exit 0
-        ;;
-esac
-FAKE
-chmod +x "$TMP/bin/tmux"
-export FREEBUFF_TMUX="$TMP/bin/tmux"
-export FAKE_TMUX_DIR="$FAKE_DIR"
-
-# Panes as captured from Freebuff 0.2.38.
-IDLE_PANE='╭──────────────────╮
-│  ▍Enter a coding task or / for commands
-╰──────────────────╯
- DeepSeek V4.1 Flash • high · /tmp/x/proj · /model to change · Chat: New chat'
-
-fake_session() {
-    # fake_session NAME PANE [ACTIVITY]
-    printf '%s\n' "$2" >"$FAKE_DIR/pane"
-    printf 'fb-%s\n' "$1" >"$FAKE_DIR/session"
-    printf '%s\n' "${3:-$(date +%s)}" >"$FAKE_DIR/activity"
-    : >"$FAKE_DIR/killed"
-    : >"$FAKE_DIR/sent"
-}
-
-fake_add_session() {
-    printf 'fb-%s\n' "$1" >>"$FAKE_DIR/session"
-}
 
 SERVER_PID=''
 SERVER_BASE=''
