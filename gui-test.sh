@@ -53,6 +53,29 @@ contains() {
     printf '%s' "$1" | grep -qF -- "$2"
 }
 
+# The header set every response must carry, errors and redirects included.
+# Kept as one string so the check is the wire's exact value, not a guess.
+CSP="default-src 'none'; style-src 'unsafe-inline'; img-src data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+
+header_is() {
+    # header_is FILE NAME VALUE
+    awk -v name="${2,,}" -v want="${3,,}" '
+        { sub(/\r$/, ""); i = index($0, ":")
+          if (i && tolower(substr($0, 1, i - 1)) == name) {
+              v = tolower(substr($0, i + 1)); sub(/^ /, "", v)
+              if (v == want) found = 1 } }
+        END { exit found ? 0 : 1 }' "$1"
+}
+
+check_security_headers() {
+    # check_security_headers FILE: the headers a meta tag cannot express
+    local file=$1
+    check header_is "$file" Content-Security-Policy "$CSP"
+    check header_is "$file" X-Content-Type-Options nosniff
+    check header_is "$file" X-Frame-Options DENY
+    check header_is "$file" Referrer-Policy no-referrer
+}
+
 json_ok() {
     printf '%s' "${1-}" | python3 -m json.tool >/dev/null 2>&1
 }
@@ -266,10 +289,50 @@ check test "$code" = 204
 check test ! -s "$TMP/devtools.json"
 
 # 404 for a name the inventory does not know.
-code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+code=$(curl -sS --max-time 10 -o /dev/null -D "$TMP/h404" -w '%{http_code}' \
     -H "Authorization: Bearer $TOKEN" \
     "$base/api/session/nope/pane" || true)
 check test "$code" = 404
+
+# ---- the headers and the Host check, on the wire ----
+# The page is interactive now, so the CSP travels as a header (a meta tag
+# cannot express frame-ancestors or base-uri) and every response carries it,
+# including the ones that exist only to say no.
+port=${base##*:}
+code=$(curl -sS --max-time 10 -o /dev/null -D "$TMP/h200" -w '%{http_code}' \
+    -H "Authorization: Bearer $TOKEN" "$base/" || true)
+check test "$code" = 200
+check_security_headers "$TMP/h200"
+code=$(curl -sS --max-time 10 -o /dev/null -D "$TMP/h401" -w '%{http_code}' \
+    "$base/api/sessions" || true)
+check test "$code" = 401
+check_security_headers "$TMP/h401"
+check_security_headers "$TMP/h404"
+
+# A page on 127.0.0.1 is same-site with every other loopback port, and DNS
+# rebinding can point a public name at 127.0.0.1, so only the names this
+# server answers for are served. A foreign Host is 421 even without a token:
+# the check runs before auth, so no route is reachable under that name.
+code=$(curl -sS --max-time 10 -o /dev/null -D "$TMP/h421" -w '%{http_code}' \
+    -H 'Host: evil.example' -H "Authorization: Bearer $TOKEN" \
+    "$base/api/sessions" || true)
+check test "$code" = 421
+check_security_headers "$TMP/h421"
+code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+    -H 'Host: evil.example' "$base/api/sessions" || true)
+check test "$code" = 421
+code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+    -H 'Host: evil.example' -X POST -H "Authorization: Bearer $TOKEN" \
+    "$base/api/gc?dry=1" || true)
+check test "$code" = 421
+
+# The names that are this server: the bound loopback, localhost, and [::1].
+for host in "127.0.0.1:$port" "localhost:$port" "[::1]:$port" "LOCALHOST"; do
+    code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+        -H "Host: $host" -H "Authorization: Bearer $TOKEN" \
+        "$base/api/sessions" || true)
+    check test "$code" = 200
+done
 
 # 400 for a crafted name, before it can reach a path or a subprocess.
 code=$(curl -sS --max-time 10 --path-as-is -o /dev/null -w '%{http_code}' \
@@ -312,11 +375,14 @@ check grep -qxF 'fb-test-999' "$FAKE_DIR/session"
 
 # A valid nonce with a foreign Origin is refused too: another service on
 # 127.0.0.1 is same-site for the cookie, so the nonce alone is not enough.
-code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+code=$(curl -sS --max-time 10 -o /dev/null -D "$TMP/h403" -w '%{http_code}' \
     -b "$jar" -X POST -H 'Origin: http://attacker.invalid' \
     --data-urlencode "nonce=$nonce" --data 'confirm=1' \
     "$base/api/session/test-999/stop?confirm=1" || true)
 check test "$code" = 403
+# The refusal carries the same headers: a 403 is still a page the browser
+# will render, and framing it would be exactly the click it refuses.
+check_security_headers "$TMP/h403"
 check grep -qxF 'fb-test-999' "$FAKE_DIR/session"
 
 # The stray-click guard: first POST renders the confirmation page and runs
@@ -340,6 +406,9 @@ code=$(curl -sS --max-time 30 -o /dev/null -D "$TMP/stop.headers" \
 check test "$code" = 303
 check test "$(sed -n 's/\r$//; s/^[Ll]ocation: //p' "$TMP/stop.headers" |
     head -n 1)" = /
+# form-action 'self' does not break the POST -> 303 flow, and the redirect
+# carries the headers too.
+check_security_headers "$TMP/stop.headers"
 check test "$(grep -cxF 'fb-test-999' "$FAKE_DIR/killed")" = 1
 check test "$(grep -cxF 'fb-test-999' "$FAKE_DIR/session" || true)" = 0
 
@@ -399,7 +468,7 @@ check stop_server "$SERVER_PID" "$base"
 
 # ---- --read-only answers POST with 403 and leaves GET alone ----
 
-start_server ro --read-only || true
+start_server ro --read-only --allow-host agents.test || true
 ro_base=$SERVER_BASE
 check test -n "$SERVER_PID"
 check test -n "$ro_base"
@@ -417,6 +486,16 @@ code=$(curl -sS --max-time 10 -o "$TMP/ro-page.html" -w '%{http_code}' \
     -H "Authorization: Bearer $TOKEN" "$ro_base/" || true)
 check test "$code" = 200
 check test "$(grep -cF '<form' "$TMP/ro-page.html" || true)" = 0
+# --allow-host adds a proxy's own name, and only that name: it is how a
+# proxy that keeps its Host keeps working with the 421 check.
+code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+    -H 'Host: agents.test' -H "Authorization: Bearer $TOKEN" \
+    "$ro_base/api/sessions" || true)
+check test "$code" = 200
+code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+    -H 'Host: other.test' -H "Authorization: Bearer $TOKEN" \
+    "$ro_base/api/sessions" || true)
+check test "$code" = 421
 code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X POST \
     -H "Authorization: Bearer $TOKEN" "$ro_base/api/gc?dry=1" || true)
 check test "$code" = 403

@@ -36,6 +36,13 @@ to a log file.
 Binding: 127.0.0.1 by default. A non-loopback address is refused unless
 --token was given explicitly; binding off-loopback is for a LAN or Tailscale
 and this server terminates no TLS, so put a reverse proxy in front of it.
+
+Headers and Host: every response, errors and redirects included, carries
+the CSP, nosniff, frame and referrer headers a `<meta>` tag cannot express
+for framing, because `gui --snapshot` writes a file while this serves a
+running, interactive page. A request whose `Host` is not a loopback name,
+the configured `--host`, or an explicit `--allow-host` is answered 421 and
+reaches no route, so a name that DNS-rebinds to 127.0.0.1 gets nothing.
 """
 
 import argparse
@@ -66,6 +73,26 @@ CLI_TIMEOUT = 30
 # hostile Content-Length from turning a request thread into a sink.
 MAX_BODY = 64 * 1024
 TRUTHY = ("1", "true", "yes", "on")
+# Constant strings, set on every response: the page has inline CSS and no
+# script, so it needs no allowance beyond style-src. `frame-ancestors` and
+# `form-action` are ignored in a `<meta>` CSP, which is why the server sends
+# the policy as a header and `gui --snapshot` keeps its narrower meta for a
+# file:// snapshot. connect-src 'self' stays for Chrome DevTools' own
+# `/.well-known` probe, which the meta has carried since the dashboard had
+# no server; without it default-src 'none' fills the console with violations.
+SECURITY_HEADERS = (
+    ("Content-Security-Policy",
+     "default-src 'none'; style-src 'unsafe-inline'; img-src data:; "
+     "connect-src 'self'; form-action 'self'; frame-ancestors 'none'; "
+     "base-uri 'none'"),
+    ("X-Content-Type-Options", "nosniff"),
+    ("X-Frame-Options", "DENY"),
+    ("Referrer-Policy", "no-referrer"),
+)
+# The names a request may be addressed to. A public name can resolve to
+# 127.0.0.1 (DNS rebinding), and every loopback port is same-site for the
+# cookie, so anything else is a 421 before auth runs.
+LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 # An action that redirects carries its report in memory, under a one-shot key
 # in the Location, so a refresh cannot replay the POST and the report cannot
 # pile up: it is taken on the next GET, expires, or is evicted oldest first.
@@ -105,6 +132,60 @@ def is_loopback(host):
         return ipaddress.ip_address(host).is_loopback
     except ValueError:
         return False
+
+
+def host_name(raw):
+    """HOST from a `Host` header, without its port, or None if malformed.
+
+    Accepts `name[:port]` and `[v6][:port]`; a bare IPv6 literal without
+    brackets is not what a browser sends and is rejected rather than guessed
+    at, and a non-numeric or empty port is malformed rather than a name.
+    """
+    host = (raw or "").strip().lower()
+    if not host:
+        return None
+    if host.startswith("["):
+        end = host.find("]")
+        if end < 0:
+            return None
+        name, rest = host[1:end], host[end + 1:]
+        if rest and (not rest.startswith(":") or not rest[1:].isdigit()):
+            return None
+        return name or None
+    if host.count(":") > 1:
+        return None
+    name, sep, port = host.partition(":")
+    if sep and not port.isdigit():
+        return None
+    return name or None
+
+
+def allowed_host_names(configured, extra=()):
+    """The Host names this server answers for.
+
+    `--host` is the address the server binds, and a proxy in front that keeps
+    its own Host name is added with `--allow-host`; everything else is 421.
+    """
+    names = set(LOOPBACK_HOSTS)
+    for value in tuple(configured) + tuple(extra):
+        value = (value or "").strip().lower()
+        if value.startswith("[") and value.endswith("]"):
+            value = value[1:-1]
+        if value:
+            names.add(value)
+    return frozenset(names)
+
+
+def host_allowed(raw, names):
+    """Whether a `Host` header is one this server answers for.
+
+    An absent Host is allowed: HTTP/1.0 and some local clients omit it, and a
+    missing name is not one a rebinding attack can supply. Everything present
+    has to be a loopback literal, the bind address, or an allowed proxy name.
+    """
+    if not (raw or "").strip():
+        return True
+    return host_name(raw) in names
 
 
 def ttyd_bin():
@@ -148,10 +229,12 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, address, handler, root, token, read_only,
-                 ttyd=None, ttyd_wanted=False, interactive=False):
+                 ttyd=None, ttyd_wanted=False, interactive=False,
+                 allowed_hosts=frozenset(LOOPBACK_HOSTS)):
         super().__init__(address, handler)
         self.root = root
         self.token = token
+        self.allowed_hosts = allowed_hosts
         self.read_only = read_only
         self.ttyd = ttyd
         self.ttyd_wanted = ttyd_wanted
@@ -284,12 +367,22 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---- transport helpers ------------------------------------------------
 
+    def end_headers(self):
+        """Attach the security headers to every response.
+
+        Placed here rather than in `_send` so the error paths this handler
+        does not build (a malformed request line answered by the base class)
+        carry them too, and so a new `_send` caller cannot forget one.
+        """
+        for key, value in SECURITY_HEADERS:
+            self.send_header(key, value)
+        super().end_headers()
+
     def _send(self, code, body, content_type, extra=()):
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
         for key, value in extra:
             self.send_header(key, value)
         self.end_headers()
@@ -392,6 +485,15 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         segments = [unquote(part) for part in parsed.path.split("/") if part]
         query = parse_qs(parsed.query, keep_blank_values=True)
+
+        # Host first, before auth and before any route: a name that resolves
+        # to loopback by DNS rebinding would otherwise reach the dashboard
+        # with the browser's cookie. 421 Misdirected Request is the answer
+        # for an authority this server does not serve, and it carries the
+        # same headers as every other response.
+        if not host_allowed(self.headers.get("Host", ""),
+                            self.server.allowed_hosts):
+            return self._json(421, {"error": "misdirected request"})
 
         # Chrome DevTools fetches this from the page's origin for its
         # workspace feature. Answering 204 keeps the console free of errors;
@@ -775,6 +877,10 @@ def parse_args(argv):
                         help="bind port, 0 for an ephemeral one (default: 7788)")
     parser.add_argument("--token", default=None,
                         help="bearer token; generated and printed once if omitted")
+    parser.add_argument("--allow-host", action="append", default=[],
+                        metavar="NAME",
+                        help="extra Host name to answer, repeatable; for a "
+                             "reverse proxy that keeps its own name")
     parser.add_argument("--read-only", action="store_true",
                         help="refuse every POST with 403")
     parser.add_argument("--ttyd", action="store_true",
@@ -811,12 +917,14 @@ def main(argv=None):
     generated = not args.token
     token = args.token or secrets.token_urlsafe(24)
     server_class = Server6 if ":" in args.host else Server
+    allowed = allowed_host_names([args.host], args.allow_host)
     try:
         httpd = server_class(
             (args.host, args.port), Handler,
             root=os.path.abspath(args.root), token=token,
             read_only=args.read_only, ttyd=ttyd,
-            ttyd_wanted=args.ttyd, interactive=args.interactive)
+            ttyd_wanted=args.ttyd, interactive=args.interactive,
+            allowed_hosts=allowed)
     except OSError as exc:
         print("gui: cannot listen on %s:%s: %s" % (args.host, args.port, exc),
               file=sys.stderr)
