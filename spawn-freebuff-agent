@@ -153,7 +153,11 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       verbatim and GET /api/session/<name>/pane is `status --json`. POST
       /api/session/<name>/stop[?graceful=1], /api/session/<name>/send (JSON
       {"text": ...}) and /api/gc[?dry=1] run the matching CLI command and
-      answer 202 with its key=value output. Binds 127.0.0.1:7788 by default;
+      answer 202 with its key=value output. The served page carries Stop and
+      gc forms that post to those routes; a form submission is
+      cookie-authenticated, so it must carry the page nonce, passes an Origin
+      check, and a successful stop answers 303 See Other to / (gc to the
+      report). Binds 127.0.0.1:7788 by default;
       a non-loopback host is refused unless --token is given. Without --token
       one is generated and printed once. Every POST needs the token even on
       loopback; --read-only answers them 403. No TLS: put a reverse proxy in
@@ -510,14 +514,31 @@ state_class() {
     esac
 }
 
+action_form() {
+    # action_form NONCE ACTION LABEL -> one server-rendered POST form.
+    # The nonce is the server's CSRF secret: a cookie-authenticated POST has
+    # no other way to prove the form came from this page. No script, so a
+    # stray click is the only risk left, and the stop routes answer with a
+    # confirmation page before they act.
+    local nonce=$1 action=$2 label=$3
+    printf '<form method="post" action="%s">' "$(html_escape "$action")"
+    printf '<input type="hidden" name="nonce" value="%s">' \
+        "$(html_escape "$nonce")"
+    printf '<button type="submit">%s</button></form>' "$(html_escape "$label")"
+}
+
 snapshot_html() {
-    # snapshot_html FILE JSON WATCH [LINK_PREFIX] [NOTE] -> one self-contained
-    # page. `sessions --json` is the input: fixed keys, one per line, so the
-    # reader below is a field scan rather than a general JSON parser. WATCH is
-    # empty for a one shot snapshot and a whole number of seconds for the meta
-    # refresh. LINK_PREFIX is `/tty/` when the served page should carry a
-    # terminal link per session; NOTE is one line under the header.
+    # snapshot_html FILE JSON WATCH [LINK_PREFIX] [NOTE] [FORM_NONCE] [FLASH]
+    # -> one self-contained page. `sessions --json` is the input: fixed keys,
+    # one per line, so the reader below is a field scan rather than a general
+    # JSON parser. WATCH is empty for a one shot snapshot and a whole number of
+    # seconds for the meta refresh. LINK_PREFIX is `/tty/` when the served page
+    # should carry a terminal link per session; NOTE is one line under the
+    # header. FORM_NONCE adds the action forms and is empty for a static
+    # snapshot, which stays read-only; FLASH is the output of an action that
+    # redirected here (the gc report) and is shown above the cards.
     local file="$1" json="$2" watch="$3" link_prefix=${4:-} note_text=${5:-}
+    local form_nonce=${6:-} flash_text=${7:-}
     local line key value name state idle watcher worktree result branch pr
     local tests="" commit="" wt generated total=0 live=0 trees=0 cards='' card
     local cls pr_html refresh=''
@@ -592,6 +613,24 @@ snapshot_html() {
                     card+="<dt>tests</dt><dd>$(html_escape "$tests")</dd>"$'\n'
                 fi
                 card+='</dl>'$'\n'
+                # Actions only for a running session the action could end.
+                # `done` and `blocked` are result states: the session is
+                # already over, so a Stop button would be a lie.
+                if [ -n "$form_nonce" ] && [ "$worktree" = yes ] &&
+                    valid_name "$name" && [ -n "$idle" ]; then
+                    case "${state:-}" in
+                        done|stopped|failed|blocked) ;;
+                        *)
+                            card+='<div class="actions">'
+                            card+=$(action_form "$form_nonce" \
+                                "/api/session/$name/stop" 'Stop')
+                            card+=$(action_form "$form_nonce" \
+                                "/api/session/$name/stop?graceful=1" \
+                                'Stop (graceful)')
+                            card+='</div>'$'\n'
+                            ;;
+                    esac
+                fi
                 card+='</article>'$'\n'
                 cards+=$card
                 continue
@@ -670,6 +709,16 @@ dt { color: var(--muted); }
 dd { margin: 0; }
 code { font: .85em ui-monospace, SFMono-Regular, Menlo, monospace; }
 a { color: inherit; }
+.actions { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .6rem; }
+.actions form { display: inline; }
+.actions button { font: inherit; font-size: .82rem; padding: .2rem .7rem;
+  border: 1px solid var(--line); border-radius: 6px; background: var(--bg);
+  color: var(--fg); cursor: pointer; }
+.actions button:hover { border-color: var(--muted); }
+.flash { margin: 0 0 1.25rem; padding: .6rem 1rem; background: var(--card);
+  border: 1px solid var(--line); border-radius: 8px; }
+.flash h2 { margin: 0 0 .4rem; font-size: .95rem; }
+.flash pre { margin: 0; white-space: pre-wrap; font-size: .82rem; }
 .empty { color: var(--muted); padding: 2rem 0; }
 footer { margin-top: 1.5rem; color: var(--muted); font-size: .78rem; }
 CSS
@@ -681,14 +730,30 @@ CSS
         if [ -n "$note_text" ]; then
             printf '<p class="note">%s</p>\n' "$(html_escape "$note_text")"
         fi
-        printf '</header>\n<main class="grid">\n'
+        # The safe action comes first: a dry run reports, it does not stop
+        # anything, and its report is useful without a terminal. Nothing to
+        # reap means no form.
+        if [ -n "$form_nonce" ] && [ "$live" -gt 0 ]; then
+            printf '<div class="actions">%s</div>\n' \
+                "$(action_form "$form_nonce" '/api/gc?dry=1' 'gc --dry-run')"
+        fi
+        printf '</header>\n'
+        if [ -n "$flash_text" ]; then
+            printf '<section class="flash">\n<h2>gc --dry-run</h2>\n<pre>%s</pre>\n</section>\n' \
+                "$(html_escape "$flash_text")"
+        fi
+        printf '<main class="grid">\n'
         if [ "$total" = 0 ]; then
             printf '<p class="empty">no sessions</p>\n'
         else
             printf '%s' "$cards"
         fi
         printf '</main>\n'
-        printf '<footer>Read-only view from spawn-freebuff-agent sessions --json. No script.</footer>\n'
+        if [ -n "$form_nonce" ]; then
+            printf '<footer>Actions are plain server-rendered forms; no script. Stop asks for confirmation before it acts.</footer>\n'
+        else
+            printf '<footer>Read-only view from spawn-freebuff-agent sessions --json. No script.</footer>\n'
+        fi
         printf '</body>\n</html>\n'
     } >"$file.tmp.$$"
     mv "$file.tmp.$$" "$file"
@@ -2256,6 +2321,7 @@ gui() {
     # of the CLI works on a host that does not have it.
     local snapshot='' watch='' no_gh=0 serve=0 first=1 json args py dir
     local links='' note_text='' ttyd=0 interactive=0
+    local form_nonce='' flash_file='' flash_text=''
     local passthrough=()
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -2267,6 +2333,8 @@ gui() {
             --interactive) interactive=1; passthrough+=(--interactive); shift ;;
             --terminal-links) links=/tty/; shift ;;
             --terminal-note) note_text=${2:-}; shift 2 ;;
+            --form-nonce) form_nonce=${2:-}; shift 2 ;;
+            --flash-file) flash_file=${2:-}; shift 2 ;;
             --port|--host|--token)
                 [ $# -ge 2 ] || die "gui: $1 needs a value"
                 passthrough+=("$1" "$2"); shift 2 ;;
@@ -2308,7 +2376,12 @@ gui() {
             args+=(--no-gh)
         fi
         json=$(sessions "${args[@]}")
-        snapshot_html "$snapshot" "$json" "$watch" "$links" "$note_text"
+        flash_text=''
+        if [ -n "$flash_file" ] && [ -f "$flash_file" ]; then
+            flash_text=$(cat "$flash_file")
+        fi
+        snapshot_html "$snapshot" "$json" "$watch" "$links" "$note_text" \
+            "$form_nonce" "$flash_text"
         if [ "$first" = 1 ]; then
             note "snapshot=$snapshot"
             [ -z "$watch" ] || note "watch_seconds=$watch"

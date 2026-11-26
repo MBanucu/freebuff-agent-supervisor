@@ -285,6 +285,103 @@ code=$(curl -sS --max-time 10 --path-as-is -o /dev/null -w '%{http_code}' \
     "$base/api/session/../etc/stop" || true)
 check test "$code" = 400
 
+# ---- the served page's forms, nonce and Origin checks ----
+# A browser gets the cookie from ?token= once and then posts the page's own
+# forms. The nonce is per server, the Origin is this server's, and a stop
+# takes two POSTs: the first renders a confirmation and changes nothing.
+jar="$TMP/jar"
+code=$(curl -sS --max-time 10 -c "$jar" -o "$TMP/page.html" \
+    -w '%{http_code}' "$base/?token=$TOKEN" || true)
+check test "$code" = 200
+page=$(cat "$TMP/page.html")
+check contains "$page" '<form method="post"'
+check contains "$page" 'action="/api/session/test-999/stop"'
+check contains "$page" 'action="/api/session/test-999/stop?graceful=1"'
+check contains "$page" 'action="/api/gc?dry=1"'
+check contains "$page" 'name="nonce"'
+nonce=$(sed -n 's/.*name="nonce" value="\([^"]*\)".*/\1/p' \
+    "$TMP/page.html" | head -n 1)
+check test -n "$nonce"
+
+# A cookie POST with no nonce is refused, not silently a no-op.
+code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+    -b "$jar" -X POST -H "Origin: $base" --data 'confirm=1' \
+    "$base/api/session/test-999/stop?confirm=1" || true)
+check test "$code" = 403
+check grep -qxF 'fb-test-999' "$FAKE_DIR/session"
+
+# A valid nonce with a foreign Origin is refused too: another service on
+# 127.0.0.1 is same-site for the cookie, so the nonce alone is not enough.
+code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' \
+    -b "$jar" -X POST -H 'Origin: http://attacker.invalid' \
+    --data-urlencode "nonce=$nonce" --data 'confirm=1' \
+    "$base/api/session/test-999/stop?confirm=1" || true)
+check test "$code" = 403
+check grep -qxF 'fb-test-999' "$FAKE_DIR/session"
+
+# The stray-click guard: first POST renders the confirmation page and runs
+# nothing, even with a valid nonce and this server's own Origin.
+: >"$FAKE_DIR/killed"
+code=$(curl -sS --max-time 30 -o "$TMP/confirm.html" -w '%{http_code}' \
+    -b "$jar" -X POST -H "Origin: $base" \
+    --data-urlencode "nonce=$nonce" \
+    "$base/api/session/test-999/stop" || true)
+check test "$code" = 200
+check contains "$(cat "$TMP/confirm.html")" 'Stop fb-test-999?'
+check contains "$(cat "$TMP/confirm.html")" '?confirm=1'
+check grep -qxF 'fb-test-999' "$FAKE_DIR/session"
+check test ! -s "$FAKE_DIR/killed"
+
+# The second click runs the action once and answers 303 to /.
+code=$(curl -sS --max-time 30 -o /dev/null -D "$TMP/stop.headers" \
+    -w '%{http_code}' -b "$jar" -X POST -H "Origin: $base" \
+    --data-urlencode "nonce=$nonce" --data 'confirm=1' \
+    "$base/api/session/test-999/stop?confirm=1" || true)
+check test "$code" = 303
+check test "$(sed -n 's/\r$//; s/^[Ll]ocation: //p' "$TMP/stop.headers" |
+    head -n 1)" = /
+check test "$(grep -cxF 'fb-test-999' "$FAKE_DIR/killed")" = 1
+check test "$(grep -cxF 'fb-test-999' "$FAKE_DIR/session" || true)" = 0
+
+# After the redirect the card reads stopped and offers no Stop button.
+code=$(curl -sS --max-time 10 -b "$jar" -o "$TMP/after.html" \
+    -w '%{http_code}' "$base/" || true)
+check test "$code" = 200
+check contains "$(cat "$TMP/after.html")" '<span class="badge">stopped</span>'
+check test "$(grep -cF 'action="/api/session/test-999/stop"' \
+    "$TMP/after.html" || true)" = 0
+
+# The gc form runs a dry run, redirects to a one-shot report URL, and the
+# report is shown once: a refresh is the plain dashboard, not a replay.
+fake_session test-999 "$IDLE_PANE" "$(($(date +%s) - 30))"
+code=$(curl -sS --max-time 10 -H "Authorization: Bearer $TOKEN" \
+    -o "$TMP/page2.html" -w '%{http_code}' "$base/" || true)
+check test "$code" = 200
+check contains "$(cat "$TMP/page2.html")" 'action="/api/gc?dry=1"'
+code=$(curl -sS --max-time 30 -o /dev/null -D "$TMP/gc.headers" \
+    -w '%{http_code}' -b "$jar" -X POST -H "Origin: $base" \
+    --data-urlencode "nonce=$nonce" "$base/api/gc?dry=1" || true)
+check test "$code" = 303
+gc_location=$(sed -n 's/\r$//; s/^[Ll]ocation: //p' "$TMP/gc.headers" |
+    head -n 1)
+check contains "$gc_location" '/?gc='
+code=$(curl -sS --max-time 10 -b "$jar" -o "$TMP/gc.html" \
+    -w '%{http_code}' "$base$gc_location" || true)
+check test "$code" = 200
+check contains "$(cat "$TMP/gc.html")" 'gc --dry-run</h2>'
+check contains "$(cat "$TMP/gc.html")" 'skip name=test-999 reason=idle'
+code=$(curl -sS --max-time 10 -b "$jar" -o "$TMP/gc2.html" \
+    -w '%{http_code}' "$base$gc_location" || true)
+check test "$code" = 200
+check test "$(grep -cF 'skip name=test-999 reason=idle' \
+    "$TMP/gc2.html" || true)" = 0
+
+# A bearer-token POST with no nonce still works: the curl path from #22.
+code=$(curl -sS --max-time 30 -o /dev/null -w '%{http_code}' -X POST \
+    -H "Authorization: Bearer $TOKEN" \
+    "$base/api/session/test-999/stop" || true)
+check test "$code" = 202
+
 # A graceful stop of an idle session kills the fake fb-* and records why.
 rm -f "$WT/.supervisor.log"
 fake_session test-999 "$IDLE_PANE"
@@ -314,6 +411,12 @@ code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X POST \
     -H "Authorization: Bearer $TOKEN" \
     "$ro_base/api/session/test-999/stop" || true)
 check test "$code" = 403
+# The read-only page carries no form at all, so a reader is never offered a
+# button whose only outcome is that 403.
+code=$(curl -sS --max-time 10 -o "$TMP/ro-page.html" -w '%{http_code}' \
+    -H "Authorization: Bearer $TOKEN" "$ro_base/" || true)
+check test "$code" = 200
+check test "$(grep -cF '<form' "$TMP/ro-page.html" || true)" = 0
 code=$(curl -sS --max-time 10 -o /dev/null -w '%{http_code}' -X POST \
     -H "Authorization: Bearer $TOKEN" "$ro_base/api/gc?dry=1" || true)
 check test "$code" = 403
