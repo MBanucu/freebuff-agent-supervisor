@@ -157,13 +157,16 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       Send a follow-up message to a running agent.
 
   spawn-freebuff-agent watch NAME [--idle-seconds N] [--poll N] [--timeout N]
-      Report working/idle/done/refused/unknown/missing transitions. Exits 0 when the
-      agent is done or the pane has been idle past the window, 1 on timeout,
-      2 when the session is gone. Never stops anything.
+      Report working/idle/done/blocked/failed/refused/unknown/missing
+      transitions. Exits 0 when the agent is done or the pane has been idle
+      past the window, 1 on timeout, 2 when the session is gone, 3 when the
+      agent reported blocked and 4 when it reported failed. Never stops
+      anything.
 
   spawn-freebuff-agent autostop NAME [--idle-seconds N] [--poll N] [--timeout N]
       Watch, then stop fb-<name> and record the run evidence. This is what
-      start --auto-stop runs detached.
+      start --auto-stop runs detached. A done, blocked or failed result stops
+      the session; the exit status is watch's (0, 3 or 4).
 
   spawn-freebuff-agent stop NAME [--graceful [--wait N]]
       Kill the tmux session; the worktree and branch are left in place.
@@ -857,7 +860,10 @@ classify_state() {
     base_checks+=$'\n'"check: result-file ($RESULT_FILE): ${result:-no}"
     case "$result" in
         done|blocked|failed)
-            emit_evidence done result-file "$result" 0 "$base_checks"
+            # The result file names the outcome, so a blocked or failed run
+            # must not be reported as done: a wait contract built on `done`
+            # would otherwise call failure success.
+            emit_evidence "$result" result-file "$result" 0 "$base_checks"
             return 0
             ;;
     esac
@@ -897,7 +903,7 @@ classify_state() {
 }
 
 session_state() {
-    # session_state NAME -> done|refused|working|idle|unknown|missing
+    # session_state NAME -> done|blocked|failed|refused|working|idle|unknown|missing
     local block first
     block=$(classify_state "$1")
     first=${block%%$'\n'*}
@@ -1414,15 +1420,28 @@ start() {
     "$tmux" capture-pane -p -t "$session" -S -8 2>/dev/null || true
 
     if [ "$autostop" = 1 ]; then
-        local script log
+        local script log watcher_pid
         case "$0" in
             */*) script=$(cd "$(dirname "$0")" && pwd)/$(basename "$0") ;;
             *) script=$(command -v "$0" 2>/dev/null || printf '%s' "$0") ;;
         esac
         log="$wt/.supervisor.log"
-        nohup "$script" --root "$ROOT" autostop "$name" \
-            --idle-seconds "$idle" --poll "$poll" </dev/null >>"$log" 2>&1 &
-        note "autostop=pid:$!"
+        # setsid puts the watcher in its own session, so tearing down the
+        # caller's process group (a closed terminal, a finished CI step) no
+        # longer takes the watcher with it. It is optional; without it nohup
+        # still ignores SIGHUP, but the watcher stays in the caller's group.
+        if command -v setsid >/dev/null 2>&1; then
+            setsid "$script" --root "$ROOT" autostop "$name" \
+                --idle-seconds "$idle" --poll "$poll" </dev/null >>"$log" 2>&1 &
+        else
+            nohup "$script" --root "$ROOT" autostop "$name" \
+                --idle-seconds "$idle" --poll "$poll" </dev/null >>"$log" 2>&1 &
+        fi
+        watcher_pid=$!
+        # watcher_state greps .supervisor.log; a note on stdout would never be
+        # seen by sessions or status.
+        printf 'autostop=pid:%s\n' "$watcher_pid" >>"$log"
+        note "autostop=pid:$watcher_pid"
         note "log=$log"
     fi
 }
@@ -1500,8 +1519,10 @@ status() {
 
     state=$(result_state "$wt")
     [ -n "$state" ] || state=unknown
+    watcher=$(watcher_state "$wt")
     if [ "$json" = 0 ]; then
         printf 'state=%s\n' "$state"
+        printf 'watcher=%s\n' "$watcher"
     fi
     if [ -f "$wt/$RESULT_FILE" ]; then
         rstate=$state
@@ -1608,7 +1629,6 @@ status() {
     # `state` mirrors the human `state=` line, including its `unknown`
     # placeholder; `result_state` is null when there is no result file at all,
     # so a consumer can tell "nothing written yet" from "unusable state".
-    watcher=$(watcher_state "$wt")
     printf '{\n'
     printf '  "name": %s,\n' "$(json_str "$name")"
     printf '  "branch": %s,\n' "$(json_str "$branch")"
@@ -1913,7 +1933,9 @@ reap() {
 }
 
 watch_run() {
-    # watch_run NAME IDLE_SECONDS POLL TIMEOUT
+    # watch_run NAME IDLE_SECONDS POLL TIMEOUT -> 0 done/idle, 1 timeout,
+    # 2 missing, 3 blocked, 4 failed. The result file's own state is the
+    # contract; a killed watcher's exit is not read as the run's outcome.
     local name="$1" idle_limit="$2" poll="$3" timeout="$4"
     local tmux session start now state last_state="" pane hash last_hash=""
     local idle_since="" elapsed
@@ -1932,6 +1954,14 @@ watch_run() {
             done)
                 note 'state=done'
                 return 0
+                ;;
+            blocked)
+                note 'state=blocked'
+                return 3
+                ;;
+            failed)
+                note 'state=failed'
+                return 4
                 ;;
             missing)
                 note 'state=missing'
@@ -2002,9 +2032,12 @@ autostop() {
     is_num "$timeout" || die "autostop: --timeout must be a number"
 
     watch_run "$name" "$idle" "$poll" "$timeout" || rc=$?
-    if [ "$rc" -eq 0 ]; then
-        reap "$name" "$(session_state "$name")"
-    fi
+    case "$rc" in
+        # 0 is done or the idle window; 3 and 4 are the result file's blocked
+        # and failed. All three end the run, so the watcher still stops the
+        # session; the exit status keeps the outcome distinguishable.
+        0|3|4) reap "$name" "$(session_state "$name")" ;;
+    esac
     return "$rc"
 }
 
@@ -2047,12 +2080,14 @@ gc() {
             missing)
                 continue
                 ;;
-            done)
+            done|blocked|failed)
+                # All three are a finished agent: blocked and failed still stop
+                # the session, and the reason names the result state.
                 if [ "$dry" = 1 ]; then
-                    note "would-stop name=$name reason=done"
+                    note "would-stop name=$name reason=$state"
                 else
-                    note "stop name=$name reason=done"
-                    reap "$name" done
+                    note "stop name=$name reason=$state"
+                    reap "$name" "$state"
                     stopped=1
                 fi
                 ;;
@@ -2258,7 +2293,7 @@ stop() {
     while :; do
         state=$(session_state "$name")
         case "$state" in
-            done|idle|refused|missing) break ;;
+            done|blocked|failed|idle|refused|missing) break ;;
         esac
         if [ "$(date +%s)" -ge "$deadline" ]; then
             break
