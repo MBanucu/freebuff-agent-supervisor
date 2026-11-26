@@ -221,6 +221,32 @@ check contains "$(cat "$TMP/start.out")" 'holding_slot=test-999'
 check contains "$(cat "$TMP/start.out")" 'gc'
 check test "$(printf '%s\n' "$(cat "$TMP/start.out")" | grep -c 'holding_slot=' || true)" = 1
 
+# The issue mirrors the session: the launch labels it status:working, and a
+# stop moves the label on and comments the evidence. GH_BIN is the fake from
+# lib.sh, so this proves the calls without a request leaving the machine.
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+fake_clear
+: >"$GH_LOG"
+if launch_brief test-gh 1001 >"$TMP/gh-start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+check test -f "$REPO/.worktrees/test-gh/.supervisor-gh"
+check contains "$(cat "$REPO/.worktrees/test-gh/.supervisor-gh")" 'issue=1001'
+check contains "$(cat "$REPO/.worktrees/test-gh/.supervisor-gh")" 'slug=owner/repo'
+check contains "$(cat "$GH_LOG")" 'issue edit 1001'
+check contains "$(cat "$GH_LOG")" '--add-label status:working'
+check contains "$(cat "$GH_LOG")" 'issue comment 1001'
+# One status label at a time: the previous label is removed in the same edit.
+printf 'status:working' >"$FAKE_GH_LABELS"
+bash "$TOOL" --root "$REPO" stop test-gh >/dev/null 2>&1 || true
+check contains "$(cat "$GH_LOG")" '--add-label status:stopped'
+check contains "$(cat "$GH_LOG")" '--remove-label status:working'
+# No issue, no sync: --no-gh leaves the state file out entirely.
+: >"$GH_LOG"
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+launch_brief test-nogh 1002 --no-gh >/dev/null 2>&1 || true
+check test ! -f "$REPO/.worktrees/test-nogh/.supervisor-gh"
+check test ! -s "$GH_LOG"
+
 # leave the fixture as it was found
 if [ -n "$RESULT_SAVED" ]; then
     printf '%s\n' "$RESULT_SAVED" >"$WT/.agent-result"

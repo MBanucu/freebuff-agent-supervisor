@@ -44,6 +44,9 @@ printf 'hello\n' >"$REPO/README.md"
 git -C "$REPO" add README.md
 git -C "$REPO" commit -qm init
 git -C "$REPO" branch -M main
+# A remote gives the fixture a slug, which is what the GitHub state sync needs
+# before it will touch anything.
+git -C "$REPO" remote add origin https://github.com/owner/repo.git
 
 total=0
 failed=0
@@ -81,6 +84,31 @@ json_ok() {
     esac
     ! printf '%s' "$text" | LC_ALL=C grep -q $'[\t\r]'
 }
+
+# ---- fake gh: records what the state sync asked for, answers nothing ----
+
+: >"$TMP/gh.log"
+export GH_LOG="$TMP/gh.log"
+: >"$TMP/gh-labels"
+export FAKE_GH_LABELS="$TMP/gh-labels"
+cat >"$TMP/bin/gh" <<'FAKE'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${GH_LOG:?}"
+case " ${1:-} ${2:-} " in
+    ' issue view ')
+        # The label query answers what the fake issue currently shows, so a
+        # test can prove the old status label is removed rather than assumed.
+        case " $* " in
+            *labels*) cat "${FAKE_GH_LABELS:-/dev/null}" 2>/dev/null || true ;;
+            *) printf '[]' ;;
+        esac
+        ;;
+esac
+exit 0
+FAKE
+chmod +x "$TMP/bin/gh"
+# GH_BIN so every area uses it whether or not $TMP/bin is on PATH.
+export GH_BIN="$TMP/bin/gh"
 
 # ---- fake tmux for lifecycle checks (#3, #4) ----
 
