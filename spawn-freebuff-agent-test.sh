@@ -3,6 +3,10 @@
 # for the project; a fake tmux stands in for sessions, so no Freebuff, gh,
 # network or phone is needed.
 set -euo pipefail
+# An unguarded command that fails ends the suite under `set -e`. Say which one:
+# without this a CI run stops with no FAIL line and only the last stderr write
+# for company, which is what took a whole suite rerun to explain (#32).
+trap 'rc=$?; printf "error: line %s exited %s\n" "${BASH_LINENO[0]}" "$rc" >&2' ERR
 
 ROOT=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd) || exit 1
 TOOL="$ROOT/spawn-freebuff-agent"
@@ -400,6 +404,23 @@ printf 'state=done\npr=none\n' >"$WT/.agent-result"
 out=$(bash "$TOOL" --root "$REPO" status --no-gh --explain test-999)
 check contains "$out" 'session_state=done'
 check contains "$out" 'explain: rule=result-file'
+# blocked and failed are the result file's own state, not another done. A
+# wait contract reads watch's exit status: 3 for blocked, 4 for failed.
+for want in blocked failed; do
+    printf 'state=%s\npr=none\n' "$want" >"$WT/.agent-result"
+    out=$(bash "$TOOL" --root "$REPO" status --no-gh test-999)
+    check contains "$out" "session_state=$want"
+    out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-999)
+    check contains "$out" "\"session_state\": \"$want\""
+    case "$want" in
+        blocked) want_rc=3 ;;
+        failed) want_rc=4 ;;
+    esac
+    if bash "$TOOL" --root "$REPO" watch test-999 --timeout 5 --poll 1 \
+        >"$TMP/watch.out" 2>&1; then rc=0; else rc=$?; fi
+    check test "$rc" -eq "$want_rc"
+    check contains "$(cat "$TMP/watch.out")" "state=$want"
+done
 rm -f "$WT/.agent-result"
 fake_clear
 out=$(bash "$TOOL" --root "$REPO" status --no-gh --explain test-999)
@@ -545,6 +566,11 @@ fake_clear
 fake_session test-999 "$IDLE_PANE"
 printf 'state=blocked\n' >"$WT/.agent-result"
 fake_add_session ghost
+# no autostop has been recorded yet: the watcher is `-`, and null in JSON
+out=$(bash "$TOOL" --root "$REPO" sessions --no-gh)
+check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $4 }')" = -
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-999)
+check contains "$out" '"watcher": null'
 printf 'autostop=pid:%s\n' "$$" >>"$WT/.supervisor.log"
 
 out=$(bash "$TOOL" --root "$REPO" sessions --no-gh)
@@ -602,8 +628,8 @@ check contains "$out" '"name": "ghost"'
 check test "$(printf '%s\n' "$out" | grep -c '^  {')" = 2
 check contains "$out" '"worktree": "yes"'
 check contains "$out" '"worktree": "missing"'
-# the result file outranks the pane for test-999, the orphan is just idle
-check contains "$out" '"state": "done"'
+# the result file outranks the pane for test-999: blocked is not done
+check contains "$out" '"state": "blocked"'
 check contains "$out" '"state": "idle"'
 check contains "$out" '"result": "blocked"'
 # a terminal run carries no idle time; the live orphan still has one (#57)
@@ -627,7 +653,7 @@ check contains "$out" '"result_commit": "def5678"'
 check contains "$out" '"result_tests": "sessions --json"'
 check contains "$out" '"running": true'
 check contains "$out" '"input": "canonical"'
-check contains "$out" '"session_state": "done"'
+check contains "$out" '"session_state": "blocked"'
 check contains "$out" '"idle_seconds": null'
 check contains "$out" '"dirty": false'
 check contains "$out" '"pane": "'
@@ -715,8 +741,8 @@ check contains "$SNAP" '<h2>test-999</h2>'
 check contains "$SNAP" '<h2>test-two</h2>'
 check contains "$SNAP" '<h2>ghost</h2>'
 check contains "$SNAP" 'no worktree'
-# the result file outranks the busy pane, so done versus working is visible
-check contains "$SNAP" 'card state-done'
+# the result file outranks the busy pane: blocked is red, working is amber
+check contains "$SNAP" 'card state-failed'
 check contains "$SNAP" 'card state-working'
 # a done card carries no idle line; a live working card still carries one (#57)
 card_of() {
@@ -887,6 +913,55 @@ sent_b=$(sent_text test-brief-b)
 check contains "$sent_b" 'Issue #1003'
 check test "$sent_a" != "$sent_b"
 check test "$(grep -c . "$REPO/.supervisor-briefs.jsonl" || true)" = 2
+
+# start --auto-stop persists the watcher pid in the log watcher_state reads,
+# so sessions shows pid:N while it lives and dead once it is killed.
+if launch_brief test-auto-pid 1009 --auto-stop --idle-seconds 3600 --poll 60 \
+    >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+AUTO_WT="$REPO/.worktrees/test-auto-pid"
+check grep -qE '^autostop=pid:[0-9]+$' "$AUTO_WT/.supervisor.log"
+auto_pid=$(sed -n 's/^autostop=pid:\([0-9]*\)$/\1/p' \
+    "$AUTO_WT/.supervisor.log" | tail -n 1)
+check test -n "$auto_pid"
+check kill -0 "$auto_pid"
+out=$(bash "$TOOL" --root "$REPO" sessions --no-gh)
+check test "$(printf '%s\n' "$out" | awk '$1 == "test-auto-pid" { print $4 }')" = "pid:$auto_pid"
+kill "$auto_pid" 2>/dev/null || true
+i=0
+while [ "$i" -lt 100 ] && kill -0 "$auto_pid" 2>/dev/null; do
+    sleep 0.05
+    i=$((i + 1))
+done
+out=$(bash "$TOOL" --root "$REPO" sessions --no-gh)
+check test "$(printf '%s\n' "$out" | awk '$1 == "test-auto-pid" { print $4 }')" = dead
+
+# A watcher survives the process group that launched it when setsid is
+# available: start in a new session, tear that group down, and the recorded
+# watcher must still answer kill -0.
+if command -v setsid >/dev/null 2>&1 && setsid -w true 2>/dev/null; then
+    SURVIVE_WT="$REPO/.worktrees/test-auto-survive"
+    # The previous launch left its turn in the pane; readiness needs the
+    # resting prompt, and a leftover busy pane would spend the whole
+    # --ready-timeout before failing for the wrong reason. Reset it, keep the
+    # gate short, and report the start's own output when it does fail.
+    printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+    if setsid -w bash -c 'echo $$ >"$1"; shift; exec "$@"' _ \
+        "$TMP/survive.pgid" bash "$TOOL" --root "$REPO" start --issue 1016 \
+        --name test-auto-survive --branch test/auto-survive --title T --url U \
+        --auto-stop --idle-seconds 3600 --poll 60 --ready-timeout 10 \
+        >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+    check test "$rc" -eq 0
+    [ "$rc" -eq 0 ] || printf 'start out:\n%s\n' "$(cat "$TMP/start.out")" >&2
+    survive_pgid=$(cat "$TMP/survive.pgid")
+    survive_pid=$(sed -n 's/^autostop=pid:\([0-9]*\)$/\1/p' \
+        "$SURVIVE_WT/.supervisor.log" | tail -n 1)
+    check test -n "$survive_pid"
+    kill -TERM -- "-$survive_pgid" 2>/dev/null || true
+    sleep 0.2
+    check kill -0 "$survive_pid"
+    kill "$survive_pid" 2>/dev/null || true
+fi
 
 # Seed older entries so the next success also proves the window is trimmed
 # to the last 20 rather than growing without bound.
@@ -1638,6 +1713,10 @@ for brief in a b c; do
     git -C "$REPO" worktree remove --force "$REPO/.worktrees/test-brief-$brief" \
         >/dev/null 2>&1 || true
 done
+for auto in pid survive; do
+    git -C "$REPO" worktree remove --force "$REPO/.worktrees/test-auto-$auto" \
+        >/dev/null 2>&1 || true
+done
 for refused in overlay turn next; do
     git -C "$REPO" worktree remove --force "$REPO/.worktrees/test-refuse-$refused" \
         >/dev/null 2>&1 || true
@@ -1652,6 +1731,7 @@ for proof in ok title swallow typed; do
 done
 git -C "$REPO" branch -D test/999 test/custom test/dead \
     test/test-brief-a test/test-brief-b test/test-brief-c \
+    test/test-auto-pid test/auto-survive \
     test/test-refuse-overlay test/test-refuse-turn test/test-refuse-next \
     test/slow test/hung test/warm \
     test/proof-ok test/proof-title test/proof-swallow test/proof-typed \

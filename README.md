@@ -90,7 +90,13 @@ spawn-freebuff-agent start --issue 103 --auto-stop
 
 The watcher writes transitions and the stop evidence to
 `.worktrees/103/.supervisor.log`, so the run is inspectable after the session
-is gone.
+is gone. `start` also appends `autostop=pid:<PID>` to that log before it
+returns, which is what `sessions` and `status` read for the WATCHER field.
+Where `setsid` is available the watcher runs in its own session, so it
+survives the caller's process group being torn down (a closed terminal, a
+finished CI step). Without `setsid` it falls back to `nohup`: that still
+ignores SIGHUP, but the watcher stays in the caller's process group and can
+be killed with it.
 
 ## Completion
 
@@ -108,10 +114,13 @@ tests=<one line: what you ran>
 ```
 
 The file is written in the worktree root, is covered by
-`.git/info/exclude`, and is never committed. `blocked` and `failed` count as
-finished: a draft PR plus an explanation is a valid outcome. A custom
-`--task-file` brief must include the same instruction, otherwise only the
-idle signal applies.
+`.git/info/exclude`, and is never committed. `done`, `blocked` and `failed`
+are kept distinct: `session_state` reports the result file's own state, and
+`watch` exits `0`, `3` or `4` respectively. All three count as finished — a
+draft PR plus an explanation is a valid outcome — but only `done` is success,
+so a wait contract cannot read failure as completion. A custom `--task-file`
+brief must include the same instruction, otherwise only the idle signal
+applies.
 
 **The idle pane (fallback).** `watch` captures the visible pane, looks at the
 bottom lines, and treats the session as idle when the input prompt is visible,
@@ -173,7 +182,9 @@ depends on them.
 
 ```
 state=done                  # from .agent-result
-session_state=done          # live: done, idle, working, refused, unknown or missing
+watcher=pid:123             # autostop watcher: pid:N, dead or -
+session_state=done          # live: done, blocked, failed, idle, working, refused,
+                            #       unknown or missing
 ```
 
 `status --explain` prints the classification decision line by line: the rule
@@ -219,21 +230,26 @@ spawn-freebuff-agent stop 103-example --graceful # end the turn first
 spawn-freebuff-agent gc --dry-run
 ```
 
-`watch` prints `state=working|idle|done|refused|unknown|missing`, and exits `0`
-when the result file appears or the pane has been idle past the window, `1` on
-`--timeout`, and `2` when the session is gone. It never stops anything.
-`autostop` is `watch` followed by a stop and an evidence record; `start
---auto-stop` runs it detached.
+`watch` prints
+`state=working|idle|done|blocked|failed|refused|unknown|missing`, and exits
+`0` when the result file says `done` or the pane has been idle past the
+window, `1` on `--timeout`, `2` when the session is gone, `3` when the result
+file says `blocked` and `4` when it says `failed`. It never stops anything.
+`autostop` is `watch` followed by a stop and an evidence record; a `done`,
+`blocked` or `failed` result is stopped and the exit status is watch's (0, 3
+or 4). `start --auto-stop` runs it detached.
 
 `list` prints the branch, session, running flag, live state and idle time.
-`status` prints the result state, `session_state`, idle seconds, the pane
-tail, the last commit, whether the worktree is dirty, and any open PR for the
-branch. `--window N` sets the scrollback the classifier reads (default 40) and
-`--explain` adds the decision trail described under completion.
+`status` prints the result state, the autostop `watcher`, `session_state`, idle
+seconds, the pane tail, the last commit, whether the worktree is dirty, and any
+open PR for the branch. `--window N` sets the scrollback the classifier reads
+(default 40) and `--explain` adds the decision trail described under
+completion.
 
 `sessions` is the inventory: one row per `fb-*` session **and** per worktree,
 with `WORKTREE yes|missing`, the attached `autostop` watcher (`pid:N`, `dead`
-or `-`), the result state, the branch and the open PR. It starts from
+or `-`; the pid is the one `start --auto-stop` wrote to
+`.supervisor.log`), the result state, the branch and the open PR. It starts from
 `tmux list-sessions`, so a session with no worktree appears there instead of
 only being found when `gc --all` kills it; `list` also names such orphans.
 `--no-gh` skips the PR column.
@@ -294,9 +310,9 @@ to `.supervisor.log`. If the pane is still `working` when the window expires
 it stops nothing and exits 1, so a kill cannot land between an edit and its
 commit by accident.
 
-`gc` stops sessions that are `done`, stuck on the concurrent-session overlay,
-idle for more than `--idle-hours` (default 12), or — with `--all` — `fb-*`
-sessions whose worktree no longer exists. Busy, approval and `unknown` panes
+`gc` stops sessions that are `done`, `blocked` or `failed`, stuck on the
+concurrent-session overlay, idle for more than `--idle-hours` (default 12), or
+— with `--all` — `fb-*` sessions whose worktree no longer exists. Busy, approval and `unknown` panes
 are skipped with a reason, and `--dry-run` only reports. `gc` never removes worktrees or
 branches; it prints the cleanup commands instead:
 
