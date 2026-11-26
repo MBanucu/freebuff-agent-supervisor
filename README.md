@@ -324,7 +324,10 @@ attacked. There are no external assets — CSS is inline and there is no
 script — so `file://` works offline and a strict CSP cannot break the view
 (the page declares `default-src 'none'; style-src 'unsafe-inline'; img-src
 data:; connect-src 'self'` — the last one only so Chrome DevTools' own
-`/.well-known` probe is not blocked and does not fill the console). `--watch N` rewrites the file every N seconds and adds
+`/.well-known` probe is not blocked and does not fill the console). That
+`<meta>` is all a static file can carry: a `file://` page has no headers.
+`gui --serve` keeps it for the same markup and adds the framing, `nosniff` and
+referrer headers a meta tag cannot express (see the threat model). `--watch N` rewrites the file every N seconds and adds
 `<meta http-equiv="refresh" content="N">`, so an open browser follows along
 without JavaScript. Without it, a single snapshot is written and the command
 exits.
@@ -363,7 +366,8 @@ spawn-freebuff-agent gui --serve --ttyd             # terminal link per card
 - `POST /api/session/<name>/send` runs `send NAME TEXT`, with the text taken
   from a JSON body `{"text": "..."}` and never from the URL.
 - `POST /api/gc[?dry=1]` runs `gc`, or `gc --dry-run`.
-- Codes: 401 for a missing or wrong token, 400 for a name that fails
+- Codes: 401 for a missing or wrong token, 421 for a `Host` this server does
+  not answer for (checked before auth), 400 for a name that fails
   `^[A-Za-z0-9_-]+$` or a body that is not JSON, 404 for an unknown session
   (no worktree, the pane route's rule), 403 in read-only mode, for a missing or
   wrong form nonce, or for a foreign `Origin`; 409 when the CLI refuses; 413
@@ -533,6 +537,50 @@ whole server (403 on POST), not a property of a token.
 - **`--read-only` is not a second boundary.** It answers POST with 403 for
   everyone, which is the point, but a token holder still reads every pane.
 
+### Response headers: framing, referrer and the CSP
+
+The served page is interactive, so the server sends the headers a `<meta>` tag
+cannot express. Every response carries them — the dashboard, `/api/*`, the
+`303` after a form action, and the `401`, `403`, `404` and `421` refusals —
+because a refusal is still a document a browser renders.
+
+| Header | Value | What it stops, and what it does not |
+| --- | --- | --- |
+| `Content-Security-Policy` | `default-src 'none'; style-src 'unsafe-inline'; img-src data:; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'` | Injected markup cannot load or run anything: no script, no object, no external style, no framing, and no injected `<base>` retargeting a form. `style-src 'unsafe-inline'` is required by the page's single inline `<style>`; there is no script, no `unsafe-inline` for script and no `unsafe-eval`. It does **not** stop a token holder — a holder can read every pane and POST every action without a browser — and it does not replace HTML-escaping: escaping is still what keeps pane text from being markup. |
+| `X-Content-Type-Options` | `nosniff` | A browser may not re-interpret a JSON or text answer as HTML or script by sniffing; `Content-Type` is the only type. |
+| `X-Frame-Options` | `DENY` | The older clickjacking control, for a browser that ignores `frame-ancestors`; both are sent. |
+| `Referrer-Policy` | `no-referrer` | No `Referer` leaves the page. A card links to the PR on github.com, and the URL may still carry the bootstrap `?token=` when that link is clicked; without this header the full dashboard URL, secret included, would travel to a third party. |
+
+`form-action 'self'` does not break the POST → `303` flow: the form targets
+this server and the redirect is a navigation, not a second submission. The
+suite asserts it on the wire. The static `--snapshot` page keeps its narrower
+`<meta>` policy, because a file opened over `file://` has no headers; where
+both apply the two policies agree, so the intersection changes nothing.
+
+### Host validation and DNS rebinding
+
+The server answers only the names it serves: `127.0.0.1`, `localhost` and
+`[::1]`, each with or without a port, plus the configured `--host` and any
+`--allow-host NAME` (repeatable). Anything else is `421 Misdirected Request`
+and reaches no route — the check runs before the token check, so not even a
+bearer caller gets an answer under a foreign name.
+
+The reason is DNS rebinding. A page on `evil.example` can re-resolve that name
+to `127.0.0.1`, and its own script then speaks to this server as a same-origin
+peer; every loopback port is the same site for a cookie. The random token is
+still the barrier against reading or acting, but the Host check makes the name
+useless before that: no dashboard to frame, no API to probe for a difference
+between 401 and 200, and no route where a later unauthenticated addition would
+be reachable. It does not protect a token holder and it is not a substitute for
+the token; it closes the one path where the browser, not the attacker, supplies
+the authority.
+
+An absent `Host` is allowed (HTTP/1.0 and some local clients omit it, and a
+missing name is not one an attacker can choose). `--host 0.0.0.0` accepts only
+the loopback names, so reaching a LAN bind by IP needs that address in
+`--allow-host`. A proxy in front must pass a name the server knows: see the
+deployment section.
+
 ### Why POST needs the token even on localhost
 
 Loopback is not a trust boundary. Any local process can connect: a browser
@@ -578,10 +626,20 @@ agents.example.com {
 
 `caddy` gets a certificate for its own name and forwards `Authorization` and
 `Cookie` unchanged, so the token is still checked by this server, now over TLS.
-nginx is the same idea: `proxy_pass http://127.0.0.1:7788;` and let it own the
-certificate. Tailscale Serve (`tailscale serve --bg 7788` with the default
-loopback bind) gives the dashboard an HTTPS name inside the tailnet, and
-tailnet membership then decides who reaches it — a network control, not a
+Caddy passes the incoming `Host` through unmodified, so the server has to be
+told that name or the request is a 421:
+
+```bash
+spawn-freebuff-agent gui --serve --allow-host agents.example.com
+```
+
+`--allow-host` is repeatable. The form's `Origin` check keeps working, because
+`Origin` and `Host` are then the same name. nginx is the same idea, with
+`proxy_pass http://127.0.0.1:7788;`, `proxy_set_header Host $http_host;` (its
+default is the upstream's address) and the matching `--allow-host`. Tailscale
+Serve (`tailscale serve --bg 7788` with the default loopback bind) gives the
+dashboard an HTTPS name inside the tailnet — pass that name to `--allow-host` —
+and tailnet membership then decides who reaches it: a network control, not a
 replacement for the token.
 
 Two things a proxy does not fix. The server reads no `X-Forwarded-*` header, so
@@ -602,7 +660,11 @@ actions, `--read-only` 403 and a read-only page with no forms, the cookie path
 confirmation page that changes nothing, the confirm POST's `303` to `/`, and
 the card reading `stopped` afterwards), the gc `303`/one-shot report, the
 bearer POST without a nonce still answering `202`, the refusal of
-`--host 0.0.0.0` without an explicit `--token`, and the ttyd redirect. **Not tested:** TLS or any reverse proxy,
+`--host 0.0.0.0` without an explicit `--token`, the ttyd redirect, the four
+security headers on `200`, `401`, `403`, `404`, `421` and `303`, a foreign
+`Host` answered `421` even without a token, the loopback names and
+`--allow-host` accepted, and `form-action 'self'` with the POST → `303` flow.
+**Not tested:** TLS or any reverse proxy,
 Tailscale, a real LAN client, and the same-site cookie case above. Those
 paragraphs describe the source and the operator's job, not a tested path;
 confirm them with your own proxy before relying on them.
