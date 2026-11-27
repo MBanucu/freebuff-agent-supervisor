@@ -357,6 +357,14 @@ Enter: take over  Esc: back to draft'
 HOURS_PANE='Not enough hours for DeepSeek V4.1 Flash: an hour on it takes 2 hours.
 Choose another model or visit https://freebuff.com/plans.
 Enter: choose another model   Esc: back to draft'
+# The released-session overlay (#121): the model slot is gone, there is no
+# composer behind it, and Enter retries with a model instead of submitting.
+RELEASED_PANE='This session was released. Choose a model to start a new session.
+Enter: retry  Esc: back to draft
+╭──────────────────╮
+│  ▍Add to the current task (/ for commands)
+╰──────────────────╯
+ DeepSeek V4.1 Flash • high · /tmp/x/proj · /model to change · Chat: New chat'
 # The TUI also draws the account's usage in its footer, with no overlay open:
 # that is a footer reading in the hours ledger (#108).
 HOURS_FOOTER_PANE='╭──────────────────╮
