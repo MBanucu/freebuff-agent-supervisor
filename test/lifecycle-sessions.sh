@@ -39,34 +39,53 @@ out=$(bash "$TOOL" --root "$REPO" gc --idle-hours 1 --dry-run)
 check contains "$out" 'would-stop name=test-999 reason=idle'
 check test ! -s "$FAKE_DIR/killed"
 
-# gc: a done session is stopped and evidence appended
+# gc: a done session is stopped and evidence appended, but the cleanup
+# command is opt-in: the default run offers no way to lose the worktree
 printf 'state=done\npr=none\n' >"$WT/.agent-result"
 out=$(bash "$TOOL" --root "$REPO" gc --idle-hours 1)
 check contains "$out" 'stop name=test-999 reason=done'
-check contains "$out" 'cleanup=git worktree remove .worktrees/test-999'
+check test -z "$(printf '%s\n' "$out" | grep 'cleanup=' || true)"
 check grep -qxF 'fb-test-999' "$FAKE_DIR/killed"
 check test -d "$WT"
 check contains "$(cat "$WT/.supervisor.log")" 'reason=done'
+
+# gc: --prune-worktrees prints what it would remove, and removes nothing
+fake_session test-999 "$IDLE_PANE"
+out=$(bash "$TOOL" --root "$REPO" gc --idle-hours 1 --prune-worktrees --dry-run)
+check contains "$out" 'would-stop name=test-999 reason=done'
+check contains "$out" 'would-prune name=test-999 cleanup=git worktree remove .worktrees/test-999'
+check test -d "$WT"
 rm -f "$WT/.agent-result"
 
-# gc: orphan session needs --all
+# gc: a refused session is stopped, but its worktree is never offered for
+# pruning: the branch was never pushed and may hold the only copy of the work
+printf 'concurrent-session limit\n' >"$WT/.refusal"
+fake_session test-999 "$IDLE_PANE"
+out=$(bash "$TOOL" --root "$REPO" gc --idle-hours 1 --prune-worktrees)
+check contains "$out" 'stop name=test-999 reason=refused'
+check test -z "$(printf '%s\n' "$out" | grep 'cleanup=' || true)"
+check test -d "$WT"
+check test ! -f "$WT/.refusal"
+
+# gc: a session whose worktree is gone only holds a slot, so plain gc stops
+# it; --all is no longer needed to free a merged run
 printf 'fb-ghost\n' >"$FAKE_DIR/session"
 printf 'Enter a coding task\n' >"$FAKE_DIR/pane"
 printf '%s\n' "$(date +%s)" >"$FAKE_DIR/activity"
 : >"$FAKE_DIR/killed"
 out=$(bash "$TOOL" --root "$REPO" gc --idle-hours 1 --dry-run)
-check contains "$out" 'skip name=ghost reason=orphan (use --all)'
-check test ! -s "$FAKE_DIR/killed"
-
-out=$(bash "$TOOL" --root "$REPO" gc --all --idle-hours 1 --dry-run)
 check contains "$out" 'would-stop name=ghost reason=orphan'
 check test ! -s "$FAKE_DIR/killed"
 
-out=$(bash "$TOOL" --root "$REPO" gc --all --idle-hours 1)
+out=$(bash "$TOOL" --root "$REPO" gc --idle-hours 1)
 check contains "$out" 'stop name=ghost reason=orphan'
 check grep -qxF 'fb-ghost' "$FAKE_DIR/killed"
 check test -f "$REPO/.worktrees/.orphans.log"
 check contains "$(cat "$REPO/.worktrees/.orphans.log")" 'reason=orphan'
+# the old flag still parses
+printf 'fb-ghost\n' >"$FAKE_DIR/session"
+out=$(bash "$TOOL" --root "$REPO" gc --all --idle-hours 1 --dry-run)
+check contains "$out" 'would-stop name=ghost reason=orphan'
 
 
 # ---- session inventory (#11) ----
@@ -234,7 +253,9 @@ printf '%s\n' "$REFUSED_PANE" >"$FAKE_DIR/pane"
 : >"$FAKE_DIR/sent"
 if launch_brief test-refuse-slot 1018 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
 check test "$rc" -ne 0
-check contains "$(cat "$TMP/start.out")" 'holding_slot=test-999'
+# ghost has no worktree, so no result file is left to prove its run over;
+# its slot is still dead weight and the refusal must name it too (#122)
+check contains "$(cat "$TMP/start.out")" 'holding_slot=test-999,ghost'
 check contains "$(cat "$TMP/start.out")" 'gc'
 check test "$(printf '%s\n' "$(cat "$TMP/start.out")" | grep -c 'holding_slot=' || true)" = 1
 

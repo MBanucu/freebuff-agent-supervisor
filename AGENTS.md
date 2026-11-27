@@ -48,7 +48,8 @@ Run both suites before you commit:
 - Never delete a worktree or a branch. `stop`, autostop and `gc` only kill
   `fb-*` tmux sessions; the branch and `.worktrees/<name>` stay for review.
 - Cleanup is the maintainer's explicit `git worktree remove` and
-  `git branch -d`, which `gc` prints, not something the tool runs.
+  `git branch -d`. `gc --prune-worktrees` prints them; the tool never runs
+  them, and a `refused` launch is never offered for pruning.
 - Do not commit generated state: `.task.md`, `.agent-result`,
   `local.properties`, `.worktrees/`, `.supervisor.log`,
   `.supervisor-briefs.jsonl` or `.supervisor-hours`.
