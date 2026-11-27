@@ -7,9 +7,15 @@ change.
 
 ## The shipped artifact
 
-- `spawn-freebuff-agent` is the whole tool: one bash file, no build step.
-- Keep it one file. It must not `source` anything it does not ship, and it may
-  not gain a runtime dependency, a JSON helper or `jq`.
+- `spawn-freebuff-agent` is the whole tool: one bash file, nothing to install
+  beside it and no build step at install time.
+- **Edit `src/`, not the artifact.** The artifact is generated: the
+  `src/NN-area.sh` parts concatenated by `./build.sh` in the order that file
+  lists. Run `./build.sh` after a change and commit the result;
+  `./build.sh --check` fails on a stale artifact, and CI runs it before the
+  suite. A new part goes into `PARTS` in `build.sh`.
+- Keep it one file: it must not `source` a part or anything else it does not
+  ship, and it may not gain a runtime dependency, a JSON helper or `jq`.
 - The tests are not shipped, so `test/lib.sh` may be shared by both suites.
 - Runtime needs are bash, git, tmux and Freebuff. `python3` is optional and
   only for `gui --serve`; `gh` enriches output but must not be required.

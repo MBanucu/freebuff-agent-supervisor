@@ -30,5 +30,10 @@ jobs:
           chmod +x "$RUNNER_TEMP/bin/freebuff"
           printf '%s\n' "$RUNNER_TEMP/bin" >>"$GITHUB_PATH"
 
+      # The shipped file is generated from src/ (#139). A stale artifact would
+      # ship code the suite never built, so the build is checked before it runs.
+      - name: Check the artifact is what src/ builds
+        run: ./build.sh --check
+
       - name: Run the deviceless suite
         run: ./spawn-freebuff-agent-test.sh

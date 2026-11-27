@@ -13,7 +13,7 @@ HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd) || exit 1
 # shellcheck source=test/lib.sh
 . "$HERE/test/lib.sh"
 
-for area in cli-json snapshot-gui state-evidence lifecycle-sessions \
+for area in build-sync cli-json snapshot-gui state-evidence lifecycle-sessions \
     brief-refusals readiness-submission wait-actions hours model-choice; do
     # shellcheck source=/dev/null
     . "$HERE/test/$area.sh"

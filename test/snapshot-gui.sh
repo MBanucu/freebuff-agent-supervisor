@@ -70,7 +70,17 @@ check test "$(printf '%s' "$SNAP" | grep -cE '(href|src)="https?://')" = 0
 bash "$TOOL" --root "$REPO" gui --snapshot "$TMP/watch.html" --no-gh \
     --watch 1 >"$TMP/gui-watch.out" 2>&1 &
 guipid=$!
-sleep 1.2
+# The watcher writes on its first pass. A fixed 1.2 s assumed that pass had
+# finished, which raced a loaded machine and failed the three checks below; the
+# wait is a bounded poll for the file, not a longer sleep, so the checks still
+# run against what the watcher produced.
+waited=0
+while [ "$waited" -lt 60 ]; do
+    [ -s "$TMP/watch.html" ] &&
+        grep -q 'http-equiv="refresh"' "$TMP/watch.html" && break
+    waited=$((waited + 1))
+    sleep 0.1
+done
 check test -f "$TMP/watch.html"
 check contains "$(cat "$TMP/watch.html")" 'http-equiv="refresh" content="1"'
 check contains "$(cat "$TMP/gui-watch.out")" 'watch_seconds=1'

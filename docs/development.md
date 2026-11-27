@@ -12,7 +12,9 @@ starts a real agent.
 
 | Path | What lives there |
 | --- | --- |
-| `spawn-freebuff-agent` | The whole shipped tool, in one bash file: `usage()` at the top, shared helpers, one function per subcommand (`start`, `status`, `sessions`, `hours`, `notify`, `gui`, `stop`, ...), and the subcommand dispatch at the bottom. |
+| `spawn-freebuff-agent` | The whole shipped tool, in one bash file: `usage()` at the top, shared helpers, one function per subcommand (`start`, `status`, `sessions`, `hours`, `models`, `notify`, `gui`, `stop`, ...), and the subcommand dispatch at the bottom. It is **generated** — edit `src/` and run `./build.sh`. |
+| `src/` | The source of truth, one part per area, in the order `build.sh` concatenates them: `00-head.sh` (shebang, the function map, constants), `10-argv.sh`, `20-discovery.sh`, `30-preflight.sh`, `40-wakelock.sh`, `50-refusal.sh`, `60-json.sh`, `70-evidence.sh`, `75-brief.sh`, `78-picker.sh`, `80-mirror.sh`, `85-start.sh`, `88-views.sh`, `90-watch.sh`, `92-gui.sh`, `94-send.sh`, `99-dispatch.sh`. |
+| `build.sh` | Concatenates `src/` into the artifact and checks it: `--check` fails when the shipped file is stale, `--out FILE` builds elsewhere. Bash only; the order of parts is the `PARTS` array. |
 | `spawn-freebuff-agent-test.sh` | The deviceless runner. Sources `test/lib.sh`, then each area file in order, and prints `ok N checks`. |
 | `test/lib.sh` | The shared harness: temporary git repo, fake tmux/stty/freebuff, pane fixtures, `check`/`contains`/`json_ok`, and the cleanup trap. |
 | `test/cli-json.sh` | Area: the CLI surface, the git exclude list, `--json` output and the remaining flags. |
@@ -23,6 +25,8 @@ starts a real agent.
 | `test/readiness-submission.sh` | Area: the readiness deadline and proof that the brief was submitted. |
 | `test/wait-actions.sh` | Area: `gui --serve` — the read-only server, the POST actions and the ttyd route. |
 | `test/hours.sh` | Area: the remaining hour budget read from a live pane. |
+| `test/model-choice.sh` | Area: the `/model` picker — `start --model`, its scroll search, and `models`. |
+| `test/build-sync.sh` | Area: the artifact is what `src/` builds, and the check fails when it is stale. |
 | `gui-test.sh` | The second suite: curl checks for `gui/server.py`. It reuses `test/lib.sh` and prints `ok N gui checks`. |
 | `gui/server.py` | The HTTP server for `gui --serve`, python3 standard library only. It shells out to the CLI, which stays the single source of state. |
 | `docs/freebuff-integration.md` | Research roadmap for MCP, hooks and completion notifications. Nothing in it is implemented. |
@@ -36,17 +40,20 @@ committed.
 
 ## How to add a subcommand
 
-The tool is one file, so a subcommand touches four places:
+The tool is one shipped file built from `src/`, so a subcommand touches four
+places:
 
 1. **The function.** Add `cmdname() { ... }` beside the related functions in
-   `spawn-freebuff-agent`. Parse flags with the same `while [ $# -gt 0 ]` /
+   the part that owns the area (`src/85-start.sh`, `src/88-views.sh`,
+   `src/94-send.sh`, ...), then run `./build.sh`. Parse flags with the same `while [ $# -gt 0 ]` /
    `case` shape as its neighbours, reject unknown flags with `die`, and keep
    the output plain `key=value` lines. `--json`, when present, is additive and
    must not change the human output.
 2. **The usage text.** Add a block to `usage()` inside its `cat <<'USAGE'`
    here-doc: the command line and every option, including defaults. `--help`
    is the only documentation a user sees without the README.
-3. **The dispatch.** Add a case to the final `case "$cmd" in` block, for
+3. **The dispatch.** Add a case to the final `case "$cmd" in` block in
+   `src/99-dispatch.sh`, for
    example `cmdname) cmdname "$@" ;;`. Existing aliases show the pattern
    (`list|ls`, `sessions|ps`); add one only when it helps.
 4. **The tests and the README.** Add checks to the area file that owns the
