@@ -222,6 +222,16 @@ to the pane when there is no chat directory. It is an internal debug format,
 not a contract, so the pane and `.agent-result` remain the fallback and the
 authority.
 
+`notify NAME` turns the same log into a one-shot event for a watcher: it reads
+from a cursor stored in the worktree (`<worktree>/.turn-log-cursor`) and
+advances it, so each turn ends as `event=turn-end` with
+`turn_state=finished|failed` and `turn_outcome=lastMessage|error` exactly once.
+The first call arms the cursor at the current end of the log instead of
+replaying history, a half-written final line waits for the next poll, and a
+missing chat directory or `log.jsonl` prints `reason=no-turn-log` and exits 2.
+Nothing is sent, stopped or waited on; completion is still the result file's
+call.
+
 The marker vocabulary, captured from 0.2.38, how the classifier orders it,
 the `unknown` fallback for a pane none of them claims, and the unverified
 approval chrome are in
@@ -260,6 +270,7 @@ spawn-freebuff-agent attach 103-example   # detach with Ctrl-b d
 spawn-freebuff-agent send 103-example "Also run the new test"
 spawn-freebuff-agent watch 103-example --idle-seconds 120 --poll 5
 spawn-freebuff-agent autostop 103-example
+spawn-freebuff-agent notify 103-example
 spawn-freebuff-agent stop 103-example            # hard kill
 spawn-freebuff-agent stop 103-example --graceful # end the turn first
 spawn-freebuff-agent gc --dry-run
