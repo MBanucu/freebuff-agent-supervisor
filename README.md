@@ -271,6 +271,8 @@ approval chrome are in
 state=done                  # from .agent-result
 watcher=pid:123             # autostop watcher: pid:N, dead or -
 wake_lock=acquired          # recorded at start; absent without --wake-lock
+model=DeepSeek V4.1 Flash Fast hours=free   # recorded at start; absent
+                            # without --model
 session_state=done          # live: done, blocked, failed, idle, working, refused,
                             #       unknown or missing
 ```
@@ -294,6 +296,7 @@ spawn-freebuff-agent status 103-example --source log
 spawn-freebuff-agent status 103-example --source auto
 spawn-freebuff-agent hours                 # any live fb-* session
 spawn-freebuff-agent hours --json
+spawn-freebuff-agent models --free         # entries that spend no hours
 spawn-freebuff-agent attach 103-example   # detach with Ctrl-b d
 spawn-freebuff-agent send 103-example "Also run the new test"
 spawn-freebuff-agent watch 103-example --idle-seconds 120 --poll 5
@@ -316,7 +319,9 @@ or 4). `start --auto-stop` runs it detached.
 `list` prints the branch, session, running flag, live state and idle time.
 `status` prints the result state, the autostop `watcher`, `session_state`, idle
 seconds, the pane tail, the last commit, whether the worktree is dirty, and any
-open PR for the branch. It also prints `hours=N/M`, the account usage the TUI
+open PR for the branch. A run launched with `--model` also prints
+`model=<name> hours=<free|Nx|paid|daily>`, the choice `start` recorded, and
+omits the line when the run chose none. It also prints `hours=N/M`, the account usage the TUI
 draws, from a live pane when there is one. When the pane carries no fraction,
 the last line of `.supervisor-hours` is used and labelled `age=47m`; a repo
 with no history prints `hours=-` instead of dressing a guess as a reading.
@@ -344,18 +349,23 @@ the arrow keys scroll the rest into view), closes it with Escape and prints one
 `models=<count> session=fb-X`. `hours=free` means the entry carries no hour
 multiplier, so a session on that model spends none of the daily budget; `paid`
 is a Paid plan and `daily` a sessions-per-day cap, which are different costs
-and are not reported as free. Nothing is submitted, so listing spends no
-hours. A session that is working or refused gets no keys at all, and a repo
-with no live session prints `model=none` and exits 1. `--json` emits
+and are not reported as free. `--free` keeps only the `free` rows and counts
+what it printed, so it is the shortlist a launch should pick from when the
+account's hours are short. Nothing is submitted, so listing spends no hours. A
+session that is working or refused gets no keys at all, and a repo with no
+live session prints `model=none` and exits 1. `--json` emits
 `{session, count, models: [{name, hours, price}]}`.
 
 `sessions` is the inventory: one row per `fb-*` session **and** per worktree,
 with `WORKTREE yes|missing`, the attached `autostop` watcher (`pid:N`, `dead`
 or `-`; the pid is the one `start --auto-stop` wrote to
-`.supervisor.log`), the result state, the branch, the open PR, the WAKE
-column (`acquired`, `unavailable`, `failed` or `-` for a run that did not ask
-for the lock) and the HOURS column (`N/M` for a reading made this run,
-`N/M age=47m` for the `.supervisor-hours` ledger, `-` with neither). It
+`.supervisor.log`), the result state, the branch, the open PR, the MODEL
+column (`Name (free)`, `Name (2x)`, `Name (paid)`, `Name (daily)` or `-` for a
+run that chose none), the WAKE column (`acquired`, `unavailable`, `failed` or
+`-` for a run that did not ask for the lock) and the HOURS column (`N/M` for a
+reading made this run, `N/M age=47m` for the `.supervisor-hours` ledger, `-`
+with neither). A mixed pool is therefore auditable from one table, instead of
+by grepping each worktree's log. It
 starts from `tmux list-sessions`, so a session with no worktree appears there
 instead of only being found when `gc` kills it; `list` also names such
 orphans.

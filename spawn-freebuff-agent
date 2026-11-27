@@ -50,8 +50,8 @@
 #     refuse_sent_brief, compose_brief, brief_jitter_max
 #   the model picker:
 #     model_norm, picker_frame, picker_entries, picker_names, picker_selected,
-#     picker_price, model_hours_cost, model_footer, model_resolve, picker_wait,
-#     model_choose
+#     picker_price, model_hours_cost, model_state, model_footer, model_resolve,
+#     picker_wait, model_choose
 #   the issue mirror:
 #     gh_state_color, gh_state
 #   start:
@@ -281,7 +281,9 @@ Spawn parallel Freebuff agents in isolated git worktrees.
   spawn-freebuff-agent status NAME [--lines N] [--no-gh] [--json] [--explain]
                               [--source pane|log|auto] [--window N]
       Show the session, input mode, result state, pane tail, branch, last
-      commit and PR. hours=N/M is this run's reading of the account usage;
+      commit and PR. model=<name> hours=<free|Nx|paid|daily> is the model
+      the run was launched with, absent when it chose none. hours=N/M is
+      this run's reading of the account usage;
       when the pane carries none, the last ledger line is shown with its age
       (hours=N/M age=47m), and no history at all is hours=-.
       --lines N   pane lines to show (default: 25)
@@ -304,12 +306,13 @@ Spawn parallel Freebuff agents in isolated git worktrees.
   spawn-freebuff-agent sessions [--no-gh] [--json]
       One table over every fb-* session and every worktree: live state, idle
       time, attached autostop watcher, whether a worktree exists, the result
-      state, the branch, the open PR, the wake lock recorded at start and the
-      last account hours reading (N/M for a live read, N/M age=47m for the
-      .supervisor-hours ledger, - when there is neither).
+      state, the branch, the open PR, the model the run was launched with
+      (`Name (free)`, `Name (2x)` or -), the wake lock recorded at start and
+      the last account hours reading (N/M for a live read, N/M age=47m for
+      the .supervisor-hours ledger, - when there is neither).
       Sessions with no worktree are listed here instead of only being
       reapable by plain gc. --json emits the same rows as an array of
-      objects.
+      objects, with the model as its own object ({name, hours}).
 
   spawn-freebuff-agent hours [NAME] [--json]
       Read the remaining Freebuff hour budget from a live pane: the welcome
@@ -320,7 +323,7 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       --json      emit the same fields as one JSON object
       Prints hours=unknown and exits 2 when no live pane can be read.
 
-  spawn-freebuff-agent models [NAME] [--json]
+  spawn-freebuff-agent models [NAME] [--free] [--json]
       List the models the client offers, read from a live session's /model
       picker: one `model=<name> hours=<free|2x|paid|daily>` line each, where
       `free` means the entry carries no hour multiplier, so a session on it
@@ -331,12 +334,16 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       submitted, so listing spends no hours. NAME defaults to any live fb-*
       session. Prints model=none and exits 1 when there is no live session,
       and refuses to type into a working or refused one.
+      --free      only the entries that carry no hour multiplier: the list a
+                  launch should pick from when the account's hours are short
       --json      emit the same rows as one JSON object
 
   spawn-freebuff-agent gui --snapshot FILE [--watch N] [--no-gh]
       Write one self-contained HTML page from `sessions --json`: one card
-      per session with done-versus-working visible at a glance. No server,
-      no script, no external assets, so it opens from file:// offline.
+      per session with done-versus-working visible at a glance and the model
+      it was launched with, with its cost class, beside the hours reading.
+      No server, no script, no external assets, so it opens from file://
+      offline.
       --watch N   rewrite the file every N seconds (adds a meta refresh)
       --no-gh     do not ask gh for the PR
 
@@ -439,9 +446,10 @@ Notes:
     types /model, moves the `›` marker with the arrow keys the frame prints,
     and presses Enter only once that marker sits on the chosen name. The
     footer must then name the model, or the launch fails with no brief sent
-    and the session stopped. The switch writes the client's global model
-    setting, so two launches that want different models must not run at the
-    same moment.
+    and the session stopped. The choice and its cost class are recorded in
+    .supervisor.log, and status, sessions and the GUI card report them. The
+    switch writes the client's global model setting, so two launches that
+    want different models must not run at the same moment.
   - A ready pane can still swallow the Enter. After typing, start waits for
     the input line to clear and for the turn to begin (or the chat title to
     change) and prints sent=yes with the signal that proved it. A send that
@@ -2118,6 +2126,24 @@ model_hours_cost() {
     printf 'free'
 }
 
+model_state() {
+    # model_state WORKTREE -> `NAME<TAB>HOURS` for the model start recorded in
+    # .supervisor.log, empty when the run chose none. The line is the one
+    # `--model` writes once the footer named the choice,
+    # `model=<name> price=<free|Nx|paid|daily>`; a `model=no want=...` line is
+    # a launch that sent no brief, not a choice, so it is not read here. The
+    # name itself carries spaces, which is why the two values are separated
+    # by a tab instead of by the line's own spaces.
+    local wt=$1 line name hours
+    line=$(grep -E ' model=.+ price=[^ ]+' "$wt/.supervisor.log" 2>/dev/null |
+        tail -n 1 || true)
+    [ -n "$line" ] || return 0
+    name=$(printf '%s\n' "$line" | sed -E 's/^.* model=(.*) price=[^ ]+.*$/\1/')
+    hours=$(printf '%s\n' "$line" | sed -E 's/^.* price=([^ ]+).*$/\1/')
+    [ -n "$name" ] || return 0
+    printf '%s\t%s' "$name" "$hours"
+}
+
 model_footer() {
     # model_footer PANE -> the model name the resting footer draws, such as
     # `DeepSeek V4.1 Flash Fast` in `... • high · /model to change`. The line
@@ -2889,7 +2915,7 @@ status() {
 
     local wt="$ROOT/.worktrees/$name" branch session tmux running=0 tty mode=unknown stty out
     local state rstate="" pane="" idle="" sstate="" last_commit dirty=no watcher=""
-    local wake_lock="" hours=""
+    local wake_lock="" hours="" model model_name="" model_hours=""
     local result_pr="" result_commit="" result_tests="" prs="" pr_json=null
     local evidence="" ev_rule="" ev_matched="" ev_lines="" ev_sha="" ev_scans="" ev_source=""
     local turn_evidence="" tstate="" tout="" turn_log=""
@@ -2921,10 +2947,17 @@ status() {
     [ -n "$state" ] || state=unknown
     watcher=$(watcher_state "$wt")
     wake_lock=$(wake_lock_state "$wt")
+    # The model is what start recorded at launch, the same evidence the wake
+    # lock is: a run that chose none has no line and prints no field (#136).
+    model=$(model_state "$wt")
+    model_name=${model%%$'\t'*}
+    model_hours=${model#*$'\t'}
     if [ "$json" = 0 ]; then
         printf 'state=%s\n' "$state"
         printf 'watcher=%s\n' "$watcher"
         [ -z "$wake_lock" ] || printf 'wake_lock=%s\n' "$wake_lock"
+        [ -z "$model_name" ] ||
+            printf 'model=%s hours=%s\n' "$model_name" "$model_hours"
     fi
     if [ -f "$wt/$RESULT_FILE" ]; then
         rstate=$state
@@ -3093,6 +3126,10 @@ status() {
     printf '  "idle_seconds": %s,\n' "$(json_nullable_num "$idle")"
     printf '  "watcher": %s,\n' "$(json_nullable_str "$watcher")"
     printf '  "wake_lock": %s,\n' "$(json_nullable_str "$wake_lock")"
+    printf '  "model": {\n'
+    printf '    "name": %s,\n' "$(json_nullable_str "$model_name")"
+    printf '    "hours": %s\n' "$(json_nullable_str "$model_hours")"
+    printf '  },\n'
     printf '  "hours": {\n'
     printf '    "value": %s,\n' "$(json_nullable_str "$HOURS_VALUE")"
     printf '    "age_seconds": %s,\n' "$(json_nullable_num "$HOURS_AGE")"
@@ -3238,7 +3275,7 @@ sessions() {
     # serialization of the same rows: one array of objects, `[]` when empty.
     local no_gh=0 json=0 name wt worktree running state idle activity now idle_secs
     local watcher wake_lock result branch pr prs="" slug="" tmux total=0 live=0 trees=0
-    local pane hours
+    local pane hours model model_name model_hours model_show
     local finished=no finished_count=0
     local names=() x first=1
     while [ $# -gt 0 ]; do
@@ -3289,11 +3326,11 @@ sessions() {
     if [ "$json" = 1 ]; then
         printf '[\n'
     elif [ -n "$prs" ]; then
-        printf '%-22s %-9s %-8s %-9s %-9s %-9s %-24s %-40s %s %s\n' \
-            NAME STATE IDLE WATCHER WORKTREE RESULT BRANCH PR WAKE HOURS
+        printf '%-22s %-9s %-8s %-9s %-9s %-9s %-24s %-40s %-32s %s %s\n' \
+            NAME STATE IDLE WATCHER WORKTREE RESULT BRANCH PR MODEL WAKE HOURS
     else
-        printf '%-22s %-9s %-8s %-9s %-9s %-9s %-40s %s %s\n' \
-            NAME STATE IDLE WATCHER WORKTREE RESULT BRANCH WAKE HOURS
+        printf '%-22s %-9s %-8s %-9s %-9s %-9s %-40s %-32s %s %s\n' \
+            NAME STATE IDLE WATCHER WORKTREE RESULT BRANCH MODEL WAKE HOURS
     fi
 
     for name in "${names[@]}"; do
@@ -3304,6 +3341,9 @@ sessions() {
         wake_lock=""
         pane=""
         hours=""
+        model_name=""
+        model_hours=""
+        model_show=-
         if [ -d "$wt" ]; then
             worktree=yes
             trees=$((trees + 1))
@@ -3312,6 +3352,12 @@ sessions() {
             [ -n "$result" ] || result=-
             watcher=$(watcher_state "$wt")
             wake_lock=$(wake_lock_state "$wt")
+            # The model start recorded, with its cost class, so a mixed pool
+            # can be read straight from the table (#136).
+            model=$(model_state "$wt")
+            model_name=${model%%$'\t'*}
+            model_hours=${model#*$'\t'}
+            [ -z "$model_name" ] || model_show="$model_name ($model_hours)"
         else
             worktree=missing
             branch=-
@@ -3382,6 +3428,10 @@ sessions() {
             fi
             printf '    "watcher": %s,\n' "$(json_nullable_str "$watcher")"
             printf '    "wake_lock": %s,\n' "$(json_nullable_str "$wake_lock")"
+            printf '    "model": {\n'
+            printf '      "name": %s,\n' "$(json_nullable_str "$model_name")"
+            printf '      "hours": %s\n' "$(json_nullable_str "$model_hours")"
+            printf '    },\n'
             printf '    "worktree": %s,\n' "$(json_str "$worktree")"
             printf '    "result": %s,\n' "$(json_nullable_str "$result")"
             printf '    "branch": %s,\n' "$(json_nullable_str "$branch")"
@@ -3394,13 +3444,13 @@ sessions() {
             printf '  }'
         elif [ -n "$prs" ] && [ "$branch" != '-' ]; then
             [ -n "$pr" ] || pr=-
-            printf '%-22s %-9s %-8s %-9s %-9s %-9s %-24s %-40s %s %s\n' \
+            printf '%-22s %-9s %-8s %-9s %-9s %-9s %-24s %-40s %-32s %s %s\n' \
                 "$name" "$state" "$idle" "$watcher" "$worktree" "$result" \
-                "$branch" "$pr" "${wake_lock:--}" "$hours"
+                "$branch" "$pr" "$model_show" "${wake_lock:--}" "$hours"
         else
-            printf '%-22s %-9s %-8s %-9s %-9s %-9s %-40s %s %s\n' \
+            printf '%-22s %-9s %-8s %-9s %-9s %-9s %-40s %-32s %s %s\n' \
                 "$name" "$state" "$idle" "$watcher" "$worktree" "$result" \
-                "$branch" "${wake_lock:--}" "$hours"
+                "$branch" "$model_show" "${wake_lock:--}" "$hours"
         fi
     done
 
@@ -3489,11 +3539,12 @@ models() {
     # the session as it was. Nothing is submitted, so the walk spends no
     # hours. Only a resting session is touched: a turn in flight or a refused
     # session gets no keys at all.
-    local name="" json=0 tmux="" session="" wt="" pane="" opened=0
+    local name="" json=0 tmux="" session="" wt="" pane="" opened=0 free_only=0
     local listed="" rows="" n pr sel step=0 count=0 first=1
     while [ $# -gt 0 ]; do
         case "$1" in
             --json) json=1; shift ;;
+            --free) free_only=1; shift ;;
             -h|--help) usage; exit 0 ;;
             -*) die "models: unsupported argument: $1" ;;
             *)
@@ -3562,6 +3613,17 @@ models() {
     # exactly as it was found; one that was already open is left open.
     if [ "$opened" = 1 ]; then
         "$tmux" send-keys -t "$session" Escape 2>/dev/null || true
+    fi
+    # --free is the shortlist a launch picks from when hours are short: the
+    # entries whose price line carries no hour multiplier. The count follows
+    # the filter, so `models=N` is the number of rows printed.
+    if [ "$free_only" = 1 ]; then
+        rows=$(printf '%s\n' "$rows" | while IFS=$'\t' read -r n pr; do
+            [ -n "$n" ] || continue
+            [ "$(model_hours_cost "$pr")" = free ] || continue
+            printf '%s\t%s\n' "$n" "$pr"
+        done || true)
+        count=$(printf '%s\n' "$rows" | grep -c . || true)
     fi
     if [ "$json" = 1 ]; then
         printf '{\n  "session": %s,\n  "count": %s,\n  "models": [\n' \
@@ -3922,6 +3984,7 @@ snapshot_html() {
     local file="$1" json="$2" watch="$3" link_prefix=${4:-} note_text=${5:-}
     local form_nonce=${6:-} flash_text=${7:-}
     local line key value name state idle watcher worktree result branch pr
+    local model_name model_hours in_model=0
     local tests="" commit="" wt generated total=0 live=0 trees=0 cards='' card
     local cls pr_html refresh='' css_file
     css_file=$(stylesheet_file)
@@ -3936,7 +3999,7 @@ snapshot_html() {
         case "$line" in
             '  {'*)
                 name='' state='' idle='' watcher='' worktree='' result=''
-                branch='' pr=''
+                branch='' pr='' model_name='' model_hours='' in_model=0
                 continue
                 ;;
             '  }'*)
@@ -3972,6 +4035,13 @@ snapshot_html() {
                 card+="<dt>worktree</dt><dd>$(html_escape "$worktree")</dd>"$'\n'
                 card+="<dt>result</dt><dd>$(html_escape "${result:--}")</dd>"$'\n'
                 card+="<dt>branch</dt><dd><code>$(html_escape "${branch:--}")</code></dd>"$'\n'
+                # The model and its cost class are one row, so `free` and
+                # `2x` are visible at a glance next to the hours reading (#136).
+                if [ -n "$model_name" ]; then
+                    card+="<dt>model</dt><dd>$(html_escape "$model_name")"
+                    card+=" <span class=\"tag\">"
+                    card+="$(html_escape "$model_hours")</span></dd>"$'\n'
+                fi
                 # A terminal link exists only for a served page with ttyd
                 # behind it, and only for a name the tool accepts.
                 if [ -n "$link_prefix" ] && [ "$worktree" = yes ] &&
@@ -4018,6 +4088,31 @@ snapshot_html() {
                 fi
                 card+='</article>'$'\n'
                 cards+=$card
+                continue
+                ;;
+            '    "model": {'*)
+                in_model=1
+                continue
+                ;;
+            # The model object is the only nested one the card reads; its
+            # closing brace ends the read so the account hours object below it
+            # is not mistaken for the model's own hours.
+            '    }'*)
+                in_model=0
+                continue
+                ;;
+            '      "name": '*)
+                [ "$in_model" = 1 ] || continue
+                value=${line#*: }
+                value=${value%,}
+                model_name=$(json_scalar "$value")
+                continue
+                ;;
+            '      "hours": '*)
+                [ "$in_model" = 1 ] || continue
+                value=${line#*: }
+                value=${value%,}
+                model_hours=$(json_scalar "$value")
                 continue
                 ;;
             '    "'*) ;;

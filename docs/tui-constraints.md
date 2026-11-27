@@ -63,7 +63,9 @@ is not absent: the frame holds one page, the arrow keys scroll the list, so the
 search walks down to the end and back before it reports a name missing. The
 same walk is what `models` lists from. The confirmed name and its
 price line are recorded as `model=<name> price=<free|Nx|paid|daily>` in
-`.supervisor.log`; a choice that cannot be made or confirmed stops the session
+`.supervisor.log`, and `status`, `sessions` and the GUI card read that line
+back, so a mixed free/paid pool is auditable without opening a log. A choice
+that cannot be made or confirmed stops the session
 with no brief sent and keeps the worktree. Because the selection is a global
 setting, two launches that want different models must be run in sequence.
 

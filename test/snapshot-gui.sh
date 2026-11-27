@@ -24,6 +24,9 @@ check test "$(grep -c '<article' "$TMP/empty.html")" = 0
 # two sessions and one orphan: one done, the others working, one no worktree
 bash "$TOOL" --root "$REPO" start --issue 996 --name test-two \
     --branch test/two --title T --url U --no-start >/dev/null
+# the launch record the card reads for its model and cost class (#136)
+printf '2026-01-01T00:00:00Z model=DeepSeek V4.1 Flash price=2x elapsed=1.1s session=fb-test-two\n' \
+    >"$REPO/.worktrees/test-two/.supervisor.log"
 printf 'state=blocked\npr=https://example.test/pr/18\ncommit=abc1234\ntests=ok <b>&"quoted"</b>\n' \
     >"$WT/.agent-result"
 fake_session test-999 "$BUSY_PANE"
@@ -56,6 +59,10 @@ check test "$(printf '%s' "$done_card" | grep -c '<dt>idle</dt>')" = 0
 live_card=$(printf '%s\n' "$SNAP" | card_of test-two)
 check test -n "$live_card"
 check test "$(printf '%s' "$live_card" | grep -c '<dt>idle</dt>')" = 1
+# the model and its cost class are one row; a run with no model has none
+check contains "$live_card" '<dt>model</dt>'
+check contains "$live_card" 'DeepSeek V4.1 Flash <span class="tag">2x</span>'
+check test "$(printf '%s' "$done_card" | grep -c '<dt>model</dt>')" = 0
 # arbitrary text is escaped, never markup
 check contains "$SNAP" 'ok &lt;b&gt;&amp;&quot;quoted&quot;&lt;/b&gt;'
 check test "$(printf '%s' "$SNAP" | grep -c '<b>')" = 0
