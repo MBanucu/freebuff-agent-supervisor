@@ -102,6 +102,12 @@ REFUSAL_OVERLAY_RE='concurrent-session limit|session limit across CLI and Deskto
 # model picker instead of submitting, and a wait for submission would sit out
 # the whole --submit-timeout over a refusal that was already on screen.
 HOURS_OVERLAY_RE='Not enough hours'
+# Freebuff's trust gate runs in the plain terminal before the TUI mounts: a
+# worktree with .agents/ (or an mcp.json) prints this and waits. The resting
+# prompt cannot appear while it is open, so the readiness wait must name it
+# instead of spending --ready-timeout. It is a user decision about running
+# repository-supplied code; start never answers it.
+TRUST_PROMPT='Load and run these?'
 # A refusal is written here as well as to .supervisor.log. The file is what
 # keeps status at refused after the sentence has scrolled away; stop removes
 # it, so a refusal lasts until the session is explicitly stopped.
@@ -179,6 +185,14 @@ Spawn parallel Freebuff agents in isolated git worktrees.
                          (default: 120); a cold first launch can need more
                          than the old fixed 45s
       --ready-poll N     seconds between readiness checks (default: 0.5)
+      --trust-agents     pass --trust-agents to Freebuff, which loads this
+                         worktree's .agents files and mcp.json without
+                         asking. It trusts repository-supplied code with
+                         your permissions, so it is opt-in and never a
+                         default; the vendor's own help describes it as
+                         "for CI", not a general answer to every prompt.
+                         Without it, a launch that stops at the trust
+                         prompt fails at once and names the directory.
       --submit-timeout N seconds after the Enter to see the turn begin or the
                          chat title change (default: 20); a brief that never
                          proves submission is reported as sent=no and the
@@ -296,6 +310,10 @@ Notes:
   - The TUI needs a 180x55 pane. Smaller panes stay in canonical mode and
     silently ignore the prompt; this tool waits for -icanon before sending,
     re-checking every --ready-poll seconds for up to --ready-timeout.
+  - A worktree that carries .agents/ (or an mcp.json) makes Freebuff print
+    `Load and run these? [y/N]` before the TUI mounts. start stops at once,
+    types nothing and names the directory: answer `y` once in an interactive
+    launch there to record the trust, or rerun start with --trust-agents.
   - A wait that gives up names the timeout it used, prints the last pane
     lines and records elapsed seconds in .supervisor.log, so a slow cold
     launch is distinguishable from a hung TUI.
@@ -1182,12 +1200,14 @@ ready_note() {
 
 wait_ready() {
     # wait_ready TMUX SESSION WORKTREE TIMEOUT POLL -> 0 ready, 2 refused,
-    # 1 did not become ready. A refusal is checked first: the overlay never
-    # draws the resting prompt, and typing into it would take over another
-    # live session instead of starting this one. The wait is a predicate with
-    # a deadline, not a fixed sleep count: it re-checks every POLL seconds
-    # until TIMEOUT has passed, so a warm pane returns on the first check and
-    # a cold launch gets the whole --ready-timeout budget.
+    # 3 trust prompt, 1 did not become ready. A refusal is checked first: the
+    # overlay never draws the resting prompt, and typing into it would take
+    # over another live session instead of starting this one. The trust prompt
+    # is next: it also never reaches the resting prompt, and it is the user's
+    # decision to answer. The wait is a predicate with a deadline, not a fixed
+    # sleep count: it re-checks every POLL seconds until TIMEOUT has passed, so
+    # a warm pane returns on the first check and a cold launch gets the whole
+    # --ready-timeout budget.
     #
     # "Not raw yet" is not the only way a check can fail. If tmux names no tty,
     # or stty cannot run on the tty it named, the predicate can never become
@@ -1216,6 +1236,12 @@ wait_ready() {
         if printf '%s\n' "$pane" | grep -qiE "$REFUSED_RE"; then
             READY_ELAPSED=$(ready_elapsed "$i" "$poll")
             return 2
+        fi
+        if printf '%s\n' "$pane" | grep -qF "$TRUST_PROMPT"; then
+            # The prompt is open and nothing else will be drawn. Return on the
+            # first check; start names the directory and both ways to proceed.
+            READY_ELAPSED=$(ready_elapsed "$i" "$poll")
+            return 3
         fi
         if [ -z "$tty" ]; then
             no_tty=$((no_tty + 1))
@@ -1542,9 +1568,9 @@ start() {
     local sdk_dir="" dry=0 nostart=0 autostop=0 idle=120 poll=5 no_gh=0 no_check=0
     local idle_set=0 poll_set=0 max_sessions=0 wait_slot=0 slot_wait=300
     local ready_timeout="$READY_TIMEOUT" ready_poll="$READY_POLL"
-    local submit_timeout="$SUBMIT_TIMEOUT"
+    local submit_timeout="$SUBMIT_TIMEOUT" trust_agents=0
     local prompt_text="" sent brief_hash_value jitter_max jitter=0
-    local ready_rc=0 submit_rc=0 pane refusal="" title_before
+    local ready_rc=0 submit_rc=0 pane refusal="" title_before trust_dir
     while [ $# -gt 0 ]; do
         case "$1" in
             --issue) issue=${2:-}; shift 2 ;;
@@ -1562,6 +1588,7 @@ start() {
             --poll) poll=${2:-}; poll_set=1; shift 2 ;;
             --ready-timeout) ready_timeout=${2:-}; shift 2 ;;
             --ready-poll) ready_poll=${2:-}; shift 2 ;;
+            --trust-agents) trust_agents=1; shift ;;
             --submit-timeout) submit_timeout=${2:-}; shift 2 ;;
             --max-sessions) max_sessions=${2:-}; shift 2 ;;
             --wait-slot)
@@ -1650,6 +1677,7 @@ start() {
         note "brief_chars=${#sent}"
         [ "$jitter_max" = 0 ] || note "jitter_max=${jitter_max}s"
         note "ready_timeout=${ready_timeout}s ready_poll=${ready_poll}s"
+        note "trust_agents=$([ "$trust_agents" = 1 ] && printf yes || printf no)"
         note "submit_timeout=${submit_timeout}s"
         note "tmux=${FREEBUFF_TMUX:-tmux} -x $COLS -y $ROWS -c $wt"
         if [ "$autostop" = 1 ]; then
@@ -1729,7 +1757,14 @@ start() {
     local tmux fb cmd
     tmux=$(tmux_bin) || die "start: tmux not found; install tmux or set FREEBUFF_TMUX"
     fb=$(freebuff_bin) || die "start: freebuff not found; set FREEBUFF_BIN"
-    printf -v cmd 'TERM=xterm-256color %q --cwd %q --trust-agents' "$fb" "$wt"
+    # Never pass --trust-agents unless asked: it loads repository-supplied
+    # agent files and mcp.json with the user's permissions. A worktree that
+    # needs it says so through the trust prompt, which start reports below.
+    if [ "$trust_agents" = 1 ]; then
+        printf -v cmd 'TERM=xterm-256color %q --cwd %q --trust-agents' "$fb" "$wt"
+    else
+        printf -v cmd 'TERM=xterm-256color %q --cwd %q' "$fb" "$wt"
+    fi
     "$tmux" new-session -d -s "$session" -x "$COLS" -y "$ROWS" -c "$wt" "$cmd"
 
     wait_ready "$tmux" "$session" "$wt" "$ready_timeout" "$ready_poll" || ready_rc=$?
@@ -1747,6 +1782,28 @@ start() {
         note "refusal=$refusal"
         note 'sent=no'
         die "start: Freebuff refused the launch before the brief was sent: $refusal (no keys typed; worktree kept at $wt)"
+    fi
+    if [ "$ready_rc" -eq 3 ]; then
+        # The trust gate is a user decision about repository-supplied code.
+        # Nothing is answered: name the directory and both ways to proceed,
+        # then stop the session so it cannot sit on the prompt forever.
+        pane=$("$tmux" capture-pane -p -t "$session" -S -15 2>/dev/null || true)
+        trust_dir="$wt/.agents"
+        if [ ! -d "$trust_dir" ] && [ -d "$ROOT/.worktrees/.agents" ]; then
+            trust_dir="$ROOT/.worktrees/.agents"
+        fi
+        "$tmux" kill-session -t "$session" 2>/dev/null || true
+        ready_note "$wt" "ready=trust-prompt elapsed=${READY_ELAPSED}s timeout=${ready_timeout}s poll=${ready_poll}s session=$session dir=$trust_dir"
+        note "session=$session"
+        note 'trust_prompt=yes'
+        note "trust_dir=$trust_dir"
+        note 'sent=no'
+        printf '%s\n' '--- pane lines the check read ---'
+        printf '%s\n' "$pane"
+        if [ "$trust_agents" = 1 ]; then
+            die "start: Freebuff stopped at its trust prompt for $trust_dir in $session even though --trust-agents was passed; it did not load repository-supplied agent files. No key was typed; stopped it, worktree kept ($wt)."
+        fi
+        die "start: Freebuff stopped at its trust prompt for $trust_dir in $session: it loads repository-supplied .agents files and mcp.json only after that directory is trusted. Answer y once in an interactive launch in $wt (freebuff --cwd $wt), or rerun start with --trust-agents to load it without asking. No key was typed; stopped it, worktree kept ($wt)."
     fi
     if [ "$ready_rc" -ne 0 ]; then
         printf '%s\n' '--- last pane lines ---'
