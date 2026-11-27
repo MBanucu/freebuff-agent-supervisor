@@ -24,6 +24,11 @@ TMP=$(mktemp -d) || exit 1
 REPO="$TMP/repo"
 FAKE_DIR="$TMP/fake"
 WT="$REPO/.worktrees/test-999"
+# The turn-log source reads <config>/projects/<name>/chats. Point it at the
+# temp tree so a suite never reads the real ~/.config/manicode, and so a
+# fixture chat directory is one mkdir away.
+export FREEBUFF_CONFIG_DIR="$TMP/freebuff-config"
+mkdir -p "$FREEBUFF_CONFIG_DIR"
 
 _cleanup() {
     local rc=$?
