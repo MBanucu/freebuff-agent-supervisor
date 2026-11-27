@@ -131,8 +131,8 @@ case "${1:-}" in
         case "$fmt" in
             *pane_tty*)
                 # Opt-in: ready_after N makes the pane report no tty for N
-                # checks, so a cold launch can be simulated as a poll count
-                # instead of a real 45-second wait.
+                # checks, so a tmux that cannot name its pane tty is
+                # simulated as a poll count instead of a real wait.
                 if [ -f "$d/ready_after" ]; then
                     left=$(cat "$d/ready_after" 2>/dev/null || printf '0')
                     if [ "$left" -gt 0 ]; then
@@ -209,9 +209,21 @@ export FAKE_TMUX_DIR="$FAKE_DIR"
 
 # A fake stty reports raw mode, and a stub freebuff keeps the launch path
 # honest on a runner without the real CLI. Areas that send put $TMP/bin on
-# PATH.
+# PATH. Opt-in: raw_after N reports canonical mode for N checks, so a cold
+# launch that has a tty but has not reached raw input yet is simulated as a
+# poll count instead of a real wait; the happy path stays raw.
 cat >"$TMP/bin/stty" <<'FAKE'
 #!/usr/bin/env bash
+d=${FAKE_TMUX_DIR:?}
+if [ -f "$d/raw_after" ]; then
+    left=$(cat "$d/raw_after" 2>/dev/null || printf '0')
+    if [ "$left" -gt 0 ]; then
+        printf '%s\n' "$((left - 1))" >"$d/raw_after"
+        printf '%s\n' 'speed 38400 baud; line = 0; icanon echo'
+        exit 0
+    fi
+    rm -f "$d/raw_after"
+fi
 printf '%s\n' 'speed 38400 baud; line = 0; -icanon -echo'
 FAKE
 cat >"$TMP/bin/freebuff" <<'FAKE'
@@ -219,7 +231,12 @@ cat >"$TMP/bin/freebuff" <<'FAKE'
 exit 0
 FAKE
 chmod +x "$TMP/bin/stty" "$TMP/bin/freebuff"
-# The send-path areas opt in to these; until then the real tools answer, so
+# Freebuff is named the way FREEBUFF_TMUX names tmux: the preflight of every
+# start probes it, so an area must not depend on the real client being
+# installed, or on it being absent. An area that wants a broken client points
+# FREEBUFF_BIN at its own stub.
+export FREEBUFF_BIN="$TMP/bin/freebuff"
+# The send-path areas opt in to PATH too; until then the real tools answer, so
 # status input mode matches a launch that has not reached a pane.
 
 fake_session() {
@@ -271,6 +288,12 @@ NOMARKER_PANE='⎘ • 6s • △▽
 │  ▍Add to the current task (/ for commands)'
 REFUSED_PANE='Your concurrent-session limit across CLI and Desktop is reached.
 Enter: take over  Esc: back to draft'
+# The hours overlay (#107): the account has no hours left for the chosen
+# model. Its Enter opens the model picker, so it is a refusal that takes no
+# keys either, and it must not be waited out as a submit timeout.
+HOURS_PANE='Not enough hours for DeepSeek V4.1 Flash: an hour on it takes 2 hours.
+Choose another model or visit https://freebuff.com/plans.
+Enter: choose another model   Esc: back to draft'
 # The trust gate runs in the plain terminal before the TUI mounts, so this
 # pane never draws the resting prompt and the readiness wait must name it.
 TRUST_PANE='Found agent configuration in /tmp/x/repo/.worktrees/test-trust/.agents

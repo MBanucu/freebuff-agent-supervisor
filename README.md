@@ -45,6 +45,8 @@ anything, and it never modifies the main worktree.
 - `freebuff` on `PATH` (or `FREEBUFF_BIN`).
 - `tmux`. On NixOS the tool finds it with `nix-shell -p tmux` and caches the
   path; otherwise install it or set `FREEBUFF_TMUX`.
+- GNU `stty` for the raw-mode check. A `PATH` that prefers toybox's `stty`
+  (no `-F`) can be overridden with `FREEBUFF_STTY`.
 - `gh` authenticated for the PR column and for the generated brief. The tool
   still works without it with `--title`/`--url` or `--no-gh`.
 - `python3` is optional and used only by `gui --serve`; every other command
@@ -106,6 +108,19 @@ typing, so a burst of launches does not reach the TUI within the same second.
 Use `--task-file FILE` when an issue needs a custom scope instead of the
 generic issue brief. `--dry-run` prints the plan and changes nothing;
 `--no-start` creates only the worktree, branch and `.task.md`.
+
+Before it creates anything, `start` checks the environment and prints one
+`preflight=<command>` line per check: `tmux`, `freebuff`, `stty` and `git`, plus
+`gh` when the run mirrors the issue. A missing command names the line that
+installs it — `hint=pkg install tmux` on Termux (detected from `PREFIX` or
+`termux-wake-lock`), `hint=install tmux or set FREEBUFF_TMUX` elsewhere — and
+nothing is created. `freebuff` is probed with `--version` under a short timeout
+(`FREEBUFF_PREFLIGHT_TIMEOUT`, default 5 seconds), so a client that exists but
+cannot execute is reported with its exit status instead of as a readiness
+timeout. A miss on `gh` is reported and does not stop the run, because a launch
+can still be named with `--title`/`--url` or `--no-gh`. A healthy run prints
+`preflight=ok`. `--no-check` or `FREEBUFF_SKIP_PREFLIGHT=1` skips the check and
+keeps the old late lookup for a caller that knows its environment.
 
 `--auto-stop` starts a detached watcher after the prompt is sent. It stops
 `fb-<name>` as soon as the agent writes `.agent-result`, or when the pane has
@@ -245,7 +260,10 @@ sessions whose run is already over. Freebuff counts live TUIs against its
 concurrent-session limit, not runs, so a `done` session still holds a slot
 until `gc` stops it. A `start` refused by that overlay names them
 (`holding_slot=a,b`) and prints the command that frees them, instead of leaving
-the next step to guesswork.
+the next step to guesswork. The hours overlay is refused the same way, as
+`refused=hours` with `hours=N/M` when the panel shows the account's usage and
+a `hint=` naming both ways out: free finished sessions with `gc`, or wait for
+the daily refill. Neither overlay is waited out as a submit timeout.
 
 `stop` is a hard kill. `stop --graceful` sends `Escape` to end the turn, waits
 up to `--wait` seconds (default 20) for the pane to reach `done`, `idle` or

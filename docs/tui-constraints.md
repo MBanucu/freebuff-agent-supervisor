@@ -24,9 +24,12 @@ can never accept the brief, so `start` prints the last pane lines, stops that
 session, and fails in a message naming the `--ready-timeout` that was used,
 leaving the worktree and branch in place. The elapsed time and pane tail are
 what distinguishes a slow cold start from a hung TUI; raise `--ready-timeout`
-for the former. The concurrent-session overlay is a refusal instead: no keys
-are typed (its Enter would take over another live session), `start` prints
-`refused=yes` with the sentence and exits non-zero, and the worktree is kept.
+for the former. The concurrent-session and hours overlays are refusals instead:
+no keys are typed (their Enter takes over another live session or opens the
+model picker), `start` prints `refused=yes`, or `refused=hours` with `hours=N/M`
+when the panel shows the account's usage plus a `hint=` naming both ways out,
+and exits non-zero; the worktree is kept. An overlay that is already on screen
+is reported on the first poll, so it never spends `--submit-timeout`.
 
 **The trust prompt is the other pre-TUI stop.** A worktree with `.agents/`
 (or an `mcp.json`) makes Freebuff print `Load and run these? [y/N]` in the

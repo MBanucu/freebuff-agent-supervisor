@@ -202,3 +202,80 @@ check test "$rc" -ne 0
 check contains "$(cat "$TMP/start.out")" 'concurrent-session overlay'
 check test ! -s "$FAKE_DIR/sent"
 fake_clear
+
+# ---- the hours overlay (#107) ----
+
+# The hours overlay is a refusal, not a slow start: it is already on screen
+# before the brief, so no keys are typed, the submit window is never entered,
+# and the output names the refusal and both ways out instead of a timeout.
+printf '%s\n' "$HOURS_PANE" >"$FAKE_DIR/pane"
+: >"$FAKE_DIR/sent"
+: >"$FAKE_DIR/killed"
+if launch_brief test-refuse-hours 1017 --submit-timeout 20 \
+    >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -ne 0
+HOURS_OUT=$(cat "$TMP/start.out")
+check contains "$HOURS_OUT" 'refused=hours'
+check contains "$HOURS_OUT" 'Not enough hours'
+check contains "$HOURS_OUT" 'hint=stop finished sessions with:'
+check contains "$HOURS_OUT" 'wait for the daily hours to refill'
+# The captured panel carries no usage figure, so no hours= line is invented.
+check test -z "$(printf '%s\n' "$HOURS_OUT" | grep '^hours=' || true)"
+check test ! -s "$FAKE_DIR/sent"
+check grep -qxF 'fb-test-refuse-hours' "$FAKE_DIR/killed"
+HOURS_WT="$REPO/.worktrees/test-refuse-hours"
+check test -f "$HOURS_WT/.refusal"
+check contains "$(cat "$HOURS_WT/.refusal")" 'Not enough hours'
+check contains "$(cat "$HOURS_WT/.supervisor.log")" 'refused at='
+check test -z "$(grep -F 'pane:' "$HOURS_WT/.supervisor.log" || true)"
+
+# A panel that also draws the account's usage reports it as hours=N/M; the
+# sentence alone does not carry a fraction, so nothing is guessed there.
+printf '%s\n%s\n' "$HOURS_PANE" 'Hours today: 1/2' >"$FAKE_DIR/pane"
+: >"$FAKE_DIR/sent"
+if launch_brief test-refuse-hours-quota 1018 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -ne 0
+check contains "$(cat "$TMP/start.out")" 'refused=hours'
+check contains "$(cat "$TMP/start.out")" 'hours=1/2'
+check test ! -s "$FAKE_DIR/sent"
+
+# The observed case: the pane was ready and the Enter was taken, then the
+# overlay appeared in place of the turn. That is the same refusal, so the
+# first submission poll reports it instead of spending --submit-timeout.
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+printf '%s\n' "$HOURS_PANE" >"$FAKE_DIR/pane_after_send"
+: >"$FAKE_DIR/sent"
+if launch_brief test-refuse-hours-turn 1019 --prompt 'hours after the send' \
+    --submit-timeout 20 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -ne 0
+HOURS_TURN_OUT=$(cat "$TMP/start.out")
+check contains "$HOURS_TURN_OUT" 'refused=hours'
+check contains "$HOURS_TURN_OUT" 'submit_elapsed=0.0s'
+check contains "$HOURS_TURN_OUT" 'resent=no'
+check test -s "$FAKE_DIR/sent"
+HOURS_TURN_WT="$REPO/.worktrees/test-refuse-hours-turn"
+check contains "$(cat "$HOURS_TURN_WT/.refusal")" 'Not enough hours'
+check contains "$(cat "$REPO/.supervisor-briefs.jsonl")" '"refused": true'
+check test -z "$(grep -F 'pane:' "$HOURS_TURN_WT/.supervisor.log" || true)"
+
+# The refused text is kept past the ledger window, so a retry after the hours
+# are back is refused locally with nothing typed.
+rm -f "$FAKE_DIR/pane_after_send"
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+: >"$FAKE_DIR/sent"
+if launch_brief test-refuse-hours-retry 1020 --prompt 'hours after the send' \
+    >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 1
+check contains "$(cat "$TMP/start.out")" 'already refused'
+check test ! -s "$FAKE_DIR/sent"
+check test ! -e "$REPO/.worktrees/test-refuse-hours-retry"
+
+# send never types into the hours overlay either
+fake_session test-refuse-hours-send "$HOURS_PANE"
+: >"$FAKE_DIR/sent"
+if bash "$TOOL" --root "$REPO" send test-refuse-hours-send 'hello' \
+    >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -ne 0
+check contains "$(cat "$TMP/start.out")" 'hours overlay'
+check test ! -s "$FAKE_DIR/sent"
+fake_clear
