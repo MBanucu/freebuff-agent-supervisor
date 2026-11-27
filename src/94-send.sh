@@ -10,7 +10,26 @@ attach() {
 }
 
 send() {
-    local name=${1:-} text=${2:-} tmux pane
+    # send NAME TEXT, or send NAME -- TEXT for text that starts with a dash.
+    # `--` was previously taken as the text itself, so a message passed that
+    # way typed `--` (or landed in an overlay) instead of failing (#121).
+    local name='' text='' tmux pane
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) usage; exit 0 ;;
+            --) shift; text="$*"; break ;;
+            *)
+                if [ -z "$name" ]; then
+                    name=$1
+                elif [ -z "$text" ]; then
+                    text=$1
+                else
+                    die "send: unexpected argument: $1 (quote the text as one argument)"
+                fi
+                ;;
+        esac
+        shift
+    done
     [ -n "$name" ] || die "send: NAME is required"
     valid_name "$name" || die "send: invalid name"
     [ -n "$text" ] || die "send: TEXT is required"
@@ -23,6 +42,11 @@ send() {
     pane=$("$tmux" capture-pane -p -t "fb-$name" -S "-$REFUSAL_WINDOW" 2>/dev/null || true)
     if printf '%s\n' "$pane" | grep -qiE "$REFUSAL_OVERLAY_RE|$HOURS_OVERLAY_RE"; then
         die "send: fb-$name is on the concurrent-session overlay or the hours overlay; no keys were sent (Enter would take over another session or open the model picker; stop it first)"
+    fi
+    # A released session draws no composer: Enter retries with the model
+    # picker's choice and starts a new session, so the text would be lost.
+    if printf '%s\n' "$pane" | grep -qiE "$RELEASED_OVERLAY_RE"; then
+        die "send: fb-$name is on the released-session overlay; no keys were sent (its Enter retries with a model and starts a new session; press Enter in the pane, then send again)"
     fi
     "$tmux" send-keys -t "fb-$name" -l "$text"
     sleep 0.2

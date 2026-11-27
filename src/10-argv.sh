@@ -39,6 +39,10 @@ REFUSAL_OVERLAY_RE='concurrent-session limit|session limit across CLI and Deskto
 # model picker instead of submitting, and a wait for submission would sit out
 # the whole --submit-timeout over a refusal that was already on screen.
 HOURS_OVERLAY_RE='Not enough hours'
+# A released session has no composer: its overlay offers Enter (retry with a
+# model, which starts a new session) and Escape, so typed text goes into the
+# overlay and is lost. send refuses it instead of typing (#121).
+RELEASED_OVERLAY_RE='This session was released|Choose a model to start a new session'
 # Freebuff's trust gate runs in the plain terminal before the TUI mounts: a
 # worktree with .agents/ (or an mcp.json) prints this and waits. The resting
 # prompt cannot appear while it is open, so the readiness wait must name it
@@ -297,7 +301,10 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       Attach to the tmux session (detach with Ctrl-b d).
 
   spawn-freebuff-agent send NAME TEXT
-      Send a follow-up message to a running agent.
+      Send a follow-up message to a running agent. `send NAME -- TEXT` passes
+      text that starts with a dash. It refuses a pane on the
+      concurrent-session, hours or released-session overlay instead of typing
+      into it.
 
   spawn-freebuff-agent watch NAME [--idle-seconds N] [--poll N] [--timeout N]
       Report working/idle/done/blocked/failed/refused/unknown/missing

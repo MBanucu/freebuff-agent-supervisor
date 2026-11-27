@@ -1,5 +1,37 @@
 # ---- status, list and sessions ----
 # The three read views and the inventory helpers they share.
+launch_branch() {
+    # launch_branch WORKTREE -> the branch the launch recorded, or empty.
+    # `.supervisor-gh` is written by start when gh sync is on; `.task.md`
+    # always names the branch the worktree was created on. A worktree whose
+    # HEAD is detached cannot answer from git, so this is the record that keeps
+    # `HEAD` out of the inventory after a retry (#121).
+    local wt="$1" file branch=''
+    file="$wt/$GH_STATE_FILE"
+    if [ -f "$file" ]; then
+        branch=$(sed -n 's/^branch=//p' "$file" | head -n 1 || true)
+    fi
+    file="$wt/.task.md"
+    if [ -z "$branch" ] && [ -f "$file" ]; then
+        branch=$(sed -n 's/^Repo: .*Branch: `\([^`]*\)`.*$/\1/p' "$file" |
+            head -n 1 || true)
+    fi
+    printf '%s' "$branch"
+}
+
+worktree_branch() {
+    # worktree_branch WORKTREE -> the branch to report. The worktree's HEAD
+    # wins; a detached HEAD (rev-parse answers `HEAD`) or an unreadable one
+    # falls back to the launch record, so a retry does not turn the column
+    # into `HEAD` while the branch is still the one the work belongs to.
+    local branch
+    branch=$(git -C "$1" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    case "$branch" in
+        ''|HEAD) branch=$(launch_branch "$1") ;;
+    esac
+    printf '%s' "${branch:-?}"
+}
+
 print_explanation() {
     # print_explanation BLOCK -> the classifier's decision as `explain:` lines,
     # including every marker that was checked and the pane it looked at.
@@ -76,7 +108,7 @@ status() {
     local evidence="" ev_rule="" ev_matched="" ev_lines="" ev_sha="" ev_scans="" ev_source=""
     local turn_evidence="" tstate="" tout="" turn_log=""
     [ -d "$wt" ] || die "status: no worktree at $wt"
-    branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
+    branch=$(worktree_branch "$wt")
     session="fb-$name"
     tmux=$(tmux_bin 2>/dev/null || true)
 
@@ -319,7 +351,7 @@ list_agents() {
     for wt in "$ROOT"/.worktrees/*; do
         [ -d "$wt" ] || continue
         name=$(basename "$wt")
-        branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
+        branch=$(worktree_branch "$wt")
         session="fb-$name"
         running=no
         state=unknown
@@ -489,7 +521,7 @@ sessions() {
         if [ -d "$wt" ]; then
             worktree=yes
             trees=$((trees + 1))
-            branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || printf '?')
+            branch=$(worktree_branch "$wt")
             result=$(result_state "$wt")
             [ -n "$result" ] || result=-
             watcher=$(watcher_state "$wt")

@@ -57,9 +57,9 @@
 #   start:
 #     start
 #   status, list, sessions, hours and models:
-#     print_explanation, status, list_agents, watcher_state, live_sessions,
-#     live_session_count, finished_live, finished_live_names, sessions, hours,
-#     models
+#     print_explanation, launch_branch, worktree_branch, status, list_agents,
+#     watcher_state, live_sessions, live_session_count, finished_live,
+#     finished_live_names, sessions, hours, models
 #   watch, autostop, notify, reap and gc:
 #     reap, watch_run, watch, autostop, notify, gc
 #   the GUI:
