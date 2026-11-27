@@ -22,7 +22,7 @@ starts a real agent.
 | `test/brief-refusals.sh` | Area: the brief-hash ledger and the vendor refusal vocabulary and state. |
 | `test/readiness-submission.sh` | Area: the readiness deadline and proof that the brief was submitted. |
 | `test/wait-actions.sh` | Area: `gui --serve` — the read-only server, the POST actions and the ttyd route. |
-| `test/hours.sh` | Area: the remaining hour budget read from a live pane. |
+| `test/hours.sh` | Area: the remaining hour budget, read from a live pane or the account API. |
 | `gui-test.sh` | The second suite: curl checks for `gui/server.py`. It reuses `test/lib.sh` and prints `ok N gui checks`. |
 | `gui/server.py` | The HTTP server for `gui --serve`, python3 standard library only. It shells out to the CLI, which stays the single source of state. |
 | `docs/freebuff-integration.md` | Research roadmap for MCP, hooks and completion notifications. Nothing in it is implemented. |
@@ -72,7 +72,7 @@ Find the area that owns the behaviour:
 | Brief ledger, refusals | `test/brief-refusals.sh` |
 | Readiness deadline, submission proof | `test/readiness-submission.sh` |
 | `gui --serve` routes and actions | `test/wait-actions.sh` |
-| Hours read from a pane | `test/hours.sh` |
+| Hours read from a pane or the account API | `test/hours.sh` |
 
 A check is one `check` call:
 
@@ -177,7 +177,8 @@ same command the workflow runs (`./spawn-freebuff-agent-test.sh` or
 - the temporary git repo (`$REPO`), its initial commit and the
   `.worktrees/test-999` path (`$WT`);
 - the fake tmux (`$TMP/bin/tmux`, driven by `$FAKE_DIR`), the fake `stty`
-  that reports raw mode, and the stub `freebuff` that exits 0;
+  that reports raw mode, the stub `freebuff` that exits 0, the fake `gh` and
+  the fake `curl` that answers the account API from `$FAKE_DIR`;
 - the captured pane fixtures `IDLE_PANE`, `BUSY_PANE`, `REFUSED_PANE`,
   `STRIKE_PANE`, `BANNER_IDLE_PANE`, `TURN_PANE`, `SWALLOWED_PANE` and the
   rest, plus the `fake_session` / `fake_clear` / `fake_add_session` /

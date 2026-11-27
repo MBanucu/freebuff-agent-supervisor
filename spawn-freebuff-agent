@@ -32,6 +32,7 @@
 #     result_key, result_state, state_is_terminal, refusal_recorded,
 #     refusal_sentence, refusal_record, clear_refusal, refusal_is_hours,
 #     hours_quota, hours_panel, hours_footer, hours_source, hours_age_label,
+#     account_credentials_file, account_token, account_hours_div, account_read,
 #     hours_read, refusal_notes
 #   escaping and JSON:
 #     json_str, json_nullable_str, json_nullable_num, html_escape,
@@ -136,6 +137,20 @@ HOURS_VALUE=''
 HOURS_AGE=''
 HOURS_SOURCE=''
 HOURS_FRESH=0
+# The account's own usage (#124): one authenticated GET answers what the pane
+# scrape works around, so the figure is the account's rather than a session's.
+# The token is the client's default.authToken and no fingerprint field or
+# cookie jar is needed. curl is read-only like gh and stays optional: without
+# it the state is named and the pane is still the fallback.
+ACCOUNT_URL='https://freebuff.com/api/web/freebuff-session'
+ACCOUNT_TIMEOUT=5
+# Set by account_read: STATE names why a read failed (unconfigured, nocurl,
+# request, novalue, unauthorized) and the figures it parsed.
+ACCOUNT_STATE=''
+ACCOUNT_REMAINING=''
+ACCOUNT_LIMIT=''
+ACCOUNT_RESET=''
+ACCOUNT_HOURS=''
 # Turn text sits above the visible prompt, so refusal detection reads this
 # many lines of scrollback rather than the 12-line chrome window.
 REFUSAL_WINDOW=40
@@ -311,13 +326,24 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       reapable by plain gc. --json emits the same rows as an array of
       objects.
 
-  spawn-freebuff-agent hours [NAME] [--json]
-      Read the remaining Freebuff hour budget from a live pane: the welcome
-      panel's `N/M hours remaining` first, then the fraction in the footer
-      next to the model (`DeepSeek V4.1 Flash 10/17 • high`). NAME defaults
-      to any live fb-* session. The value is an observation with an age (the
-      seconds since the pane last changed), never an estimate.
-      --json      emit the same fields as one JSON object
+  spawn-freebuff-agent hours [NAME] [--source pane|account] [--json]
+      Read the remaining Freebuff hour budget. The default source is a live
+      pane: the welcome panel's `N/M hours remaining` first, then the fraction
+      in the footer next to the model (`DeepSeek V4.1 Flash 10/17 • high`).
+      NAME defaults to any live fb-* session, and the value is an observation
+      with an age (the seconds since the pane last changed), never an estimate.
+      --source account
+                  ask the account API instead: one GET with the client's
+                  default.authToken from ~/.config/manicode/credentials.json,
+                  no cookie jar. Prints hours=5/21 reset=2026-11-27T23:00:00Z
+                  session=- source=account, where the figures are the daily
+                  remaining and limit divided by five, the unit the TUI draws.
+                  A token the server rejects is named as hours=unknown
+                  source=account status=unauthorized (exit 2); a missing or
+                  tokenless credentials file prints account=unconfigured and
+                  falls back to the pane.
+      --json      emit the same fields as one JSON object, with remaining,
+                  limit and reset_at (null when the pane is the source)
       Prints hours=unknown and exits 2 when no live pane can be read.
 
   spawn-freebuff-agent models [NAME] [--json]
@@ -458,6 +484,12 @@ Notes:
     because Freebuff treats a repeated message as scripted use and counts a
     strike against the account. A brief the vendor refused is marked in the
     same ledger, kept past the window and never sent again.
+  - Before a launch creates anything, start asks the account API for the
+    remaining hours (the reader behind hours --source account) and refuses an
+    empty budget as refused=hours with the reset time, without spending a
+    worktree or a session slot. Only a definitive zero refuses, --model skips
+    the check because a free model spends no hours, and an absent token, an
+    absent curl or a server that does not answer never blocks a launch.
   - A refusal (the concurrent-session or hours overlay, or the vendor's
     anti-automation answer in the turn text) is recorded in
     .worktrees/<name>/.refusal and .supervisor.log. start prints refused=yes,
@@ -916,6 +948,105 @@ hours_age_label() {
     else
         printf '%sd' "$((secs / 86400))"
     fi
+}
+
+account_credentials_file() {
+    # account_credentials_file -> the client's credentials.json under its
+    # config root, the same root the turn log is read from.
+    printf '%s/credentials.json' "$(freebuff_config_dir)"
+}
+
+account_token() {
+    # account_token FILE -> the `default.authToken` the account API accepts,
+    # empty when the file is absent, unreadable or carries no token. The file
+    # is read once and the text after the `default` key is kept, so another
+    # account's token is never used; a file without that key still answers
+    # with its only authToken. No jq and no JSON parser: one sed pass.
+    local file=${1-} text token
+    [ -f "$file" ] && [ -r "$file" ] || return 0
+    text=$(sed -e ':a' -e 'N' -e '$!ba' -- "$file" 2>/dev/null || true)
+    token=$(printf '%s\n' "$text" |
+        sed -e 's/.*"default"[[:space:]]*:[[:space:]]*{//' |
+        sed -n 's/.*"authToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+        head -n 1)
+    case "$token" in
+        ''|*[[:space:]]*) return 0 ;;
+    esac
+    printf '%s' "$token"
+}
+
+account_hours_div() {
+    # account_hours_div N -> N/5, the unit the TUI draws (105 -> 21, 25 -> 5).
+    # A figure that does not divide evenly keeps one decimal rather than being
+    # rounded to a number the account does not have.
+    awk -v n="${1:-0}" 'BEGIN {
+        v = n / 5
+        if (v == int(v)) printf "%d", v
+        else printf "%.1f", v
+    }'
+}
+
+account_read() {
+    # account_read -> 0 when the account's own usage was read from
+    # ACCOUNT_URL, 1 with ACCOUNT_STATE naming why not. A 401 is its own
+    # state, `unauthorized`: an expired token is a fixable thing and must not
+    # read as an unknown figure or as a network failure. Everything else is
+    # named and left to the caller, which falls back to the pane. The figures
+    # are the daily remaining and limit divided by five, the unit the TUI
+    # prints, plus the daily reset.
+    local file token body rc=0 code
+    ACCOUNT_STATE=''
+    ACCOUNT_REMAINING=''
+    ACCOUNT_LIMIT=''
+    ACCOUNT_RESET=''
+    ACCOUNT_HOURS=''
+    file=$(account_credentials_file)
+    token=$(account_token "$file")
+    if [ -z "$token" ]; then
+        ACCOUNT_STATE=unconfigured
+        return 1
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        ACCOUNT_STATE=nocurl
+        return 1
+    fi
+    # -f makes an HTTP error a non-zero exit, and -w still prints its code, so
+    # one request both reads the body and tells 401 from a transport failure.
+    if body=$(curl -fsS -m "$ACCOUNT_TIMEOUT" -w '\n%{http_code}' \
+        -H "Authorization: Bearer $token" "$ACCOUNT_URL" 2>/dev/null); then
+        rc=0
+    else
+        rc=$?
+    fi
+    code=$(printf '%s\n' "$body" | tail -n 1)
+    body=$(printf '%s\n' "$body" | sed '$d')
+    if [ "$rc" -ne 0 ]; then
+        case "$code" in
+            401) ACCOUNT_STATE=unauthorized ;;
+            *) ACCOUNT_STATE=request ;;
+        esac
+        return 1
+    fi
+    ACCOUNT_REMAINING=$(printf '%s\n' "$body" |
+        sed -n 's/.*"remaining"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' |
+        head -n 1)
+    ACCOUNT_LIMIT=$(printf '%s\n' "$body" |
+        sed -n 's/.*"limit"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' |
+        head -n 1)
+    ACCOUNT_RESET=$(printf '%s\n' "$body" |
+        sed -n 's/.*"resetAt"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+        head -n 1)
+    # The API spells the reset with milliseconds; the tool prints whole seconds.
+    ACCOUNT_RESET=$(printf '%s' "$ACCOUNT_RESET" | sed 's/\.[0-9]*Z$/Z/')
+    if ! is_num "$ACCOUNT_REMAINING" || ! is_num "$ACCOUNT_LIMIT"; then
+        ACCOUNT_STATE=novalue
+        ACCOUNT_REMAINING=''
+        ACCOUNT_LIMIT=''
+        ACCOUNT_RESET=''
+        return 1
+    fi
+    ACCOUNT_HOURS="$(account_hours_div "$ACCOUNT_REMAINING")/$(account_hours_div "$ACCOUNT_LIMIT")"
+    return 0
 }
 
 hours_read() {
@@ -2531,6 +2662,22 @@ start() {
         return 0
     fi
 
+    # The account's own usage is one GET away (#124), so a launch that would
+    # land on an empty budget is refused before it spends a worktree or a
+    # concurrent-session slot. Only a definitive zero refuses, and only when
+    # no --model was named: a free model spends no hours and its picker price
+    # is the only place that is known. An absent token, an absent curl or a
+    # server that does not answer is never a reason to block a launch; those
+    # keep the pane-side refusal below.
+    if [ "$nostart" = 0 ] && [ -z "$model_want" ] && account_read &&
+        [ "$ACCOUNT_REMAINING" = 0 ]; then
+        note 'refused=hours'
+        note "hours=$ACCOUNT_HOURS"
+        [ -z "$ACCOUNT_RESET" ] || note "reset=$ACCOUNT_RESET"
+        note "hint=wait for the daily hours to refill, or launch a model that costs no hours with --model"
+        die "start: the account has no hours left ($ACCOUNT_HOURS, reset ${ACCOUNT_RESET:--}); nothing was created"
+    fi
+
     # Every session shares one account, so a launch is pointless while the
     # limit is reached: the pane stops on the overlay and never takes input.
     # Check before spending a worktree, and wait for a slot if asked.
@@ -3413,15 +3560,25 @@ sessions() {
 }
 
 hours() {
-    # hours [NAME] [--json] -> the remaining hour budget, read from a live
-    # pane. It is an observation with an age, never an estimate: the welcome
-    # panel's `N/M hours remaining` wins over the footer fraction next to the
-    # model, and a pane that shows neither (or no live session at all) is
-    # unknown with exit 2.
-    local name="" json=0 tmux="" session="" pane="" value="" source='' age='' agedisp='-'
+    # hours [NAME] [--source pane|account] [--json] -> the remaining hour
+    # budget. The default source is a live pane and stays the default until
+    # the account reader is proven in the field: the welcome panel's
+    # `N/M hours remaining` wins over the footer fraction next to the model,
+    # and a pane that shows neither (or no live session at all) is unknown
+    # with exit 2. --source account asks the account API instead (#124), so
+    # the figure is the account's and needs no session.
+    local name="" json=0 want=pane tmux="" session="" pane="" value="" source=''
+    local age='' agedisp='-' note_account='' extra=''
     while [ $# -gt 0 ]; do
         case "$1" in
             --json) json=1; shift ;;
+            --source)
+                case "${2:-}" in
+                    pane|account) want=$2 ;;
+                    *) die 'hours: --source must be pane or account' ;;
+                esac
+                shift 2
+                ;;
             -h|--help) usage; exit 0 ;;
             -*) die "hours: unsupported argument: $1" ;;
             *)
@@ -3434,6 +3591,35 @@ hours() {
         valid_name "$name" || die "hours: invalid name"
         session="fb-$name"
     fi
+
+    if [ "$want" = account ]; then
+        if account_read; then
+            if [ "$json" = 1 ]; then
+                printf '{"hours":%s,"session":null,"age":null,"source":"account","remaining":%s,"limit":%s,"reset_at":%s}\n' \
+                    "$(json_str "$ACCOUNT_HOURS")" "$ACCOUNT_REMAINING" \
+                    "$ACCOUNT_LIMIT" "$(json_nullable_str "$ACCOUNT_RESET")"
+            else
+                note "hours=$ACCOUNT_HOURS reset=${ACCOUNT_RESET:--} session=- source=account"
+            fi
+            return 0
+        fi
+        if [ "$ACCOUNT_STATE" = unauthorized ]; then
+            # The server answered and said no: the token is expired or
+            # revoked, which is a fixable thing rather than an unknown figure.
+            if [ "$json" = 1 ]; then
+                printf '{"hours":null,"session":null,"age":null,"source":"account","status":"unauthorized","remaining":null,"limit":null,"reset_at":null}\n'
+            else
+                note 'hours=unknown session=- source=account status=unauthorized'
+                note "hint=log in again with the Freebuff client to refresh $(account_credentials_file)"
+            fi
+            exit 2
+        fi
+        # No verdict from the server (no token, no curl, a timeout, a body
+        # without figures): the pane is still an observation, so name the
+        # state and read it as the default source does.
+        note_account=$ACCOUNT_STATE
+    fi
+
     tmux=$(tmux_bin 2>/dev/null || true)
     [ -n "$session" ] || session=$(live_sessions | head -n 1)
 
@@ -3452,29 +3638,34 @@ hours() {
         # session that cannot report its activity has no age, not a zero.
         age=$(idle_seconds "${session#fb-}" 2>/dev/null || true)
         [ -z "$age" ] || agedisp="${age}s"
+        [ -z "$note_account" ] || extra=$(printf ',"account":%s' "$(json_str "$note_account")")
         if [ -z "$value" ]; then
             if [ "$json" = 1 ]; then
-                printf '{"hours":null,"session":%s,"age":%s,"source":null}\n' \
-                    "$(json_nullable_str "$session")" "$(json_nullable_num "$age")"
+                printf '{"hours":null,"session":%s,"age":%s,"source":null,"remaining":null,"limit":null,"reset_at":null%s}\n' \
+                    "$(json_nullable_str "$session")" "$(json_nullable_num "$age")" "$extra"
             else
+                [ -z "$note_account" ] || note "account=$note_account"
                 note "hours=unknown session=$session age=$agedisp source=none"
             fi
             exit 2
         fi
         if [ "$json" = 1 ]; then
-            printf '{"hours":%s,"session":%s,"age":%s,"source":%s}\n' \
+            printf '{"hours":%s,"session":%s,"age":%s,"source":%s,"remaining":null,"limit":null,"reset_at":null%s}\n' \
                 "$(json_str "$value")" "$(json_str "$session")" \
-                "$(json_nullable_num "$age")" "$(json_str "$source")"
+                "$(json_nullable_num "$age")" "$(json_str "$source")" "$extra"
         else
+            [ -z "$note_account" ] || note "account=$note_account"
             note "hours=$value session=$session age=$agedisp source=$source"
         fi
         return 0
     fi
 
     # No live pane: the tool cannot invent a number it has not read.
+    [ -z "$note_account" ] || extra=$(printf ',"account":%s' "$(json_str "$note_account")")
     if [ "$json" = 1 ]; then
-        printf '{"hours":null,"session":null,"age":null,"source":null}\n'
+        printf '{"hours":null,"session":null,"age":null,"source":null,"remaining":null,"limit":null,"reset_at":null%s}\n' "$extra"
     else
+        [ -z "$note_account" ] || note "account=$note_account"
         note 'hours=unknown'
     fi
     exit 2
