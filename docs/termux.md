@@ -228,8 +228,15 @@ This phone is already prepared: **[device]**
 | `dumpsys package com.termux` | version 0.118.3, installed 2026-11-17 |
 
 So on **this** phone all three mitigations are in place, and a wake lock has
-been held for more than a day. That is operator setup, not something the tool
-does or checks. A fresh Termux is not in this state.
+been held for more than a day. That is operator setup: the tool does not check
+the exemption or the phantom-process setting. Since #99 it can request the lock
+itself with `start --wake-lock` (`FREEBUFF_WAKE_LOCK=1` for every launch) and
+records `wake_lock=acquired|unavailable|failed` in `.supervisor.log`, so a
+reaped run is explainable afterwards. It never releases the lock: the lock is
+service-scoped, so `stop` on one session would unlock every session and the
+GUI. It dies with the Termux app and keeps the CPU awake while held, which
+costs battery; `termux-wake-unlock` is the operator's call. A fresh Termux is
+not in this state.
 
 What that means for each process, all of which are children of the Termux app:
 
@@ -247,9 +254,10 @@ What that means for each process, all of which are children of the Termux app:
   and no other device can reach it. **[repo]**
 
 **[unverified]** The screen was not locked (the task forbids it), so none of
-this is a lock test. It is configuration evidence plus source reading. The
-wake-lock child (#99) is where a real lock/unlock run belongs, and it should
-record what happened rather than assume.
+this is a lock test. It is configuration evidence plus source reading. A real
+screen-lock run is still unverified; #99 only records what `start` asked for,
+and `termux-wake-lock` has no status query, so `status` and `sessions` report
+the recorded value rather than claiming the lock is still held.
 
 `adb shell ps -A` shows only `com.termux` and `com.termux.adbbridge` as Termux
 processes; tmux and the agent run under the app uid and are not visible to the
@@ -313,8 +321,9 @@ Ranked by what actually blocks a phone run:
    Termux-clean the supervisor is.
 2. **Background survival.** Not a code bug: the app must hold a wake lock, be
    exempt from battery optimisation and, on Android 12+, have the phantom
-   process monitor off. This phone has all three; a fresh install does not. The
-   tool does not check or request any of them (#99).
+   process monitor off. This phone has all three; a fresh install does not.
+   Since #99 `start --wake-lock` can request the lock and records the answer;
+   the tool does not check or change the other two.
 3. **Readiness error reporting.** Addressed by #100: a failing `stty -F` is
    named after a few checks with its command and error, `FREEBUFF_STTY`
    overrides the binary, and `status` says `input=unknown` rather than

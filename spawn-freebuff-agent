@@ -26,6 +26,8 @@
 #   the preflight:
 #     preflight_termux, preflight_pkg, preflight_hint, preflight_run,
 #     preflight_die, preflight
+#   the wake lock:
+#     wake_lock_state, wake_lock_acquire
 #   state files and refusals:
 #     result_key, result_state, state_is_terminal, refusal_recorded,
 #     refusal_sentence, refusal_record, clear_refusal, refusal_is_hours,
@@ -194,6 +196,10 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       --no-check         skip the preflight that names a missing tmux,
                          freebuff, stty or git before anything is created
                          (FREEBUFF_SKIP_PREFLIGHT=1 does the same)
+      --wake-lock        ask Termux for a partial wake lock before tmux starts,
+                         so a run can outlive the screen; optional and never
+                         fatal, recorded in .supervisor.log and never released
+                         (FREEBUFF_WAKE_LOCK=1 does the same)
       --dry-run          print the plan, change nothing
       --help             this text
 
@@ -214,9 +220,10 @@ Spawn parallel Freebuff agents in isolated git worktrees.
   spawn-freebuff-agent sessions [--no-gh] [--json]
       One table over every fb-* session and every worktree: live state, idle
       time, attached autostop watcher, whether a worktree exists, the result
-      state, the branch and the open PR. Sessions with no worktree are listed
-      here instead of only being reapable by gc --all. --json emits the same
-      rows as an array of objects.
+      state, the branch, the open PR and the wake lock recorded at start.
+      Sessions with no worktree are listed here instead of only being
+      reapable by gc --all. --json emits the same rows as an array of
+      objects.
 
   spawn-freebuff-agent gui --snapshot FILE [--watch N] [--no-gh]
       Write one self-contained HTML page from `sessions --json`: one card
@@ -289,6 +296,8 @@ Environment:
                          send when --max-sessions allows several (default:
                          2N; 0 disables the wait)
   FREEBUFF_TTYD       ttyd executable for gui --ttyd (default: ttyd on PATH)
+  FREEBUFF_WAKE_LOCK  1 acquires the Termux wake lock for every start, like
+                      --wake-lock
   FREEBUFF_SUPERVISOR_ROOT  repository root override (tests)
   GH_BIN              gh executable (default: gh on PATH)
 
@@ -317,6 +326,14 @@ Notes:
     or refused=hours with hours=N/M when the panel shows the account's usage,
     plus a hint naming the next step, and exits non-zero; an overlay gets no
     keys at all, and status keeps refused until stop clears it.
+  - --wake-lock runs termux-wake-lock once, after the preflight and before
+    tmux new-session, and records wake_lock=acquired|unavailable|failed in
+    .supervisor.log. It is never fatal: without the binary the run starts
+    unprotected and says so. The tool never releases the lock, because it is
+    service-scoped: stop on one session would unlock every session and the
+    GUI. It dies with the Termux app, keeps the CPU awake while held and costs
+    battery; release it yourself with termux-wake-unlock. status and sessions
+    report the value recorded at start, not a claim that it is still held.
   - Completion is either the agent's .agent-result file (stock brief) or an
     idle pane after the window; the pane heuristic is tied to the TUI.
   - The tool never deletes a worktree or branch. Use git worktree remove and
@@ -591,6 +608,45 @@ preflight() {
         die "start: freebuff at $fb_path exits $fb_rc, so it cannot run (a glibc binary on bionic Termux reports its missing loader this way); set FREEBUFF_BIN to a runnable client (see docs/termux.md)"
     fi
     note 'preflight=ok'
+}
+
+# ---- the wake lock ----
+# The opt-in Termux partial wake lock (#99). With the screen off, Doze can
+# suspend the CPU and Android can reap the app, which takes the detached tmux
+# server, the autostop watcher and `gui --serve` with it; a wake lock is the
+# operator's mitigation, and the tool can ask for one. It only asks and
+# records the answer: termux-wake-lock has no status query, so nothing here
+# can claim the lock is still held.
+wake_lock_state() {
+    # wake_lock_state WORKTREE -> the last value start recorded, empty when no
+    # start asked for a lock. This is evidence of what was acquired at launch,
+    # not a live status.
+    local wt=$1 value
+    value=$(grep -o 'wake_lock=[a-z]*' "$wt/.supervisor.log" 2>/dev/null |
+        tail -n 1 | cut -d= -f2 || true)
+    printf '%s' "$value"
+}
+
+wake_lock_acquire() {
+    # wake_lock_acquire WORKTREE -> 0 when termux-wake-lock ran, 1 when it is
+    # missing or failed. Never fatal: a phone without the binary still runs,
+    # unprotected, and one line says which part is missing. The tool never
+    # releases the lock: it is service-scoped, so `stop` on one session would
+    # unlock every session and the GUI.
+    local wt=$1 bin rc=0
+    if bin=$(command -v termux-wake-lock 2>/dev/null); then
+        "$bin" >/dev/null 2>&1 || rc=$?
+        if [ "$rc" -eq 0 ]; then
+            ready_note "$wt" 'wake_lock=acquired'
+            return 0
+        fi
+        ready_note "$wt" 'wake_lock=failed'
+        note "wake_lock=failed: $bin exited $rc; the session is not protected from Doze"
+        return 1
+    fi
+    ready_note "$wt" 'wake_lock=unavailable'
+    note 'wake_lock=unavailable: termux-wake-lock is not installed; the session is not protected from Doze (pkg install termux-tools)'
+    return 1
 }
 
 # ---- state files and refusals ----
@@ -1540,6 +1596,7 @@ gh_state() {
 start() {
     local issue="" name="" branch="" base="main" title="" url="" task_file=""
     local sdk_dir="" dry=0 nostart=0 autostop=0 idle=120 poll=5 no_gh=0 no_check=0
+    local wake_lock=0
     local idle_set=0 poll_set=0 max_sessions=0 wait_slot=0 slot_wait=300
     local ready_timeout="$READY_TIMEOUT" ready_poll="$READY_POLL"
     local submit_timeout="$SUBMIT_TIMEOUT"
@@ -1558,6 +1615,7 @@ start() {
             --auto-stop) autostop=1; shift ;;
             --no-gh) no_gh=1; shift ;;
             --no-check) no_check=1; shift ;;
+            --wake-lock) wake_lock=1; shift ;;
             --idle-seconds) idle=${2:-}; idle_set=1; shift 2 ;;
             --poll) poll=${2:-}; poll_set=1; shift 2 ;;
             --ready-timeout) ready_timeout=${2:-}; shift 2 ;;
@@ -1600,6 +1658,9 @@ start() {
     if [ "$max_sessions" = 0 ] && [ "$wait_slot" = 1 ]; then
         die "start: --wait-slot needs --max-sessions N (nothing to wait for otherwise)"
     fi
+    # The environment switch is for a shell that always wants the lock on a
+    # phone, so every launch does not have to repeat the flag.
+    [ "${FREEBUFF_WAKE_LOCK:-}" != 1 ] || wake_lock=1
 
     # A missing command has to be named before a worktree is spent on it, and a
     # client that exists but cannot execute must not look like a slow launch
@@ -1651,6 +1712,7 @@ start() {
         [ "$jitter_max" = 0 ] || note "jitter_max=${jitter_max}s"
         note "ready_timeout=${ready_timeout}s ready_poll=${ready_poll}s"
         note "submit_timeout=${submit_timeout}s"
+        [ "$wake_lock" = 0 ] || note 'wake_lock=requested'
         note "tmux=${FREEBUFF_TMUX:-tmux} -x $COLS -y $ROWS -c $wt"
         if [ "$autostop" = 1 ]; then
             note "autostop=yes idle_seconds=$idle poll=$poll"
@@ -1729,6 +1791,12 @@ start() {
     local tmux fb cmd
     tmux=$(tmux_bin) || die "start: tmux not found; install tmux or set FREEBUFF_TMUX"
     fb=$(freebuff_bin) || die "start: freebuff not found; set FREEBUFF_BIN"
+    # The lock is asked for after the preflight and before tmux starts, so the
+    # server it is meant to protect is never launched without it. The result is
+    # recorded for status and sessions; it is never fatal and never released.
+    if [ "$wake_lock" = 1 ]; then
+        wake_lock_acquire "$wt" || true
+    fi
     printf -v cmd 'TERM=xterm-256color %q --cwd %q --trust-agents' "$fb" "$wt"
     "$tmux" new-session -d -s "$session" -x "$COLS" -y "$ROWS" -c "$wt" "$cmd"
 
@@ -1947,6 +2015,7 @@ status() {
 
     local wt="$ROOT/.worktrees/$name" branch session tmux running=0 tty mode=unknown stty out
     local state rstate="" pane="" idle="" sstate="" last_commit dirty=no watcher=""
+    local wake_lock=""
     local result_pr="" result_commit="" result_tests="" prs="" pr_json=null
     local evidence="" ev_rule="" ev_matched="" ev_lines="" ev_sha="" ev_scans=""
     [ -d "$wt" ] || die "status: no worktree at $wt"
@@ -1962,9 +2031,11 @@ status() {
     state=$(result_state "$wt")
     [ -n "$state" ] || state=unknown
     watcher=$(watcher_state "$wt")
+    wake_lock=$(wake_lock_state "$wt")
     if [ "$json" = 0 ]; then
         printf 'state=%s\n' "$state"
         printf 'watcher=%s\n' "$watcher"
+        [ -z "$wake_lock" ] || printf 'wake_lock=%s\n' "$wake_lock"
     fi
     if [ -f "$wt/$RESULT_FILE" ]; then
         rstate=$state
@@ -2100,6 +2171,7 @@ status() {
     printf '  "session_state": %s,\n' "$(json_str "$sstate")"
     printf '  "idle_seconds": %s,\n' "$(json_nullable_num "$idle")"
     printf '  "watcher": %s,\n' "$(json_nullable_str "$watcher")"
+    printf '  "wake_lock": %s,\n' "$(json_nullable_str "$wake_lock")"
     printf '  "commit": %s,\n' "$(json_nullable_str "$last_commit")"
     printf '  "dirty": %s,\n' "$([ "$dirty" = yes ] && printf true || printf false)"
     printf '  "pr": %s,\n' "$pr_json"
@@ -2234,7 +2306,7 @@ sessions() {
     # session with no worktree is visible before gc --all reaps it. --json is a
     # serialization of the same rows: one array of objects, `[]` when empty.
     local no_gh=0 json=0 name wt worktree running state idle activity now idle_secs
-    local watcher result branch pr prs="" slug="" tmux total=0 live=0 trees=0
+    local watcher wake_lock result branch pr prs="" slug="" tmux total=0 live=0 trees=0
     local finished=no finished_count=0
     local names=() x first=1
     while [ $# -gt 0 ]; do
@@ -2285,11 +2357,11 @@ sessions() {
     if [ "$json" = 1 ]; then
         printf '[\n'
     elif [ -n "$prs" ]; then
-        printf '%-22s %-9s %-8s %-9s %-9s %-9s %-24s %s\n' \
-            NAME STATE IDLE WATCHER WORKTREE RESULT BRANCH PR
+        printf '%-22s %-9s %-8s %-9s %-9s %-9s %-24s %-40s %s\n' \
+            NAME STATE IDLE WATCHER WORKTREE RESULT BRANCH PR WAKE
     else
-        printf '%-22s %-9s %-8s %-9s %-9s %-9s %s\n' \
-            NAME STATE IDLE WATCHER WORKTREE RESULT BRANCH
+        printf '%-22s %-9s %-8s %-9s %-9s %-9s %-40s %s\n' \
+            NAME STATE IDLE WATCHER WORKTREE RESULT BRANCH WAKE
     fi
 
     for name in "${names[@]}"; do
@@ -2297,6 +2369,7 @@ sessions() {
         total=$((total + 1))
         idle_secs=""
         pr=""
+        wake_lock=""
         if [ -d "$wt" ]; then
             worktree=yes
             trees=$((trees + 1))
@@ -2304,6 +2377,7 @@ sessions() {
             result=$(result_state "$wt")
             [ -n "$result" ] || result=-
             watcher=$(watcher_state "$wt")
+            wake_lock=$(wake_lock_state "$wt")
         else
             worktree=missing
             branch=-
@@ -2359,6 +2433,7 @@ sessions() {
                 printf '    "finished": false,\n'
             fi
             printf '    "watcher": %s,\n' "$(json_nullable_str "$watcher")"
+            printf '    "wake_lock": %s,\n' "$(json_nullable_str "$wake_lock")"
             printf '    "worktree": %s,\n' "$(json_str "$worktree")"
             printf '    "result": %s,\n' "$(json_nullable_str "$result")"
             printf '    "branch": %s,\n' "$(json_nullable_str "$branch")"
@@ -2366,13 +2441,13 @@ sessions() {
             printf '  }'
         elif [ -n "$prs" ] && [ "$branch" != '-' ]; then
             [ -n "$pr" ] || pr=-
-            printf '%-22s %-9s %-8s %-9s %-9s %-9s %-24s %s\n' \
+            printf '%-22s %-9s %-8s %-9s %-9s %-9s %-24s %-40s %s\n' \
                 "$name" "$state" "$idle" "$watcher" "$worktree" "$result" \
-                "$branch" "$pr"
+                "$branch" "$pr" "${wake_lock:--}"
         else
-            printf '%-22s %-9s %-8s %-9s %-9s %-9s %s\n' \
+            printf '%-22s %-9s %-8s %-9s %-9s %-9s %-40s %s\n' \
                 "$name" "$state" "$idle" "$watcher" "$worktree" "$result" \
-                "$branch"
+                "$branch" "${wake_lock:--}"
         fi
     done
 

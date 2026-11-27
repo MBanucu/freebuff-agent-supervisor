@@ -247,6 +247,115 @@ launch_brief test-nogh 1002 --no-gh >/dev/null 2>&1 || true
 check test ! -f "$REPO/.worktrees/test-nogh/.supervisor-gh"
 check test ! -s "$GH_LOG"
 
+# ---- the opt-in Termux wake lock (#99) ----
+
+# The lock is service-scoped, so the tool only ever acquires it: start asks
+# once per launch, records the answer, and nothing (least of all stop) releases
+# it. Both stubs log, so a release would be visible instead of assumed away.
+mkdir -p "$TMP/wake-bin"
+cat >"$TMP/wake-bin/termux-wake-lock" <<'FAKE'
+#!/usr/bin/env bash
+printf 'lock\n' >>"${WAKE_LOG:?}"
+FAKE
+cat >"$TMP/wake-bin/termux-wake-unlock" <<'FAKE'
+#!/usr/bin/env bash
+printf 'unlock\n' >>"${UNLOCK_LOG:?}"
+FAKE
+chmod +x "$TMP/wake-bin/termux-wake-lock" "$TMP/wake-bin/termux-wake-unlock"
+: >"$TMP/wake.log"
+: >"$TMP/unlock.log"
+export WAKE_LOG="$TMP/wake.log" UNLOCK_LOG="$TMP/unlock.log"
+PATH_SAVED="$PATH"
+export PATH="$TMP/wake-bin:$PATH"
+
+# --wake-lock acquires once and records it, on the launch and in the log.
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+if launch_brief test-wake 1101 --wake-lock >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+check test "$(grep -c . "$TMP/wake.log")" = 1
+check contains "$(cat "$TMP/start.out")" 'wake_lock=acquired'
+check contains "$(cat "$REPO/.worktrees/test-wake/.supervisor.log")" 'wake_lock=acquired'
+
+# A second session asks again and releases nothing: the lock it already holds
+# belongs to every session and the GUI, not to the first run.
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+if launch_brief test-wake-two 1102 --wake-lock >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+check test "$(grep -c . "$TMP/wake.log")" = 2
+check contains "$(cat "$REPO/.worktrees/test-wake-two/.supervisor.log")" 'wake_lock=acquired'
+check test ! -s "$TMP/unlock.log"
+
+# stop never unlocks, even for the session that asked for the lock.
+out=$(bash "$TOOL" --root "$REPO" stop test-wake)
+check contains "$out" 'stopped=fb-test-wake'
+check test ! -s "$TMP/unlock.log"
+
+# status and sessions report what was recorded at start, not a live claim.
+out=$(bash "$TOOL" --root "$REPO" status --no-gh test-wake)
+check contains "$out" 'wake_lock=acquired'
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-wake)
+check contains "$out" '"wake_lock": "acquired"'
+out=$(bash "$TOOL" --root "$REPO" sessions --no-gh)
+check test "$(printf '%s\n' "$out" | awk '$1 == "test-wake" { print $NF }')" = acquired
+check test "$(printf '%s\n' "$out" | awk '$1 == "test-wake-two" { print $NF }')" = acquired
+
+# FREEBUFF_WAKE_LOCK=1 is the same switch for a shell that always wants it.
+: >"$TMP/wake.log"
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+export FREEBUFF_WAKE_LOCK=1
+if launch_brief test-wake-env 1103 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+unset FREEBUFF_WAKE_LOCK
+check test "$rc" -eq 0
+check test "$(grep -c . "$TMP/wake.log")" = 1
+check contains "$(cat "$REPO/.worktrees/test-wake-env/.supervisor.log")" 'wake_lock=acquired'
+
+# Without the binary the run is not blocked: it warns, starts, and records
+# unavailable so a later reap has an explanation.
+mv "$TMP/wake-bin/termux-wake-lock" "$TMP/wake-lock.stub"
+: >"$TMP/wake.log"
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+if launch_brief test-wake-none 1104 --wake-lock >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+mv "$TMP/wake-lock.stub" "$TMP/wake-bin/termux-wake-lock"
+check test "$rc" -eq 0
+check contains "$(cat "$TMP/start.out")" 'wake_lock=unavailable'
+check contains "$(cat "$TMP/start.out")" 'not protected'
+check contains "$(cat "$REPO/.worktrees/test-wake-none/.supervisor.log")" 'wake_lock=unavailable'
+check test ! -s "$TMP/wake.log"
+
+# A binary that fails is recorded as failed, and the run still starts.
+mv "$TMP/wake-bin/termux-wake-lock" "$TMP/wake-lock.stub"
+printf '#!/usr/bin/env bash\nexit 3\n' >"$TMP/wake-bin/termux-wake-lock"
+chmod +x "$TMP/wake-bin/termux-wake-lock"
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+if launch_brief test-wake-fail 1107 --wake-lock >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+rm -f "$TMP/wake-bin/termux-wake-lock"
+mv "$TMP/wake-lock.stub" "$TMP/wake-bin/termux-wake-lock"
+check test "$rc" -eq 0
+check contains "$(cat "$TMP/start.out")" 'wake_lock=failed'
+check contains "$(cat "$TMP/start.out")" 'exited 3'
+check contains "$(cat "$REPO/.worktrees/test-wake-fail/.supervisor.log")" 'wake_lock=failed'
+
+# A run without the flag is unchanged: no call and no wake_lock record.
+: >"$TMP/wake.log"
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+if launch_brief test-nowake 1105 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+check test ! -s "$TMP/wake.log"
+check test -z "$(grep -F 'wake_lock=' "$REPO/.worktrees/test-nowake/.supervisor.log" 2>/dev/null || true)"
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-nowake)
+check contains "$out" '"wake_lock": null'
+
+# The flag is part of the surface, and a dry run names the plan without
+# acquiring anything.
+check contains "$(bash "$TOOL" --help 2>&1)" '--wake-lock'
+out=$(bash "$TOOL" --root "$REPO" start --issue 1106 --name test-wake-dry \
+    --branch test/wake-dry --title T --url U --wake-lock --dry-run)
+check contains "$out" 'wake_lock=requested'
+check test ! -s "$TMP/wake.log"
+
+# Put PATH back so the areas after this one see the fixture they expect.
+export PATH="$PATH_SAVED"
+
 # leave the fixture as it was found
 if [ -n "$RESULT_SAVED" ]; then
     printf '%s\n' "$RESULT_SAVED" >"$WT/.agent-result"

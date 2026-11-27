@@ -112,6 +112,22 @@ can still be named with `--title`/`--url` or `--no-gh`. A healthy run prints
 `preflight=ok`. `--no-check` or `FREEBUFF_SKIP_PREFLIGHT=1` skips the check and
 keeps the old late lookup for a caller that knows its environment.
 
+`--wake-lock` (or `FREEBUFF_WAKE_LOCK=1`) asks Termux for a partial wake lock
+with `termux-wake-lock`, once, after the preflight and before `tmux new-session`.
+It is optional and never fatal: without the binary the run starts anyway, prints
+one line saying the session is not protected, and records
+`wake_lock=unavailable`; a command that fails records `wake_lock=failed`. A
+successful call records `wake_lock=acquired` in `.supervisor.log`, which
+`status` and `sessions` report afterwards.
+
+The tool never releases the lock. It is service-scoped, so `stop` on one session
+would release it for every session and the GUI. It also dies with the Termux
+app, and while held it keeps the CPU awake at the battery's expense; release it
+yourself with `termux-wake-unlock`. The recorded value is what `start` acquired,
+not a claim that the lock is still held: `termux-wake-lock` has no status query.
+Battery-optimisation exemption and the phantom-process monitor are separate
+operator settings the tool does not change.
+
 `--auto-stop` starts a detached watcher after the prompt is sent. It stops
 `fb-<name>` as soon as the agent writes `.agent-result`, or when the pane has
 been idle for `--idle-seconds` (default 120) with `--poll` seconds between
@@ -194,6 +210,7 @@ approval chrome are in
 ```
 state=done                  # from .agent-result
 watcher=pid:123             # autostop watcher: pid:N, dead or -
+wake_lock=acquired          # recorded at start; absent without --wake-lock
 session_state=done          # live: done, blocked, failed, idle, working, refused,
                             #       unknown or missing
 ```
@@ -241,7 +258,9 @@ open PR for the branch. `--window N` sets the scrollback the classifier reads
 `sessions` is the inventory: one row per `fb-*` session **and** per worktree,
 with `WORKTREE yes|missing`, the attached `autostop` watcher (`pid:N`, `dead`
 or `-`; the pid is the one `start --auto-stop` wrote to
-`.supervisor.log`), the result state, the branch and the open PR. It starts from
+`.supervisor.log`), the result state, the branch, the open PR and the WAKE
+column (`acquired`, `unavailable`, `failed` or `-` for a run that did not ask
+for the lock). It starts from
 `tmux list-sessions`, so a session with no worktree appears there instead of
 only being found when `gc --all` kills it; `list` also names such orphans.
 `--no-gh` skips the PR column. The last line counts what was listed —
