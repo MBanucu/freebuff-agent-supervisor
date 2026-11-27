@@ -240,6 +240,8 @@ spawn-freebuff-agent status 103-example --lines 40
 spawn-freebuff-agent status 103-example --no-gh
 spawn-freebuff-agent status 103-example --json
 spawn-freebuff-agent status 103-example --explain
+spawn-freebuff-agent hours                 # any live fb-* session
+spawn-freebuff-agent hours --json
 spawn-freebuff-agent attach 103-example   # detach with Ctrl-b d
 spawn-freebuff-agent send 103-example "Also run the new test"
 spawn-freebuff-agent watch 103-example --idle-seconds 120 --poll 5
@@ -264,6 +266,15 @@ seconds, the pane tail, the last commit, whether the worktree is dirty, and any
 open PR for the branch. `--window N` sets the scrollback the classifier reads
 (default 40) and `--explain` adds the decision trail described in
 [machine-readable output](docs/machine-readable-output.md).
+
+`hours [NAME]` reads the remaining Freebuff hour budget from a live pane,
+never from a guess or a file: the welcome panel's `N/M hours remaining` first,
+then the footer fraction next to the model (`DeepSeek V4.1 Flash 10/17 •
+high`). `NAME` defaults to any live `fb-*` session. It prints
+`hours=N/M session=fb-X age=Ns source=panel|footer`, where the age is the
+seconds since the pane last changed, so a stale reading is visible. With no
+live session, or a pane that shows no figure, it prints `hours=unknown` and
+exits 2. `--json` emits the same fields as one object.
 
 `sessions` is the inventory: one row per `fb-*` session **and** per worktree,
 with `WORKTREE yes|missing`, the attached `autostop` watcher (`pid:N`, `dead`

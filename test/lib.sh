@@ -320,6 +320,15 @@ BANNER_IDLE_PANE=' Can.t reach Freebuff.s servers. Retrying… Try another netwo
 │  ▍Enter a coding task or / for commands
 ╰──────────────────╯
  DeepSeek V4.1 Flash 10/17 • high · /tmp/x/proj · /model to change · Chat: New chat'
+# The welcome panel (#106) draws the account's budget as `N/M hours remaining`
+# above the resting prompt. Its figure differs from the footer's, so a read
+# that prefers the panel is visible in its answer.
+HOURS_PANEL_PANE=' Welcome to Freebuff
+ 0/21 hours remaining
+╭──────────────────╮
+│  ▍Enter a coding task or / for commands
+╰──────────────────╯
+ DeepSeek V4.1 Flash 10/17 • high · /tmp/x/proj · /model to change · Chat: New chat'
 # A submitted brief: the composer is empty again, the turn is in flight and
 # the chat title now names the task instead of `New chat`.
 TURN_PANE='thinking...                                      7s  ■ Esc
