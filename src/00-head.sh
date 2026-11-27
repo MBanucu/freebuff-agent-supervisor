@@ -41,8 +41,10 @@
 #   state classification and evidence:
 #     sha256_hex, normalise_window, first_match, evidence_field,
 #     classify_chrome, freebuff_config_dir, turn_log_path, turn_log_read,
-#     turn_log_evidence, turn_log_cursor, turn_log_poll, emit_evidence,
-#     classify_state, session_state, session_activity, idle_seconds
+#     turn_log_evidence, turn_log_cursor, turn_log_poll, concord_file,
+#     concord_validate, concord_task_record, concord_map_state,
+#     concord_evidence, emit_evidence, classify_state, session_state,
+#     session_activity, idle_seconds
 #   the brief:
 #     write_task, ready_polls, ready_elapsed, ready_note, wait_ready,
 #     composer_line, chat_title, composer_cleared, turn_began,
