@@ -82,6 +82,16 @@ comes from `.task.md`. The default message names the session, its branch, its
 worktree path and the issue number, so no two sessions receive byte-identical
 text.
 
+`--trust-agents` forwards Freebuff's own `--trust-agents` flag, which loads a
+worktree's `.agents/` files and `mcp.json` without asking. That runs
+repository-supplied code with your permissions, so `start` never passes it by
+default; the vendor's help scopes it to loading this repository's agent files
+"for CI", not a general "stop asking me" switch. Without it, a launch that
+reaches the plain-terminal `Load and run these? [y/N]` prompt fails at once,
+names the `.agents` directory, types nothing and keeps the worktree. Answer
+`y` once in an interactive launch there to record the trust, or pass
+`--trust-agents`. `--dry-run` prints `trust_agents=yes|no`.
+
 Every sent brief is hashed and appended to `.supervisor-briefs.jsonl` in the
 repository root, which `start` also adds to `.git/info/exclude`. The last 20
 hashes are kept: before a worktree is created, `start` refuses text whose hash

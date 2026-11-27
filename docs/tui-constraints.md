@@ -18,14 +18,25 @@ ready_poll=0.5s`).
 
 While it waits, `start` notes `waiting-for-ready=yes elapsed=Ns` every ten
 polls, and records the outcome in `.worktrees/<name>/.supervisor.log`:
-`ready=yes` or `ready=timeout`, each with the elapsed seconds, the timeout and
-the poll interval. A pane that never becomes ready can never accept the
-brief, so `start` prints the last pane lines, stops that session, and fails in
-a message naming the `--ready-timeout` that was used, leaving the worktree and
-branch in place. The elapsed time and pane tail are what distinguishes a slow
-cold start from a hung TUI; raise `--ready-timeout` for the former. The concurrent-session overlay is a refusal instead: no keys are typed
-(its Enter would take over another live session), `start` prints `refused=yes`
-with the sentence and exits non-zero, and the worktree is kept.
+`ready=yes`, `ready=timeout` or `ready=trust-prompt`, each with the elapsed
+seconds, the timeout and the poll interval. A pane that never becomes ready
+can never accept the brief, so `start` prints the last pane lines, stops that
+session, and fails in a message naming the `--ready-timeout` that was used,
+leaving the worktree and branch in place. The elapsed time and pane tail are
+what distinguishes a slow cold start from a hung TUI; raise `--ready-timeout`
+for the former. The concurrent-session overlay is a refusal instead: no keys
+are typed (its Enter would take over another live session), `start` prints
+`refused=yes` with the sentence and exits non-zero, and the worktree is kept.
+
+**The trust prompt is the other pre-TUI stop.** A worktree with `.agents/`
+(or an `mcp.json`) makes Freebuff print `Load and run these? [y/N]` in the
+plain terminal before the TUI mounts. The readiness wait matches that line
+and returns on the first poll: `start` prints `trust_prompt=yes`, names the
+directory and both ways to proceed — answer `y` once in an interactive launch
+there, or pass `--trust-agents` — records `ready=trust-prompt` in
+`.supervisor.log`, stops the session and types nothing. The flag is opt-in
+because it runs repository-supplied code with the user's permissions; the
+default launch never passes it.
 
 **A ready pane can still swallow the Enter.** That failure looks healthy: the
 composer clears, the session rests at the idle prompt, the worktree is clean
