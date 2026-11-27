@@ -133,6 +133,32 @@ rm -f "$REPO/.supervisor-hours"
 fake_session test-999 "$IDLE_PANE"
 fake_add_session ghost
 
+# the MODEL column and its JSON object: what start recorded at launch (#136)
+printf '2026-01-01T00:00:00Z model=DeepSeek V4.1 Flash Fast price=free elapsed=1.2s session=fb-test-999\n' \
+    >>"$WT/.supervisor.log"
+out=$(bash "$TOOL" --root "$REPO" sessions --no-gh)
+check contains "$out" 'MODEL'
+check contains "$out" 'DeepSeek V4.1 Flash Fast (free)'
+# a row with no recorded model says so, and WAKE/HOURS stay the last two
+check test "$(printf '%s\n' "$out" | awk '$1 == "ghost" { print $8 }')" = -
+check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $(NF-1) }')" = -
+out=$(bash "$TOOL" --root "$REPO" sessions --json --no-gh)
+check json_ok "$out"
+check contains "$out" '"model": {'
+check contains "$out" '"name": "DeepSeek V4.1 Flash Fast",'
+check contains "$out" '"hours": "free"'
+# status prints the same evidence, and a failed picker attempt is not a model
+out=$(bash "$TOOL" --root "$REPO" status --no-gh test-999)
+check contains "$out" 'model=DeepSeek V4.1 Flash Fast hours=free'
+printf '2026-01-01T00:00:01Z model=no want=flash reason=resolve elapsed=0.1s session=fb-test-999\n' \
+    >>"$WT/.supervisor.log"
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-999)
+check json_ok "$out"
+check contains "$out" '"name": "DeepSeek V4.1 Flash Fast",'
+# the failed line adds no second model= row: the choice is still the one
+out=$(bash "$TOOL" --root "$REPO" status --no-gh test-999)
+check test "$(printf '%s\n' "$out" | grep -c '^model=')" = 1
+
 # a watcher that was recorded but has gone is not reported as alive
 printf 'autostop=pid:999999\n' >>"$WT/.supervisor.log"
 out=$(bash "$TOOL" --root "$REPO" sessions --no-gh)

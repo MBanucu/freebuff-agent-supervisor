@@ -22,6 +22,10 @@ what the pane is doing.
     "finished": false,
     "watcher": "pid:123",
     "wake_lock": "acquired",
+    "model": {
+      "name": "DeepSeek V4.1 Flash Fast",
+      "hours": "free"
+    },
     "worktree": "yes",
     "result": "blocked",
     "branch": "test/999",
@@ -34,6 +38,14 @@ what the pane is doing.
   }
 ]
 ```
+
+The `model` object is the choice `start --model` recorded in
+`.supervisor.log`: `name` is the picker entry and `hours` its cost class
+(`free`, `Nx`, `paid` or `daily`), which is the same value the table's MODEL
+column appends in parentheses. Both are `null` for a run that chose no model,
+including a worktree with no log; a failed picker attempt is recorded as
+`model=no ...` and is not a choice, so it leaves both `null`. `status` prints
+the same evidence as `model=<name> hours=<class>` when it exists.
 
 The `hours` object is the account usage the TUI draws, in all three values the
 human views show: `value` is the `N/M` string, `source` is `panel` when the
@@ -48,6 +60,7 @@ appended to `.supervisor-hours` as
 `status NAME --json` is one object with the same fields plus the detail view's:
 `running` and `dirty` as booleans, `input` (`raw|canonical|unknown`),
 `session_state`, `turn_state`, `turn_outcome`, `commit`, `wake_lock`, the
+`model` object (`name` and `hours`, both `null` when none was recorded), the
 `hours` object, the `result_*` keys from `.agent-result`, the pane tail as a
 `pane` string, and the classifier's decision as the `evidence` object
 documented below.
@@ -108,7 +121,8 @@ session is not running or its state is terminal (`done`, `stopped`, `blocked`,
 `failed`) — a finished run has no idle time, so a done card cannot read `idle
 5495s` — `result` with no `.agent-result`, `branch` and `pr` for a session with
 no worktree, `watcher` with no autostop recorded, `wake_lock` when the run did
-not ask for one, and `pane` when no session is running. The `hours` values are
+not ask for one, the `model` fields when the run chose no model, and `pane`
+when no session is running. The `hours` values are
 `null` only when neither the pane nor the ledger has a reading; `age_seconds`
 is `0` for a live read and the ledger's age otherwise. `wake_lock` is the
 value `start` recorded (`acquired`, `unavailable` or `failed`), not a live
