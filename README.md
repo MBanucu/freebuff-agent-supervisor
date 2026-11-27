@@ -45,6 +45,8 @@ anything, and it never modifies the main worktree.
 - `freebuff` on `PATH` (or `FREEBUFF_BIN`).
 - `tmux`. On NixOS the tool finds it with `nix-shell -p tmux` and caches the
   path; otherwise install it or set `FREEBUFF_TMUX`.
+- GNU `stty` for the raw-mode check. A `PATH` that prefers toybox's `stty`
+  (no `-F`) can be overridden with `FREEBUFF_STTY`.
 - `gh` authenticated for the PR column and for the generated brief. The tool
   still works without it with `--title`/`--url` or `--no-gh`.
 - `python3` is optional and used only by `gui --serve`; every other command

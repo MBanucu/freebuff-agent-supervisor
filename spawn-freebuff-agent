@@ -20,8 +20,9 @@
 #
 #   argv and usage:
 #     usage, die, note, is_num, is_duration, valid_name
-#   tmux, freebuff and git discovery:
-#     repo_slug, tmux_bin, freebuff_bin, exclude_path, ensure_excludes
+#   tmux, freebuff, stty and git discovery:
+#     repo_slug, tmux_bin, freebuff_bin, stty_bin, exclude_path,
+#     ensure_excludes
 #   state files and refusals:
 #     result_key, result_state, state_is_terminal, refusal_recorded,
 #     refusal_sentence, refusal_record, clear_refusal
@@ -114,8 +115,21 @@ READY_POLL=0.5
 # Note the wait every this many polls, so a slow launch leaves a trace in
 # .supervisor.log instead of looking like a hang.
 READY_NOTE_POLLS=10
-# Set by wait_ready: seconds spent polling, for the log and the failure line.
+# A readiness check can fail hard instead of being "not raw yet": tmux names
+# no tty for the pane, or the stty binary is missing or cannot read that tty
+# (toybox stty without -F, a pty the user cannot open). Those do not clear on
+# their own, so after this many consecutive failures the wait names the fault
+# instead of burning every poll in --ready-timeout. A cold start that has a
+# tty but is not raw yet still gets the whole deadline.
+READY_FAILS=3
+# Set by wait_ready: seconds spent polling, and on a hard failure why the pane
+# never became ready, the exact stty command, the tty and stty's error, for
+# the log and the failure line.
 READY_ELAPSED=0.0
+READY_REASON=''
+READY_STTY=''
+READY_TTY=''
+READY_ERROR=''
 # A ready TUI can still swallow the Enter: the brief lands in the composer and
 # is never submitted, the composer clears, and the session rests at the idle
 # prompt looking healthy. So the Enter is not proof. After typing, start waits
@@ -252,6 +266,8 @@ Spawn parallel Freebuff agents in isolated git worktrees.
 Environment:
   FREEBUFF_BIN        freebuff executable (default: freebuff on PATH)
   FREEBUFF_TMUX       tmux executable (default: tmux on PATH, then nix-shell)
+  FREEBUFF_STTY       stty executable for the raw-mode check (default: stty on
+                      PATH); point it at GNU stty if the PATH one has no -F
   FREEBUFF_START_JITTER  upper bound in seconds for the random delay before a
                          send when --max-sessions allows several (default:
                          2N; 0 disables the wait)
@@ -376,6 +392,17 @@ freebuff_bin() {
         return 0
     fi
     return 1
+}
+
+stty_bin() {
+    # The raw-mode check uses GNU stty's -F. Termux ships it in coreutils, but
+    # a PATH that prefers /system/bin gives toybox instead, so the binary is
+    # overridable like tmux and freebuff rather than assumed.
+    if [ -n "${FREEBUFF_STTY:-}" ]; then
+        printf '%s' "$FREEBUFF_STTY"
+        return 0
+    fi
+    command -v stty 2>/dev/null
 }
 
 exclude_path() {
@@ -947,19 +974,33 @@ ready_note() {
 
 wait_ready() {
     # wait_ready TMUX SESSION WORKTREE TIMEOUT POLL -> 0 ready, 2 refused,
-    # 1 never ready inside TIMEOUT. A refusal is checked first: the overlay
-    # never draws the resting prompt, and typing into it would take over
-    # another live session instead of starting this one. The wait is a
-    # predicate with a deadline, not a fixed sleep count: it re-checks every
-    # POLL seconds until TIMEOUT has passed, so a warm pane returns on the
-    # first check and a cold launch gets the whole --ready-timeout budget.
-    # READY_ELAPSED is set for the caller's log line and failure message.
+    # 1 did not become ready. A refusal is checked first: the overlay never
+    # draws the resting prompt, and typing into it would take over another
+    # live session instead of starting this one. The wait is a predicate with
+    # a deadline, not a fixed sleep count: it re-checks every POLL seconds
+    # until TIMEOUT has passed, so a warm pane returns on the first check and
+    # a cold launch gets the whole --ready-timeout budget.
+    #
+    # "Not raw yet" is not the only way a check can fail. If tmux names no tty,
+    # or stty cannot run on the tty it named, the predicate can never become
+    # true, and waiting out the deadline only hides the fault. After
+    # READY_FAILS consecutive such failures the wait returns with the reason
+    # in READY_REASON and the evidence in READY_ELAPSED/READY_TTY/READY_STTY/
+    # READY_ERROR. A cool-down is not a hard failure: a tty that reports
+    # canonical mode, or a raw pane without the resting prompt, keeps polling.
     local tmux="$1" session="$2" wt="$3" timeout="$4" poll="$5"
-    local polls i=0 tty pane
+    local polls i=0 tty pane stty out rc fails=0 no_tty=0
     polls=$(ready_polls "$timeout" "$poll")
+    # Resolved once, before the first check, so the happy path pays no lookup.
+    stty=$(stty_bin 2>/dev/null || true)
+    READY_REASON=''
+    READY_STTY=''
+    READY_TTY=''
+    READY_ERROR=''
     while :; do
         if ! "$tmux" has-session -t "$session" 2>/dev/null; then
             READY_ELAPSED=$(ready_elapsed "$i" "$poll")
+            READY_REASON=no-session
             return 1
         fi
         tty=$("$tmux" display-message -p -t "$session" '#{pane_tty}' 2>/dev/null || true)
@@ -968,16 +1009,50 @@ wait_ready() {
             READY_ELAPSED=$(ready_elapsed "$i" "$poll")
             return 2
         fi
-        if [ -n "$tty" ] &&
-            stty -a -F "$tty" 2>/dev/null | grep -q -- '-icanon' &&
-            printf '%s' "$pane" | grep -q 'Enter a coding task'; then
-            READY_ELAPSED=$(ready_elapsed "$i" "$poll")
-            ready_note "$wt" "ready=yes elapsed=${READY_ELAPSED}s timeout=${timeout}s poll=${poll}s"
-            return 0
+        if [ -z "$tty" ]; then
+            no_tty=$((no_tty + 1))
+            fails=0
+            if [ "$no_tty" -ge "$READY_FAILS" ]; then
+                READY_ELAPSED=$(ready_elapsed "$i" "$poll")
+                READY_REASON=no-tty
+                return 1
+            fi
+        else
+            no_tty=0
+            # stdout and stderr share one capture: on failure stty writes the
+            # error and nothing else, and on success the settings are what
+            # the -icanon check needs. Newlines are flattened so one log line
+            # stays one line.
+            if [ -n "$stty" ]; then
+                out=$("$stty" -a -F "$tty" 2>&1) && rc=0 || rc=$?
+            else
+                out='stty not found on PATH (set FREEBUFF_STTY)'
+                rc=127
+            fi
+            if [ "$rc" -ne 0 ]; then
+                fails=$((fails + 1))
+                READY_STTY=${stty:-stty}
+                READY_TTY=$tty
+                READY_ERROR=${out//$'\n'/ }
+                if [ "$fails" -ge "$READY_FAILS" ]; then
+                    READY_ELAPSED=$(ready_elapsed "$i" "$poll")
+                    READY_REASON=stty
+                    return 1
+                fi
+            else
+                fails=0
+                if printf '%s' "$out" | grep -q -- '-icanon' &&
+                    printf '%s' "$pane" | grep -q 'Enter a coding task'; then
+                    READY_ELAPSED=$(ready_elapsed "$i" "$poll")
+                    ready_note "$wt" "ready=yes elapsed=${READY_ELAPSED}s timeout=${timeout}s poll=${poll}s"
+                    return 0
+                fi
+            fi
         fi
         i=$((i + 1))
         if [ "$i" -ge "$polls" ]; then
             READY_ELAPSED=$(ready_elapsed "$i" "$poll")
+            READY_REASON=timeout
             return 1
         fi
         if [ $((i % READY_NOTE_POLLS)) -eq 0 ]; then
@@ -1468,8 +1543,27 @@ start() {
         # A pane that never reached raw input can never accept the brief, so it
         # is dead weight. Kill only the session; the worktree and branch stay.
         "$tmux" kill-session -t "$session" 2>/dev/null || true
-        ready_note "$wt" "ready=timeout elapsed=${READY_ELAPSED}s timeout=${ready_timeout}s poll=${ready_poll}s session=$session"
-        die "start: TUI did not reach raw input in $session after ${READY_ELAPSED}s (--ready-timeout $ready_timeout, --ready-poll $ready_poll); stopped it, worktree kept ($wt). A cold first launch can need a larger --ready-timeout."
+        case "$READY_REASON" in
+            stty)
+                # Name the binary, the tty and its own error: a toybox stty
+                # without -F, or a pty this user cannot open, is not a slow
+                # cold start and must not read as one.
+                ready_note "$wt" "ready=no reason=stty elapsed=${READY_ELAPSED}s timeout=${ready_timeout}s poll=${ready_poll}s session=$session tty=$READY_TTY command=$READY_STTY error=$READY_ERROR"
+                die "start: raw-mode check failed in $session after ${READY_ELAPSED}s: tty=$READY_TTY command=$READY_STTY -a -F $READY_TTY error=$READY_ERROR; stopped it, worktree kept ($wt). Set FREEBUFF_STTY to a GNU stty if this one does not support -F."
+                ;;
+            no-tty)
+                ready_note "$wt" "ready=no reason=no-tty elapsed=${READY_ELAPSED}s timeout=${ready_timeout}s poll=${ready_poll}s session=$session"
+                die "start: tmux reported no pane tty for $session after ${READY_ELAPSED}s (tmux display-message -p '#{pane_tty}'); stopped it, worktree kept ($wt)."
+                ;;
+            no-session)
+                ready_note "$wt" "ready=no reason=no-session elapsed=${READY_ELAPSED}s timeout=${ready_timeout}s poll=${ready_poll}s session=$session"
+                die "start: session $session disappeared before it reached raw input after ${READY_ELAPSED}s; stopped it, worktree kept ($wt)."
+                ;;
+            *)
+                ready_note "$wt" "ready=timeout elapsed=${READY_ELAPSED}s timeout=${ready_timeout}s poll=${ready_poll}s session=$session"
+                die "start: TUI did not reach raw input in $session after ${READY_ELAPSED}s (--ready-timeout $ready_timeout, --ready-poll $ready_poll); stopped it, worktree kept ($wt). A cold first launch can need a larger --ready-timeout."
+                ;;
+        esac
     fi
 
     # A brief that is byte-identical across sessions reads as scripted use to
@@ -1637,7 +1731,7 @@ status() {
     esac
     is_num "$window" || die "status: --window must be a number"
 
-    local wt="$ROOT/.worktrees/$name" branch session tmux running=0 tty mode=unknown
+    local wt="$ROOT/.worktrees/$name" branch session tmux running=0 tty mode=unknown stty out
     local state rstate="" pane="" idle="" sstate="" last_commit dirty=no watcher=""
     local result_pr="" result_commit="" result_tests="" prs="" pr_json=null
     local evidence="" ev_rule="" ev_matched="" ev_lines="" ev_sha="" ev_scans=""
@@ -1673,10 +1767,18 @@ status() {
     if [ -n "$tmux" ] && "$tmux" has-session -t "$session" 2>/dev/null; then
         running=1
         tty=$("$tmux" display-message -p -t "$session" '#{pane_tty}' 2>/dev/null || true)
-        if [ -n "$tty" ] && stty -a -F "$tty" 2>/dev/null | grep -q -- '-icanon'; then
-            mode=raw
-        else
-            mode=canonical
+        # raw/canonical are known only when stty can read the tty. A missing
+        # tty, a missing stty or a tty stty cannot open stays unknown instead
+        # of claiming canonical input the tool never observed.
+        if [ -n "$tty" ]; then
+            stty=$(stty_bin 2>/dev/null || true)
+            if [ -n "$stty" ] && out=$("$stty" -a -F "$tty" 2>/dev/null); then
+                if printf '%s' "$out" | grep -q -- '-icanon'; then
+                    mode=raw
+                else
+                    mode=canonical
+                fi
+            fi
         fi
         evidence=$(classify_state "$name" "$window")
         sstate=$(evidence_field "$evidence" state)
