@@ -394,6 +394,48 @@ check test ! -s "$TMP/wake.log"
 # Put PATH back so the areas after this one see the fixture they expect.
 export PATH="$PATH_SAVED"
 
+# ---- send: the `--` form and a pane with no composer (#121) ----
+
+# `send NAME -- TEXT` used to type the separator itself and drop the message.
+# The text arrives as one argv element and nothing else is typed but Enter.
+fake_session test-999 "$IDLE_PANE"
+: >"$FAKE_DIR/sent"
+out=$(bash "$TOOL" --root "$REPO" send test-999 -- '-also a follow-up')
+check test -z "$out"
+check grep -qF -- $'-also a follow-up\t' "$FAKE_DIR/sent"
+check test "$(grep -c . "$FAKE_DIR/sent")" = 2
+
+# A `--` with nothing after it is a missing text, not a message of "--".
+: >"$FAKE_DIR/sent"
+if bash "$TOOL" --root "$REPO" send test-999 -- >"$TMP/send.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -ne 0
+check contains "$(cat "$TMP/send.out")" 'send: TEXT is required'
+check test ! -s "$FAKE_DIR/sent"
+
+# A released session has an overlay, not a composer: typing there loses the
+# text, so send refuses and names the step that retries the session.
+fake_session test-999 "$RELEASED_PANE"
+: >"$FAKE_DIR/sent"
+if bash "$TOOL" --root "$REPO" send test-999 'continue' >"$TMP/send.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -ne 0
+check contains "$(cat "$TMP/send.out")" 'released-session overlay'
+check contains "$(cat "$TMP/send.out")" 'press Enter in the pane'
+check test ! -s "$FAKE_DIR/sent"
+
+# A detached worktree answers `HEAD`; the launch record keeps the branch the
+# session was created on, so a retry does not lose it from the column.
+fake_session test-999 "$IDLE_PANE"
+printf 'branch=test/recorded\n' >"$WT/.supervisor-gh"
+git -C "$WT" checkout --detach >/dev/null 2>&1
+check test "$(git -C "$WT" rev-parse --abbrev-ref HEAD)" = HEAD
+out=$(bash "$TOOL" --root "$REPO" sessions --no-gh)
+check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $7 }')" = test/recorded
+# Without the gh record, the branch .task.md was written with is the fallback.
+rm -f "$WT/.supervisor-gh"
+out=$(bash "$TOOL" --root "$REPO" sessions --no-gh)
+check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $7 }')" = test/999
+git -C "$WT" checkout test/999 >/dev/null 2>&1
+
 # leave the fixture as it was found
 if [ -n "$RESULT_SAVED" ]; then
     printf '%s\n' "$RESULT_SAVED" >"$WT/.agent-result"
