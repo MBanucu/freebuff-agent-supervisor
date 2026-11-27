@@ -265,3 +265,125 @@ check contains "$out" '"pane": null'
 
 fake_session test-999 "$IDLE_PANE"
 rm -f "$WT/.agent-result"
+
+# ---- the turn-log source (#75) ----
+# A fixture chat directory stands in for the client's debug log; the fake
+# tmux still supplies the session, so no real Freebuff run is involved.
+CHAT_ROOT="$FREEBUFF_CONFIG_DIR/projects/test-999/chats"
+chat_log() {
+    # chat_log OUTCOME|working|truncated -> one chat directory and log.jsonl.
+    # `working` puts the end before the start, so the last event is a start
+    # with no end after it; `truncated` leaves the end half-written.
+    rm -rf "$FREEBUFF_CONFIG_DIR/projects"
+    mkdir -p "$CHAT_ROOT/2026-11-25T10-32-52"
+    printf '{"output":{"type":"lastMessage"}}\n' \
+        >"$CHAT_ROOT/2026-11-25T10-32-52/run-state.json"
+    case "$1" in
+        working)
+            printf '%s\n' \
+                '{"msg":"Main prompt finished","data":{"outputType":"lastMessage"}}' \
+                '{"msg":"[send-message] Sending message with sdk run config","data":{}}' \
+                >"$CHAT_ROOT/2026-11-25T10-32-52/log.jsonl"
+            ;;
+        truncated)
+            printf '%s\n' \
+                '{"msg":"[send-message] Sending message with sdk run config","data":{}}' \
+                '{"msg":"Main prompt finished","data":{"outputType":"lastMess' \
+                >"$CHAT_ROOT/2026-11-25T10-32-52/log.jsonl"
+            ;;
+        *)
+            printf '%s\n' \
+                '{"msg":"[send-message] Sending message with sdk run config","data":{}}' \
+                "{\"msg\":\"Main prompt finished\",\"data\":{\"outputType\":\"$1\"}}" \
+                >"$CHAT_ROOT/2026-11-25T10-32-52/log.jsonl"
+            ;;
+    esac
+}
+
+# a lastMessage turn is finished; the pane would rest at its prompt, so
+# session_state is idle and done stays the result file's word
+chat_log lastMessage
+fake_session test-999 "$IDLE_PANE"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --source log test-999)
+check contains "$out" 'session_state=idle'
+check contains "$out" 'turn_state=finished'
+check contains "$out" 'turn_outcome=lastMessage'
+
+# an error turn is failed, in both vocabularies
+chat_log error
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --source log test-999)
+check contains "$out" 'session_state=failed'
+check contains "$out" 'turn_state=failed'
+check contains "$out" 'turn_outcome=error'
+
+# a start with no end after it is a turn in flight, with no outcome yet
+chat_log working
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --source log test-999)
+check contains "$out" 'session_state=working'
+check contains "$out" 'turn_state=working'
+check grep -qxF 'turn_outcome=' <<<"$out"
+
+# a half-written final line is ignored, so the turn is still working
+chat_log truncated
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --source log test-999)
+check contains "$out" 'turn_state=working'
+
+# --explain names the source, the rule and the pair it read
+chat_log lastMessage
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --source log --explain test-999)
+check contains "$out" 'explain: source=log'
+check contains "$out" 'explain: rule=turn-finished'
+check contains "$out" 'explain: turn_state=finished'
+check contains "$out" 'explain: turn_outcome=lastMessage'
+check contains "$out" 'explain: check: turn-start (line 1): yes'
+check contains "$out" 'explain: check: turn-end (line 2): yes'
+
+# no chat directory is unknown with a reason, never an error
+rm -rf "$FREEBUFF_CONFIG_DIR/projects"
+if out=$(bash "$TOOL" --root "$REPO" status --no-gh --source log --explain test-999); then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+check contains "$out" 'session_state=unknown'
+check contains "$out" 'turn_state=unknown'
+check contains "$out" 'explain: rule=no-turn-log'
+check contains "$out" 'explain: source=log'
+
+# the default stays the pane: a busy pane wins over a finished log
+chat_log lastMessage
+fake_session test-999 "$BUSY_PANE"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh test-999)
+check contains "$out" 'session_state=working'
+check test -z "$(printf '%s\n' "$out" | grep -F 'turn_state=' || true)"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --source log test-999)
+check contains "$out" 'session_state=idle'
+check contains "$out" 'turn_state=finished'
+
+# auto prefers the log; with none it falls back to the pane and says so
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --source auto test-999)
+check contains "$out" 'session_state=idle'
+check contains "$out" 'turn_state=finished'
+rm -rf "$FREEBUFF_CONFIG_DIR/projects"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --source auto --explain test-999)
+check contains "$out" 'session_state=working'
+check contains "$out" 'explain: source=pane'
+check contains "$out" 'explain: check: log-verdict: unknown'
+
+# --json carries the turn keys additively, null when the log is absent
+chat_log lastMessage
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-999)
+check json_ok "$out"
+check contains "$out" '"turn_state": "finished"'
+check contains "$out" '"turn_outcome": "lastMessage"'
+check contains "$out" '"source": "pane"'
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh --source log test-999)
+check json_ok "$out"
+check contains "$out" '"source": "log"'
+check contains "$out" '"turn_state": "finished"'
+rm -rf "$FREEBUFF_CONFIG_DIR/projects"
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-999)
+check json_ok "$out"
+check contains "$out" '"turn_state": null'
+check contains "$out" '"turn_outcome": null'
+
+# leave the fixture out of the areas that run after this one
+rm -rf "$FREEBUFF_CONFIG_DIR/projects"
+fake_session test-999 "$IDLE_PANE"

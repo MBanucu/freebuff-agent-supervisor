@@ -32,9 +32,19 @@ what the pane is doing.
 
 `status NAME --json` is one object with the same fields plus the detail view's:
 `running` and `dirty` as booleans, `input` (`raw|canonical|unknown`),
-`session_state`, `commit`, `wake_lock`, the `result_*` keys from
-`.agent-result`, the pane tail as a `pane` string, and the classifier's
-decision as the `evidence` object documented below.
+`session_state`, `turn_state`, `turn_outcome`, `commit`, `wake_lock`, the
+`result_*` keys from `.agent-result`, the pane tail as a `pane` string, and the
+classifier's decision as the `evidence` object documented below.
+
+`turn_state` is the turn log's verdict (`working`, `finished`, `failed` or
+`unknown`) and `turn_outcome` its `outputType` (`lastMessage` or `error`).
+They are additive and do not change `session_state` on their own: `null` when
+there is no chat directory to read, `unknown` when the directory exists but
+holds no complete start/end pair. `--source log` makes `session_state` come
+from the same pair (a finished turn is `idle`; `done` stays the result file's
+word), and `--source auto` uses the log when it has a verdict and otherwise
+falls back to the pane. `--explain` names the source, the rule and the pair it
+read.
 
 `hours NAME --json` is one object with the human line's fields: `hours` is
 the `N/M` figure read from the pane, `session` the live session it came from,
@@ -55,6 +65,7 @@ The same block is in `status --json` as an additive `evidence` object:
 
 ```json
 "evidence": {
+  "source": "pane",
   "rule": "no-rule-matched",
   "matched": null,
   "window_lines": 40,
@@ -63,12 +74,18 @@ The same block is in `status --json` as an additive `evidence` object:
 }
 ```
 
+`source` names what produced the verdict: `pane` (a pane rule or the session
+check), `log` (the turn log), `result-file` or `refusal`.
+
 `rule` is one of `recorded-refusal`, `result-file`, `refusal-prose`,
 `busy-marker`, `resting-prompt`, `protected-window`, `no-rule-matched`,
-`unstable-window`, `no-session`. `matched` is the first matching line, cut to
-200 characters. `unstable-window` keeps the old safe `working` answer for a pane
-that changed between the two scans without matching a rule; it is rechecked on
-the next poll rather than reported as `unknown`.
+`unstable-window`, `no-session`, and for the turn log `turn-started`,
+`turn-finished`, `turn-failed`, `no-turn-events` (a log with no complete
+pair) and `no-turn-log` (no chat directory or no `log.jsonl`). `matched` is
+the first matching line, cut to 200 characters. `unstable-window` keeps the
+old safe `working` answer for a pane that changed between the two scans
+without matching a rule; it is rechecked on the next poll rather than reported
+as `unknown`.
 
 A missing value is `null` rather than the table's `-`: `idle_seconds` when the
 session is not running or its state is terminal (`done`, `stopped`, `blocked`,
