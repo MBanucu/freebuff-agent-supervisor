@@ -268,13 +268,17 @@ Run inside Termux, in a checkout under `$HOME`.
    `proot-distro`, or a remote host — and the tool cannot paper over it.
    **[repo]** (the repo records the same client as a 138 MB ELF in
    `docs/freebuff-integration.md`) + **[package]** (the npm build is glibc;
-   Termux is bionic).
+   Termux is bionic). Since #98 the preflight runs the client's `--version`
+   before the worktree exists, so a present but unrunnable client is
+   `preflight=freebuff error=exit_127` and the start stops there instead of
+   waiting out the 120-second readiness gate.
 2. **`spawn-freebuff-agent gui --snapshot /tmp/agents.html` →
    `Permission denied`.** `/tmp` is shell-owned and not writable by the Termux
    uid. Use `$TMPDIR/agents.html`. **[device]**
 3. **`spawn-freebuff-agent start --issue 89` on a fresh install →
-   `start: tmux not found; install tmux or set FREEBUFF_TMUX`.** Fix:
-   `pkg install tmux`. **[repo]**
+   `start: tmux not found; install tmux or set FREEBUFF_TMUX`.** Since #98 it
+   is preceded by `preflight=tmux missing=tmux hint=pkg install tmux`, and no
+   worktree is created. Fix: `pkg install tmux`. **[repo]**
 4. **`spawn-freebuff-agent gui --serve` without Python.** The tool already says
    `gui: --serve needs python3 (pkg install python on Termux); the rest of the
    CLI works without it`. Fix: `pkg install python`. **[repo]**

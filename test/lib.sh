@@ -216,7 +216,12 @@ cat >"$TMP/bin/freebuff" <<'FAKE'
 exit 0
 FAKE
 chmod +x "$TMP/bin/stty" "$TMP/bin/freebuff"
-# The send-path areas opt in to these; until then the real tools answer, so
+# Freebuff is named the way FREEBUFF_TMUX names tmux: the preflight of every
+# start probes it, so an area must not depend on the real client being
+# installed, or on it being absent. An area that wants a broken client points
+# FREEBUFF_BIN at its own stub.
+export FREEBUFF_BIN="$TMP/bin/freebuff"
+# The send-path areas opt in to PATH too; until then the real tools answer, so
 # status input mode matches a launch that has not reached a pane.
 
 fake_session() {

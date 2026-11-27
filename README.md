@@ -97,6 +97,19 @@ Use `--task-file FILE` when an issue needs a custom scope instead of the
 generic issue brief. `--dry-run` prints the plan and changes nothing;
 `--no-start` creates only the worktree, branch and `.task.md`.
 
+Before it creates anything, `start` checks the environment and prints one
+`preflight=<command>` line per check: `tmux`, `freebuff`, `stty` and `git`, plus
+`gh` when the run mirrors the issue. A missing command names the line that
+installs it — `hint=pkg install tmux` on Termux (detected from `PREFIX` or
+`termux-wake-lock`), `hint=install tmux or set FREEBUFF_TMUX` elsewhere — and
+nothing is created. `freebuff` is probed with `--version` under a short timeout
+(`FREEBUFF_PREFLIGHT_TIMEOUT`, default 5 seconds), so a client that exists but
+cannot execute is reported with its exit status instead of as a readiness
+timeout. A miss on `gh` is reported and does not stop the run, because a launch
+can still be named with `--title`/`--url` or `--no-gh`. A healthy run prints
+`preflight=ok`. `--no-check` or `FREEBUFF_SKIP_PREFLIGHT=1` skips the check and
+keeps the old late lookup for a caller that knows its environment.
+
 `--auto-stop` starts a detached watcher after the prompt is sent. It stops
 `fb-<name>` as soon as the agent writes `.agent-result`, or when the pane has
 been idle for `--idle-seconds` (default 120) with `--poll` seconds between
