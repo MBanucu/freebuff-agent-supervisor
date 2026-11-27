@@ -41,6 +41,32 @@ there, or pass `--trust-agents` — records `ready=trust-prompt` in
 because it runs repository-supplied code with the user's permissions; the
 default launch never passes it.
 
+**The model picker is the only switch, and it costs nothing to open.** The
+client takes no `--model` flag, reads no model environment variable and keeps
+no per-worktree model setting: the model is one key in `settings.json` that
+the TUI's `/model` picker writes, so a per-launch choice can only be made
+through the TUI. `/model` opens a frame that prints its own aid line
+(`choose model · Tab reasoning · Enter select · Esc cancel`), draws one box
+per model and puts the only per-model price the client shows on the line under
+each name: `2x` for a model whose hour costs two, and a phrase with no
+multiplier — `Recommended`, `Paid plan` — for one that spends none. Typing does
+not filter the list; the arrow keys move the `›` marker and Enter selects.
+
+The picker itself is free: the hour charge happens at submit, so opening it,
+walking it and cancelling spends nothing. `start --model` uses that: it types
+`/model`, waits for the aid line, resolves the wanted name from the boxes it
+drew, presses the arrow key that closes the distance to the `›` marker (and
+reverses when a press does not move it, because the list does not wrap),
+presses Enter only once the marker sits on the name, and then requires the
+footer to name that model with the frame gone. A name the frame does not draw
+is not absent: the frame holds one page, the arrow keys scroll the list, so the
+search walks down to the end and back before it reports a name missing. The
+same walk is what `models` lists from. The confirmed name and its
+price line are recorded as `model=<name> price=<free|Nx|paid|daily>` in
+`.supervisor.log`; a choice that cannot be made or confirmed stops the session
+with no brief sent and keeps the worktree. Because the selection is a global
+setting, two launches that want different models must be run in sequence.
+
 **A ready pane can still swallow the Enter.** That failure looks healthy: the
 composer clears, the session rests at the idle prompt, the worktree is clean
 and `session_state` says `idle`, so the old `start` printed `started=yes` for a
