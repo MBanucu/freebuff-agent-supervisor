@@ -299,6 +299,12 @@ Enter: take over  Esc: back to draft'
 HOURS_PANE='Not enough hours for DeepSeek V4.1 Flash: an hour on it takes 2 hours.
 Choose another model or visit https://freebuff.com/plans.
 Enter: choose another model   Esc: back to draft'
+# The TUI also draws the account's usage in its footer, with no overlay open:
+# that is a footer reading in the hours ledger (#108).
+HOURS_FOOTER_PANE='╭──────────────────╮
+│  ▍Enter a coding task or / for commands
+╰──────────────────╯
+ DeepSeek V4.1 Flash • high · /tmp/x/proj · Hours today: 3/4'
 # The trust gate runs in the plain terminal before the TUI mounts, so this
 # pane never draws the resting prompt and the readiness wait must name it.
 TRUST_PANE='Found agent configuration in /tmp/x/repo/.worktrees/test-trust/.agents
