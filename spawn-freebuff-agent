@@ -48,13 +48,18 @@
 #     await_submission, brief_hash, brief_ledger_file, brief_ledger_seen,
 #     brief_ledger_trim, brief_ledger_record, brief_ledger_mark_refused,
 #     refuse_sent_brief, compose_brief, brief_jitter_max
+#   the model picker:
+#     model_norm, picker_frame, picker_entries, picker_names, picker_selected,
+#     picker_price, model_hours_cost, model_footer, model_resolve, picker_wait,
+#     model_choose
 #   the issue mirror:
 #     gh_state_color, gh_state
 #   start:
 #     start
-#   status, list, sessions and hours:
+#   status, list, sessions, hours and models:
 #     print_explanation, status, list_agents, watcher_state, live_sessions,
-#     live_session_count, finished_live, finished_live_names, sessions, hours
+#     live_session_count, finished_live, finished_live_names, sessions, hours,
+#     models
 #   watch, autostop, notify, reap and gc:
 #     reap, watch_run, watch, autostop, notify, gc
 #   the GUI:
@@ -175,6 +180,31 @@ SUBMIT_TIMEOUT=20
 # Set by await_submission: the signal that proved the send and the time it took.
 SUBMIT_PROOF=''
 SUBMIT_ELAPSED=0.0
+# The /model picker (#125). The client has no --model flag, no environment
+# override and no per-worktree setting: its model is one config key that the
+# TUI's `/model` picker writes, so the picker is the only per-session switch.
+# Its aid line is what says the frame is open; an entry's name line carries
+# `•` and the line under it carries the only per-model price the client
+# prints (`2x` for a model whose hour costs two, a phrase with no multiplier
+# for one that spends none). Every step is read back from the pane.
+MODEL_PICKER_AID='choose model'
+MODEL_PICKER_TIMEOUT=15
+MODEL_PICKER_POLL=0.5
+# Up to this many arrow keys before the walk is called stuck. The real list is
+# a few screens long, so this is a runaway guard, not a limit on the list.
+MODEL_PICKER_STEPS=40
+# Set by model_resolve: the entry --model named, its price line, and why a
+# name matched nothing. Set by model_choose: the seconds the switch took.
+MODEL_RESOLVED=''
+MODEL_PRICE=''
+MODEL_ERROR=''
+# Set by model_resolve: whether the name matched several entries. Ambiguity is
+# not absence, so the scroll search must not walk the list over it.
+MODEL_AMBIGUOUS=0
+# The last pane captured by model_frame_get, which is the frame the search and
+# the walk both read.
+MODEL_FRAME=''
+PICKER_ELAPSED=0
 # Preflight: `freebuff --version` must answer inside this many seconds, or the
 # start says so instead of waiting out the readiness gate. A client that exists
 # but cannot execute (the glibc binary on bionic Termux, #89) is the failure
@@ -223,6 +253,20 @@ Spawn parallel Freebuff agents in isolated git worktrees.
                          so a burst does not reach the TUI in one second.
       --no-start         create the worktree and brief, do not launch
       --prompt TEXT      send this message instead of the default brief
+      --model NAME       choose this model in the TUI before the brief is
+                         typed: an exact picker name, or a unique
+                         case-insensitive substring of one (`fast` is
+                         `DeepSeek V4.1 Flash Fast`). The client has no flag
+                         for it, so its /model picker is driven and the
+                         footer is read back before a key of the brief is
+                         sent. The run prints model=<name>
+                         price=<free|Nx|paid|daily>; `free` means the picker
+                         printed no hour multiplier under that entry, so the
+                         session spends none of the daily budget, while
+                         `paid` and `daily` are a Paid plan and a per-day
+                         session cap. A name the frame does not draw is
+                         found by scrolling the list. An ambiguous or
+                         unknown name fails before anything is sent.
       --no-gh            do not label or comment on the issue
       --no-check         skip the preflight that names a missing tmux,
                          freebuff, stty or git before anything is created
@@ -275,6 +319,19 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       seconds since the pane last changed), never an estimate.
       --json      emit the same fields as one JSON object
       Prints hours=unknown and exits 2 when no live pane can be read.
+
+  spawn-freebuff-agent models [NAME] [--json]
+      List the models the client offers, read from a live session's /model
+      picker: one `model=<name> hours=<free|2x|paid|daily>` line each, where
+      `free` means the entry carries no hour multiplier, so a session on it
+      spends none of the daily budget. The client has no catalog command, so
+      the picker is the catalog: it is opened with /model, walked to the end
+      of the list (the frame draws one page and the arrow keys scroll it) and
+      closed with Escape, leaving the session as it was. Nothing is
+      submitted, so listing spends no hours. NAME defaults to any live fb-*
+      session. Prints model=none and exits 1 when there is no live session,
+      and refuses to type into a working or refused one.
+      --json      emit the same rows as one JSON object
 
   spawn-freebuff-agent gui --snapshot FILE [--watch N] [--no-gh]
       Write one self-contained HTML page from `sessions --json`: one card
@@ -377,6 +434,14 @@ Notes:
   - A wait that gives up names the timeout it used, prints the last pane
     lines and records elapsed seconds in .supervisor.log, so a slow cold
     launch is distinguishable from a hung TUI.
+  - --model drives the client's own /model picker. There is no client flag,
+    environment override or per-worktree setting for the model, so start
+    types /model, moves the `›` marker with the arrow keys the frame prints,
+    and presses Enter only once that marker sits on the chosen name. The
+    footer must then name the model, or the launch fails with no brief sent
+    and the session stopped. The switch writes the client's global model
+    setting, so two launches that want different models must not run at the
+    same moment.
   - A ready pane can still swallow the Enter. After typing, start waits for
     the input line to clear and for the turn to begin (or the chat title to
     change) and prints sent=yes with the signal that proved it. A send that
@@ -1961,6 +2026,304 @@ compose_brief() {
     printf '%s' "$text"
 }
 
+# ---- the model picker ----
+# `start --model` switches the model before the brief is typed. The client
+# exposes no flag for it, so the picker is driven with the keys it prints and
+# every step is read back: the frame, the `›` marker walking to the chosen
+# name, and the footer naming that name afterwards.
+model_norm() {
+    # model_norm TEXT -> lower case with runs of whitespace collapsed, so
+    # `--model fast` and `--model "DeepSeek V4.1 Flash Fast"` compare the same
+    # way regardless of case or spacing.
+    printf '%s' "${1-}" | tr '[:upper:]' '[:lower:]' |
+        sed -E 's/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+picker_frame() {
+    # picker_frame PANE -> 0 when the /model picker is on screen. No other
+    # frame draws its aid line, and the hours overlay's `choose another model`
+    # does not contain this phrase.
+    printf '%s\n' "${1-}" | grep -qF -- "$MODEL_PICKER_AID"
+}
+
+picker_entries() {
+    # picker_entries PANE -> one `yes|no<TAB>name<TAB>price` line per entry, in
+    # the order the list draws them. Inside a box, the line carrying `•` is the
+    # model's name and the line under it is its price; `›` marks the
+    # selection. The hours panel and the section headings are drawn in boxes
+    # too, so an entry with no name is skipped.
+    printf '%s\n' "${1-}" | awk '
+        function trim(s) { gsub(/^[[:space:]]+/, "", s); gsub(/[[:space:]]+$/, "", s); return s }
+        /^[[:space:]]*┌/ { inbox = 1; name = ""; price = ""; sel = "no"; next }
+        /^[[:space:]]*└/ {
+            if (inbox && name != "") printf "%s\t%s\t%s\n", sel, name, price
+            inbox = 0; name = ""; price = ""
+            next
+        }
+        inbox {
+            body = $0
+            sub(/^[[:space:]]*│/, "", body)
+            sub(/[[:space:]]*│[[:space:]]*$/, "", body)
+            body = trim(body)
+            if (body == "") next
+            if (body ~ /^›/) { sel = "yes"; sub(/^›[[:space:]]*/, "", body) }
+            if (index(body, "•") > 0) {
+                n = body
+                sub(/[[:space:]]*•.*$/, "", n)
+                name = trim(n)
+            } else if (name != "") {
+                price = trim(body)
+            }
+        }'
+}
+
+picker_names() {
+    # picker_names PANE -> the entry names, one per line, in picker order
+    picker_entries "${1-}" | cut -f2
+}
+
+picker_selected() {
+    # picker_selected PANE -> the name the `›` marker sits on, empty when the
+    # frame carries none (a repaint, or a list that has not drawn yet)
+    picker_entries "${1-}" | awk -F'\t' '$1 == "yes" { print $2; exit }'
+}
+
+picker_price() {
+    # picker_price PANE NAME -> the line the picker draws under NAME, empty
+    # when it draws none. It is the only per-model price the client shows.
+    picker_entries "${1-}" | awk -F'\t' -v n="$2" '$2 == n { print $3; exit }'
+}
+
+model_hours_cost() {
+    # model_hours_cost PRICE -> what the picker says that model costs: `2x`
+    # when an hour on it costs two, `paid` for a Paid plan, `daily` for a
+    # per-day session cap, and `free` when its line carries none of those, in
+    # which case the session spends none of the hour budget. The line is the
+    # client's own words, so the answer is read, not assumed: `2x` and `Paid
+    # plan` are different costs and must not both print as free.
+    local line=${1-} mult
+    mult=$(printf '%s\n' "$line" | grep -oE '[0-9]+(\.[0-9]+)?x' | head -n 1 || true)
+    if [ -n "$mult" ]; then
+        printf '%s' "$mult"
+        return 0
+    fi
+    if printf '%s\n' "$line" | grep -qi 'paid plan'; then
+        printf 'paid'
+        return 0
+    fi
+    if printf '%s\n' "$line" | grep -qiE 'sessions? a day|per day'; then
+        printf 'daily'
+        return 0
+    fi
+    printf 'free'
+}
+
+model_footer() {
+    # model_footer PANE -> the model name the resting footer draws, such as
+    # `DeepSeek V4.1 Flash Fast` in `... • high · /model to change`. The line
+    # naming the hint is the footer; the picker's own entries also say
+    # `• high`, so the hint is what tells the two apart.
+    local line
+    line=$(printf '%s\n' "${1-}" | grep -F -- '/model to change' |
+        tail -n 1 || true)
+    printf '%s' "$line" | sed -E 's/^[[:space:]]*//; s/[[:space:]]*•.*$//'
+}
+
+model_resolve() {
+    # model_resolve PANE WANT -> 0 with MODEL_RESOLVED and MODEL_PRICE set to
+    # the entry WANT names, 1 with MODEL_ERROR saying why not. An exact name
+    # wins; after that a unique case-insensitive substring is enough (`fast`).
+    # Two candidates is an error that lists them: choosing one of two would
+    # spend the account's hours on a guess.
+    local pane=${1-} want names exact partial count
+    want=$(model_norm "${2-}")
+    MODEL_RESOLVED=''
+    MODEL_PRICE=''
+    MODEL_ERROR=''
+    MODEL_AMBIGUOUS=0
+    if [ -z "$want" ]; then
+        MODEL_ERROR='--model is empty'
+        return 1
+    fi
+    names=$(picker_names "$pane")
+    if [ -z "$names" ]; then
+        MODEL_ERROR='the picker drew no model names'
+        return 1
+    fi
+    exact=$(printf '%s\n' "$names" | while IFS= read -r n; do
+        if [ "$(model_norm "$n")" = "$want" ]; then printf '%s\n' "$n"; fi
+    done)
+    if [ -n "$exact" ]; then
+        MODEL_RESOLVED=$exact
+    else
+        partial=$(printf '%s\n' "$names" | while IFS= read -r n; do
+            case "$(model_norm "$n")" in
+                *"$want"*) printf '%s\n' "$n" ;;
+            esac
+        done)
+        if [ -z "$partial" ]; then
+            MODEL_ERROR="no model matches '${2-}' (the picker lists: $(printf '%s' "$names" | tr '\n' ' ' | sed -E 's/ $//'))"
+            return 1
+        fi
+        count=$(printf '%s\n' "$partial" | awk 'END { print NR }')
+        if [ "$count" -gt 1 ]; then
+            MODEL_AMBIGUOUS=1
+            MODEL_ERROR="'${2-}' matches $count models: $(printf '%s' "$partial" | tr '\n' ' ' | sed -E 's/ $//')"
+            return 1
+        fi
+        MODEL_RESOLVED=$partial
+    fi
+    MODEL_PRICE=$(picker_price "$pane" "$MODEL_RESOLVED")
+    return 0
+}
+
+model_frame_get() {
+    # model_frame_get TMUX SESSION -> the pane, kept in MODEL_FRAME so the
+    # search and the walk read the same capture without a second one.
+    MODEL_FRAME=$("$1" capture-pane -p -t "$2" 2>/dev/null || true)
+}
+
+model_search() {
+    # model_search TMUX SESSION WANT -> 0 with MODEL_RESOLVED/MODEL_PRICE set
+    # and the matching frame in MODEL_FRAME, 1 with MODEL_ERROR set. The frame
+    # draws only what fits 55 rows, so a name that is not on screen is not
+    # absent: the arrow keys scroll the list, the marker moving is what
+    # reveals the entries below the fold, so the search walks down to the end
+    # of the list and then back up before calling the name missing. An
+    # ambiguous name is not searched for: scrolling cannot tell two apart.
+    local tmux=$1 session=$2 want=$3 last='' step=0 dir=Down
+    model_frame_get "$tmux" "$session"
+    model_resolve "$MODEL_FRAME" "$want" && return 0
+    [ "$MODEL_AMBIGUOUS" = 0 ] || return 1
+    while [ "$step" -lt "$MODEL_PICKER_STEPS" ]; do
+        last=$(picker_selected "$MODEL_FRAME")
+        "$tmux" send-keys -t "$session" "$dir" 2>/dev/null || true
+        step=$((step + 1))
+        sleep "$MODEL_PICKER_POLL"
+        model_frame_get "$tmux" "$session"
+        model_resolve "$MODEL_FRAME" "$want" && return 0
+        [ "$MODEL_AMBIGUOUS" = 0 ] || return 1
+        if [ "$(picker_selected "$MODEL_FRAME")" = "$last" ]; then
+            # This end of the list is reached, so the rest is above it: walk
+            # back up once, then stop.
+            if [ "$dir" = Down ]; then
+                dir=Up
+            else
+                break
+            fi
+        fi
+    done
+    # Leave MODEL_ERROR naming the entries the last frame drew, so the caller
+    # can print what the list did offer.
+    model_resolve "$MODEL_FRAME" "$want" || true
+    return 1
+}
+
+picker_wait() {
+    # picker_wait TMUX SESSION TIMEOUT POLL -> 0 when the picker frame is on
+    # screen, 1 when it never drew inside TIMEOUT. PICKER_ELAPSED carries the
+    # seconds spent, in tenths, for the log either way.
+    local tmux=$1 session=$2 timeout=$3 poll=$4 frame='' i=0 polls
+    polls=$(ready_polls "$timeout" "$poll")
+    while [ "$i" -lt "$polls" ]; do
+        frame=$("$tmux" capture-pane -p -t "$session" 2>/dev/null || true)
+        if picker_frame "$frame"; then
+            PICKER_ELAPSED=$(ready_elapsed "$((i + 1))" "$poll")
+            return 0
+        fi
+        i=$((i + 1))
+        sleep "$poll"
+    done
+    PICKER_ELAPSED=$(ready_elapsed "$i" "$poll")
+    return 1
+}
+
+model_choose() {
+    # model_choose TMUX SESSION WORKTREE WANT -> 0 when the footer names the
+    # chosen model, 1 when it does not, with MODEL_ERROR saying why. The keys
+    # are the picker's own: `/model`, the arrow keys its aid line prints, and
+    # Enter. The selection is read back after every press, so a list that
+    # moved, or one that does not wrap, is followed instead of counted, and
+    # Enter is pressed only once the `›` marker sits on the wanted name.
+    local tmux=$1 session=$2 wt=$3 want=$4
+    local frame='' selected target names cur tgt key dir='' step=0 footer
+    local moved polls i norm_target
+    "$tmux" send-keys -t "$session" -l '/model' 2>/dev/null || true
+    sleep "$MODEL_PICKER_POLL"
+    "$tmux" send-keys -t "$session" C-m 2>/dev/null || true
+    if ! picker_wait "$tmux" "$session" "$MODEL_PICKER_TIMEOUT" "$MODEL_PICKER_POLL"; then
+        MODEL_ERROR='/model did not open the picker'
+        ready_note "$wt" "model=no want=$want reason=picker-timeout elapsed=${PICKER_ELAPSED}s session=$session"
+        return 1
+    fi
+    # The frame draws only part of the catalog, so the search scrolls the list
+    # before it calls a name absent.
+    if ! model_search "$tmux" "$session" "$want"; then
+        ready_note "$wt" "model=no want=$want reason=resolve elapsed=${PICKER_ELAPSED}s session=$session"
+        "$tmux" send-keys -t "$session" Escape 2>/dev/null || true
+        return 1
+    fi
+    target=$MODEL_RESOLVED
+    frame=$MODEL_FRAME
+    while :; do
+        selected=$(picker_selected "$frame")
+        [ "$(model_norm "$selected")" != "$(model_norm "$target")" ] || break
+        if [ "$step" -ge "$MODEL_PICKER_STEPS" ]; then
+            MODEL_ERROR="the picker never moved the selection to '$target' (it stayed on '${selected:-none}' after $MODEL_PICKER_STEPS keys)"
+            ready_note "$wt" "model=no want=$want reason=selection-stuck steps=$step session=$session"
+            "$tmux" send-keys -t "$session" Escape 2>/dev/null || true
+            return 1
+        fi
+        names=$(picker_names "$frame")
+        cur=$(printf '%s\n' "$names" | grep -nxF -- "${selected:-}" |
+            head -n 1 | cut -d: -f1 || true)
+        tgt=$(printf '%s\n' "$names" | grep -nxF -- "$target" |
+            head -n 1 | cut -d: -f1 || true)
+        if [ -z "$dir" ]; then
+            if is_num "$cur" && is_num "$tgt" && [ "$tgt" -lt "$cur" ]; then
+                dir=Up
+            else
+                dir=Down
+            fi
+        fi
+        key=$dir
+        "$tmux" send-keys -t "$session" "$key" 2>/dev/null || true
+        step=$((step + 1))
+        sleep "$MODEL_PICKER_POLL"
+        frame=$("$tmux" capture-pane -p -t "$session" 2>/dev/null || true)
+        moved=$(picker_selected "$frame")
+        if [ "$moved" = "$selected" ]; then
+            # At an end of the list: it does not wrap, so walk back instead of
+            # pressing into the edge until the step guard gives up.
+            case "$key" in
+                Up) dir=Down ;;
+                *) dir=Up ;;
+            esac
+        fi
+    done
+    "$tmux" send-keys -t "$session" C-m 2>/dev/null || true
+    # The Enter is not proof: the footer is. Read it back until it names the
+    # chosen model and the picker frame is gone, bounded like every other wait.
+    norm_target=$(model_norm "${target%% · *}")
+    polls=$(ready_polls "$MODEL_PICKER_TIMEOUT" "$MODEL_PICKER_POLL")
+    i=0
+    while [ "$i" -lt "$polls" ]; do
+        frame=$("$tmux" capture-pane -p -t "$session" 2>/dev/null || true)
+        footer=$(model_footer "$frame")
+        if ! picker_frame "$frame" &&
+            [ "$(model_norm "${footer%% · *}")" = "$norm_target" ]; then
+            PICKER_ELAPSED=$(ready_elapsed "$((i + 1))" "$MODEL_PICKER_POLL")
+            return 0
+        fi
+        i=$((i + 1))
+        sleep "$MODEL_PICKER_POLL"
+    done
+    PICKER_ELAPSED=$(ready_elapsed "$i" "$MODEL_PICKER_POLL")
+    MODEL_ERROR="the footer still shows '${footer:-nothing}' after Enter, not '$target'"
+    ready_note "$wt" "model=no want=$want reason=footer elapsed=${PICKER_ELAPSED}s session=$session"
+    return 1
+}
+
 brief_jitter_max() {
     # brief_jitter_max MAX_SESSIONS -> upper bound for the random delay before
     # a send. Only a pool of several slots is paced: one slot cannot fire two
@@ -2034,6 +2397,7 @@ start() {
     local ready_timeout="$READY_TIMEOUT" ready_poll="$READY_POLL"
     local submit_timeout="$SUBMIT_TIMEOUT" trust_agents=0
     local prompt_text="" sent brief_hash_value jitter_max jitter=0
+    local model_want=""
     local ready_rc=0 submit_rc=0 pane refusal="" title_before trust_dir
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -2066,6 +2430,11 @@ start() {
             --dry-run) dry=1; shift ;;
             --no-start) nostart=1; shift ;;
             --prompt) prompt_text=${2:-}; shift 2 ;;
+            --model)
+                model_want=${2:-}
+                [ -n "$model_want" ] || die "start: --model must name a model"
+                shift 2
+                ;;
             -h|--help) usage; exit 0 ;;
             *) die "start: unsupported argument: $1" ;;
         esac
@@ -2085,6 +2454,9 @@ start() {
     is_duration "$ready_poll" || die "start: --ready-poll must be a positive number of seconds"
     is_num "$submit_timeout" || die "start: --submit-timeout must be a number of seconds"
     [ "$submit_timeout" -ge 1 ] || die "start: --submit-timeout must be at least 1 second"
+    case "$model_want" in
+        *$'\n'*|*$'\t'*) die "start: --model must be one line" ;;
+    esac
     if [ "$autostop" = 0 ] && { [ "$idle_set" = 1 ] || [ "$poll_set" = 1 ]; }; then
         die "start: --idle-seconds and --poll require --auto-stop"
     fi
@@ -2146,6 +2518,7 @@ start() {
         [ "$jitter_max" = 0 ] || note "jitter_max=${jitter_max}s"
         note "ready_timeout=${ready_timeout}s ready_poll=${ready_poll}s"
         note "trust_agents=$([ "$trust_agents" = 1 ] && printf yes || printf no)"
+        [ -z "$model_want" ] || note "model=$model_want"
         note "submit_timeout=${submit_timeout}s"
         [ "$wake_lock" = 0 ] || note 'wake_lock=requested'
         note "tmux=${FREEBUFF_TMUX:-tmux} -x $COLS -y $ROWS -c $wt"
@@ -2220,6 +2593,8 @@ start() {
     note "result=$result"
 
     if [ "$nostart" = 1 ]; then
+        [ -z "$model_want" ] ||
+            note "model=$model_want applied=no (--no-start launches no session)"
         return 0
     fi
 
@@ -2307,6 +2682,29 @@ start() {
                 die "start: TUI did not reach raw input in $session after ${READY_ELAPSED}s (--ready-timeout $ready_timeout, --ready-poll $ready_poll); stopped it, worktree kept ($wt). A cold first launch can need a larger --ready-timeout."
                 ;;
         esac
+    fi
+
+    # The model is chosen before the brief is typed. A launch that lands on a
+    # model whose hour costs two is exactly what #125 exists to stop, and the
+    # picker is the only switch the client offers. A choice that cannot be
+    # made or confirmed sends no brief: the session is stopped and the
+    # worktree kept, like every other failed launch.
+    if [ -n "$model_want" ]; then
+        if ! model_choose "$tmux" "$session" "$wt" "$model_want"; then
+            pane=$("$tmux" capture-pane -p -t "$session" -S "-$REFUSAL_WINDOW" 2>/dev/null || true)
+            "$tmux" send-keys -t "$session" Escape 2>/dev/null || true
+            "$tmux" kill-session -t "$session" 2>/dev/null || true
+            note "session=$session"
+            note "model_want=$model_want"
+            note "model_error=$MODEL_ERROR"
+            note 'sent=no'
+            printf '%s\n' '--- pane lines the check read ---'
+            printf '%s\n' "$pane"
+            die "start: could not choose model '$model_want' in $session: $MODEL_ERROR. No brief was sent; stopped it, worktree kept ($wt)."
+        fi
+        # The picker's own price line is the answer to whether this run spends
+        # hours: `free` means it printed no multiplier under the entry.
+        ready_note "$wt" "model=$MODEL_RESOLVED price=$(model_hours_cost "$MODEL_PRICE") elapsed=${PICKER_ELAPSED}s session=$session"
     fi
 
     # A brief that is byte-identical across sessions reads as scripted use to
@@ -3082,6 +3480,110 @@ hours() {
     exit 2
 }
 
+models() {
+    # models [NAME] [--json] -> the models the client's /model picker offers,
+    # read from a live session. The client has no catalog command and no
+    # --model flag, so the picker is the catalog: it is opened with /model,
+    # walked to the end of the list (the frame draws one page and the arrow
+    # keys scroll the rest into view), and closed with Escape, which leaves
+    # the session as it was. Nothing is submitted, so the walk spends no
+    # hours. Only a resting session is touched: a turn in flight or a refused
+    # session gets no keys at all.
+    local name="" json=0 tmux="" session="" wt="" pane="" opened=0
+    local listed="" rows="" n pr sel step=0 count=0 first=1
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) json=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            -*) die "models: unsupported argument: $1" ;;
+            *)
+                [ -z "$name" ] || die "models: at most one NAME"
+                name=$1; shift
+                ;;
+        esac
+    done
+    tmux=$(tmux_bin 2>/dev/null || true)
+    if [ -n "$name" ]; then
+        valid_name "$name" || die "models: invalid name"
+        session="fb-$name"
+    fi
+    if [ -z "$session" ]; then
+        session=$(live_sessions | head -n 1)
+    fi
+    if [ -z "$session" ]; then
+        note 'model=none'
+        die "models: no live fb-* session to read the picker from; start one first"
+    fi
+    [ -n "$tmux" ] || die 'models: tmux not found; the picker can only be read from a live pane'
+    "$tmux" has-session -t "$session" 2>/dev/null ||
+        die "models: session $session is not live"
+    [ -n "$name" ] || name=${session#fb-}
+    wt="$ROOT/.worktrees/$name"
+    pane=$("$tmux" capture-pane -p -t "$session" 2>/dev/null || true)
+    if picker_frame "$pane"; then
+        opened=0
+    else
+        if [ -n "$(refusal_recorded "$wt")" ]; then
+            die "models: $session is refused; stop it first (no keys were sent)"
+        fi
+        if printf '%s\n' "$pane" | grep -qiE "$BUSY_RE"; then
+            die "models: $session is working; the picker is only read from a resting session (no keys were sent)"
+        fi
+        "$tmux" send-keys -t "$session" -l '/model' 2>/dev/null || true
+        sleep "$MODEL_PICKER_POLL"
+        "$tmux" send-keys -t "$session" C-m 2>/dev/null || true
+        if ! picker_wait "$tmux" "$session" "$MODEL_PICKER_TIMEOUT" "$MODEL_PICKER_POLL"; then
+            die "models: /model did not open the picker in $session after ${PICKER_ELAPSED}s"
+        fi
+        opened=1
+        pane=$MODEL_FRAME
+    fi
+    # One page at a time: collect what the frame draws, press Down, repeat
+    # until the marker stops moving. That is the end of the list; the walk is
+    # what makes the entries below the fold reachable.
+    while :; do
+        while IFS=$'\t' read -r _ n pr; do
+            [ -n "$n" ] || continue
+            printf '%s\n' "$listed" | grep -qxF -- "$n" && continue
+            listed="${listed:+$listed$'\n'}$n"
+            rows="${rows:+$rows$'\n'}$n"$'\t'"$pr"
+            count=$((count + 1))
+        done <<<"$(picker_entries "$pane")"
+        [ "$step" -lt "$MODEL_PICKER_STEPS" ] || break
+        sel=$(picker_selected "$pane")
+        "$tmux" send-keys -t "$session" Down 2>/dev/null || true
+        step=$((step + 1))
+        sleep "$MODEL_PICKER_POLL"
+        pane=$("$tmux" capture-pane -p -t "$session" 2>/dev/null || true)
+        picker_frame "$pane" || break
+        [ "$(picker_selected "$pane")" != "$sel" ] || break
+    done
+    # A picker this command opened is closed again, so the session is left
+    # exactly as it was found; one that was already open is left open.
+    if [ "$opened" = 1 ]; then
+        "$tmux" send-keys -t "$session" Escape 2>/dev/null || true
+    fi
+    if [ "$json" = 1 ]; then
+        printf '{\n  "session": %s,\n  "count": %s,\n  "models": [\n' \
+            "$(json_str "$session")" "$count"
+        while IFS=$'\t' read -r n pr; do
+            [ -n "$n" ] || continue
+            [ "$first" = 1 ] || printf ',\n'
+            first=0
+            printf '    {"name": %s, "hours": %s, "price": %s}' \
+                "$(json_str "$n")" "$(json_str "$(model_hours_cost "$pr")")" \
+                "$(json_str "$pr")"
+        done <<<"$rows"
+        printf '\n  ]\n}\n'
+        return 0
+    fi
+    while IFS=$'\t' read -r n pr; do
+        [ -n "$n" ] || continue
+        printf 'model=%s hours=%s\n' "$n" "$(model_hours_cost "$pr")"
+    done <<<"$rows"
+    printf 'models=%s session=%s\n' "$count" "$session"
+}
+
 # ---- watch, autostop, reap and gc ----
 # The lifecycle: follow a run, stop what has finished or gone quiet, and record
 # the evidence the review needs.
@@ -3810,6 +4312,7 @@ case "$cmd" in
     list|ls) list_agents "$@" ;;
     sessions|ps) sessions "$@" ;;
     hours) hours "$@" ;;
+    models) models "$@" ;;
     gui) gui "$@" ;;
     attach) attach "$@" ;;
     send) send "$@" ;;

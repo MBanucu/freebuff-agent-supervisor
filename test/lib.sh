@@ -153,8 +153,10 @@ case "${1:-}" in
         esac
         ;;
     send-keys)
-        if [ "${!#}" = Escape ]; then
+        last="${!#}"
+        if [ "$last" = Escape ]; then
             printf '%s\n' "${3:-}" >>"$d/escaped"
+            rm -f "$d/picker_open"
             if [ -f "$d/pane_after_escape" ]; then
                 mv "$d/pane_after_escape" "$d/pane"
             fi
@@ -165,17 +167,73 @@ case "${1:-}" in
             line=''
             for arg in "$@"; do line+="$arg"$'\t'; done
             printf '%s\n' "$line" >>"$d/sent"
-            # After Enter the pane shows what the TUI did with the brief. A
-            # fixture file overrides it (a refusal, a swallowed Enter); by
-            # default the send was accepted, so the pane becomes a turn in
-            # flight, which is what start now requires before started=yes.
-            if [ "${!#}" = C-m ]; then
-                if [ -f "$d/pane_after_send" ]; then
-                    mv "$d/pane_after_send" "$d/pane"
-                elif [ -f "$d/turn_pane" ]; then
-                    cp "$d/turn_pane" "$d/pane"
-                fi
-            fi
+            # What was typed, so the /model picker below can tell that the
+            # slash command opened it and the brief did not.
+            case "$last" in
+                C-m|Up|Down|Tab|BSpace) ;;
+                *) printf '%s' "$last" >"$d/last_text" ;;
+            esac
+            # The /model picker (#125), opt-in through $d/picker_pane: typing
+            # /model and Enter draws the frame, an arrow key moves the `›`
+            # marker (it does not wrap, like the real list at its ends), and
+            # Enter on the frame shows $d/pane_after_model with @MODEL@
+            # replaced by the selected name, which is the footer start reads
+            # back. Without those files this stays the plain send path.
+            case "$last" in
+                Up|Down)
+                    if [ -f "$d/picker_open" ] && [ -f "$d/picker_next_pane" ]; then
+                        # A scroll: the list itself moved and revealed the page
+                        # below the fold, which the marker logic cannot model.
+                        mv "$d/picker_next_pane" "$d/pane"
+                    elif [ -f "$d/picker_open" ]; then
+                        awk -v dir="$last" '
+                            { rows[NR] = $0 }
+                            /│/ && /•/ {
+                                n++
+                                at[n] = NR
+                                if ($0 ~ /│ › /) cur = n
+                            }
+                            END {
+                                if (n == 0) exit 1
+                                if (cur == 0) cur = 1
+                                tgt = cur + (dir == "Down" ? 1 : -1)
+                                if (tgt < 1) tgt = 1
+                                if (tgt > n) tgt = n
+                                for (i = 1; i <= n; i++) sub(/│ › /, "│   ", rows[at[i]])
+                                sub(/│   /, "│ › ", rows[at[tgt]])
+                                for (i = 1; i <= NR; i++) print rows[i]
+                            }' "$d/pane" >"$d/pane.tmp" && mv "$d/pane.tmp" "$d/pane"
+                    fi
+                    ;;
+                C-m)
+                    if [ -f "$d/picker_open" ] && [ -f "$d/pane_after_model" ]; then
+                        sel=$(awk '
+                            /│/ && /•/ && /│ › / {
+                                s = $0
+                                sub(/^.*│ › /, "", s)
+                                sub(/ *•.*$/, "", s)
+                                gsub(/^ +| +$/, "", s)
+                                print s
+                                exit
+                            }' "$d/pane")
+                        rm -f "$d/picker_open"
+                        sed "s/@MODEL@/$sel/" "$d/pane_after_model" >"$d/pane"
+                    elif [ -f "$d/picker_pane" ] &&
+                        [ "$(cat "$d/last_text" 2>/dev/null)" = /model ]; then
+                        cp "$d/picker_pane" "$d/pane"
+                        : >"$d/picker_open"
+                    elif [ -f "$d/pane_after_send" ]; then
+                        # After Enter the pane shows what the TUI did with the
+                        # brief. A fixture file overrides it (a refusal, a
+                        # swallowed Enter); by default the send was accepted,
+                        # so the pane becomes a turn in flight, which is what
+                        # start now requires before started=yes.
+                        mv "$d/pane_after_send" "$d/pane"
+                    elif [ -f "$d/turn_pane" ]; then
+                        cp "$d/turn_pane" "$d/pane"
+                    fi
+                    ;;
+            esac
         fi
         ;;
     kill-session)
@@ -375,6 +433,56 @@ PROSE_AT_PROMPT_PANE='No permission was required for that deletion.
 │  ▍Enter a coding task or / for commands
 ╰──────────────────╯
  DeepSeek V4.1 Flash • high · /tmp/x/proj · /model to change · Chat: New chat'
+
+# The /model picker (#125) as 0.2.38 draws it: an aid line, a section
+# heading, one box per model, and under each name the only per-model price the
+# client prints (`2x` for a model whose hour costs two, a phrase with no
+# multiplier for one that spends none). `›` marks the selection.
+MODEL_PICKER_PANE=' ┌──────────────────────────────────────────────────────────────────┐
+ │ 1/21 hours remaining                                             │
+ │ 13 day streak                                                    │
+ └──────────────────────────────────────────────────────────────────┘
+ ↑↓ choose model · Tab reasoning · Enter select · Esc cancel
+ PREMIUM · Strongest price-to-performance models
+ ┌──────────────────────────────────────────────────────────────────────────────┐
+ │ › DeepSeek V4.1 Flash Fast • high · Fastest · Images                         │
+ │                  Recommended · May use data for AI training                  │
+ └──────────────────────────────────────────────────────────────────────────────┘
+ ┌──────────────────────────────────────────────────────────────────────────────┐
+ │   DeepSeek V4.1 Flash • high · Steady speed · Images                         │
+ │                      2x · May use data for AI training                       │
+ └──────────────────────────────────────────────────────────────────────────────┘
+ POWERFUL · Frontier models like GPT-6.1 Sol and more
+ ┌──────────────────────────────────────────────────────────────────────────────┐
+ │   GPT-6 Luna • high · Strong all-around · Images                             │
+ │                                  Paid plan                                   │
+ └──────────────────────────────────────────────────────────────────────────────┘
+ DeepSeek V4.1 Flash Fast • high · /tmp/x/proj · /model to change · Chat: New chat'
+# The pane after Enter on the picker: the footer names the model that was
+# chosen, which is the proof start reads back. @MODEL@ is the selected name.
+MODEL_AFTER_PANE='╭──────────────────╮
+│  ▍Enter a coding task or / for commands
+╰──────────────────╯
+ @MODEL@ • high · /tmp/x/proj · /model to change · Chat: New chat'
+# The picker one page further down: the frame draws what fits 55 rows, so a
+# model below the fold only appears after the list scrolls. Shown by the fake
+# on the first arrow key through $FAKE_DIR/picker_next_pane, with the `›`
+# marker where the scroll left it.
+MODEL_PICKER_SCROLLED_PANE=' ↑↓ choose model · Tab reasoning · Enter select · Esc cancel
+ POWERFUL · Frontier models like GPT-6.1 Sol and more
+ ┌──────────────────────────────────────────────────────────────────────────────┐
+ │   Claude Haiku 5.5 · 100k context • medium · Anthropic · fast · Images       │
+ │                                  Paid plan                                   │
+ └──────────────────────────────────────────────────────────────────────────────┘
+ ┌──────────────────────────────────────────────────────────────────────────────┐
+ │ › GPT-6.1 Terra • medium · OpenAI · 2 sessions a day · Images · 2 per day   │
+ │                                  Paid plan                                   │
+ └──────────────────────────────────────────────────────────────────────────────┘
+ ┌──────────────────────────────────────────────────────────────────────────────┐
+ │   GPT-5.5 • high · Strong all-around · Images                                │
+ │                              2 sessions a day                                │
+ └──────────────────────────────────────────────────────────────────────────────┘
+ DeepSeek V4.1 Flash Fast • high · /tmp/x/proj · /model to change · Chat: New chat'
 
 # The default outcome of an Enter: the brief was taken and a turn is running.
 printf '%s\n' "$TURN_PANE" >"$FAKE_DIR/turn_pane"

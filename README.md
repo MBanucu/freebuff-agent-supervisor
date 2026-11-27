@@ -119,6 +119,24 @@ Use `--task-file FILE` when an issue needs a custom scope instead of the
 generic issue brief. `--dry-run` prints the plan and changes nothing;
 `--no-start` creates only the worktree, branch and `.task.md`.
 
+`--model NAME` chooses the model before the brief is typed, which is the
+difference between a launch that spends hours and one that does not. The client
+has no flag for it, so `start` drives its own `/model` picker: it types
+`/model`, walks the `›` marker onto the entry NAME resolves to, presses Enter,
+and reads the footer back before a key of the brief is sent. NAME is an exact
+picker name or a unique case-insensitive substring of one, so `--model fast`
+is `DeepSeek V4.1 Flash Fast`. The launch prints `model=<name>
+price=<free|Nx|paid|daily>`: `free` means the picker printed no hour
+multiplier under that entry, so the session spends none of the daily budget,
+`2x` means an hour on it costs two, and `paid`/`daily` are a Paid plan and a
+sessions-per-day cap, which are not hours either. A name the frame does not
+draw is searched for by scrolling the list before it is called missing, so an
+entry below the fold is reachable. An ambiguous or unknown name fails the launch after the
+session starts but before the brief is sent — the session is stopped, the
+worktree kept and nothing retyped. The switch writes the client's global model
+setting, so two launches that want different models must not run at the same
+moment.
+
 Before it creates anything, `start` checks the environment and prints one
 `preflight=<command>` line per check: `tmux`, `freebuff`, `stty` and `git`, plus
 `gh` when the run mirrors the issue. A missing command names the line that
@@ -317,6 +335,19 @@ high`). `NAME` defaults to any live `fb-*` session. It prints
 seconds since the pane last changed, so a stale reading is visible. With no
 live session, or a pane that shows no figure, it prints `hours=unknown` and
 exits 2. `--json` emits the same fields as one object.
+
+`models [NAME]` lists what the client offers, because it offers no catalog
+command: the `/model` picker is the catalog. It opens the picker in a live,
+resting session, walks it to the end of the list (the frame draws one page and
+the arrow keys scroll the rest into view), closes it with Escape and prints one
+`model=<name> hours=<free|2x|paid|daily>` line each, plus
+`models=<count> session=fb-X`. `hours=free` means the entry carries no hour
+multiplier, so a session on that model spends none of the daily budget; `paid`
+is a Paid plan and `daily` a sessions-per-day cap, which are different costs
+and are not reported as free. Nothing is submitted, so listing spends no
+hours. A session that is working or refused gets no keys at all, and a repo
+with no live session prints `model=none` and exits 1. `--json` emits
+`{session, count, models: [{name, hours, price}]}`.
 
 `sessions` is the inventory: one row per `fb-*` session **and** per worktree,
 with `WORKTREE yes|missing`, the attached `autostop` watcher (`pid:N`, `dead`
