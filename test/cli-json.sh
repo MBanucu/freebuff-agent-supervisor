@@ -27,6 +27,86 @@ check contains "$out" 'session=fb-test-prompt'
 check test ! -e "$REPO/.worktrees/test-prompt"
 check contains "$(bash "$TOOL" --help 2>&1)" '--prompt TEXT'
 
+# ---- the preflight (#98) ----
+
+# A healthy run says so once per check, before the plan, and ends on ok.
+out=$(bash "$TOOL" --root "$REPO" start --issue 994 --name test-preflight \
+    --branch test/preflight --title T --url U --dry-run)
+check contains "$out" 'preflight=tmux ok'
+check contains "$out" 'preflight=freebuff ok'
+check contains "$out" 'preflight=stty ok'
+check contains "$out" 'preflight=git ok'
+check contains "$out" 'preflight=gh ok'
+check contains "$out" 'preflight=ok'
+check test "$(printf '%s\n' "$out" | grep -c '^preflight=')" = 6
+check contains "$out" 'worktree='
+check contains "$(bash "$TOOL" --help 2>&1)" '--no-check'
+
+# A Termux-shaped PATH without tmux names the package that installs it, on a
+# dry run and on a real start, and neither leaves a worktree or a branch.
+mkdir -p "$TMP/termux-bin" "$TMP/nocache"
+for cmd in bash git stty sha256sum cut sed sleep; do
+    found=$(command -v "$cmd" || true)
+    [ -z "$found" ] || ln -sf "$found" "$TMP/termux-bin/$cmd"
+done
+termux_start() {
+    # termux_start ARGS... -> one start on a Termux-shaped PATH: the commands
+    # the tool needs, no tmux, PREFIX set and no tmux cache to fall back on.
+    env -u FREEBUFF_TMUX PREFIX=/data/data/com.termux/files/usr \
+        XDG_CACHE_HOME="$TMP/nocache" PATH="$TMP/termux-bin" \
+        FREEBUFF_BIN="$TMP/bin/freebuff" bash "$TOOL" --root "$REPO" "$@"
+}
+out=$(termux_start start --issue 89 --name test-termux --branch test/termux \
+    --title T --url U --dry-run 2>&1) || true
+check contains "$out" 'preflight=tmux missing=tmux hint=pkg install tmux'
+check contains "$out" 'preflight=failed'
+check test ! -e "$REPO/.worktrees/test-termux"
+out=$(termux_start start --issue 89 --name test-termux --branch test/termux \
+    --title T --url U 2>&1) || true
+check contains "$out" 'hint=pkg install tmux'
+check contains "$out" 'start: tmux not found'
+check test ! -e "$REPO/.worktrees/test-termux"
+check test ! -e "$REPO/.git/refs/heads/test/termux"
+
+# A client that exists but cannot execute is named with its exit status: on
+# Termux that is the glibc binary and its missing loader, and the old path
+# reported it as a 120s readiness timeout.
+printf '#!/usr/bin/env bash\nexit 127\n' >"$TMP/bin/freebuff-127"
+printf '#!/usr/bin/env bash\nsleep 30\n' >"$TMP/bin/freebuff-hang"
+chmod +x "$TMP/bin/freebuff-127" "$TMP/bin/freebuff-hang"
+fake_clear
+out=$(FREEBUFF_BIN="$TMP/bin/freebuff-127" bash "$TOOL" --root "$REPO" start \
+    --issue 98 --name test-broken --branch test/broken --title T --url U 2>&1) || true
+check contains "$out" 'preflight=freebuff error=exit_127'
+check contains "$out" 'exits 127'
+check test ! -e "$REPO/.worktrees/test-broken"
+check test -z "$(grep -F 'fb-test-broken' "$FAKE_DIR/session" 2>/dev/null || true)"
+out=$(FREEBUFF_PREFLIGHT_TIMEOUT=1 FREEBUFF_BIN="$TMP/bin/freebuff-hang" \
+    bash "$TOOL" --root "$REPO" start --issue 97 --name test-hang \
+    --branch test/hang --title T --url U 2>&1) || true
+check contains "$out" 'preflight=freebuff error=timeout'
+check test ! -e "$REPO/.worktrees/test-hang"
+
+# gh is optional: a miss is reported, not fatal, because the run can still be
+# named and labelled with --title/--url or --no-gh.
+out=$(GH_BIN="$TMP/no-gh" bash "$TOOL" --root "$REPO" start --issue 95 \
+    --name test-nogh --branch test/nogh --title T --url U --dry-run)
+check contains "$out" 'preflight=gh missing=gh hint=install gh optional=yes'
+check contains "$out" 'preflight=ok'
+check contains "$out" 'worktree='
+
+# --no-check and FREEBUFF_SKIP_PREFLIGHT=1 keep the old late lookup: no probe,
+# no preflight line, and a dry run still prints the plan.
+out=$(FREEBUFF_BIN="$TMP/bin/freebuff-127" bash "$TOOL" --root "$REPO" start \
+    --issue 96 --name test-nocheck --branch test/nocheck --title T --url U \
+    --dry-run --no-check)
+case "$out" in *preflight=*) check false ;; *) check true ;; esac
+check contains "$out" 'worktree='
+out=$(FREEBUFF_SKIP_PREFLIGHT=1 FREEBUFF_BIN="$TMP/bin/freebuff-127" \
+    bash "$TOOL" --root "$REPO" start --issue 96 --name test-nocheck \
+    --branch test/nocheck --title T --url U --dry-run)
+case "$out" in *preflight=*) check false ;; *) check true ;; esac
+
 bash "$TOOL" --root "$REPO" start --issue 999 --name test-999 \
     --branch test/999 --title 'Test issue' \
     --url 'https://example.test/issues/999' --no-start --sdk-dir "$TMP/sdk" >/dev/null
