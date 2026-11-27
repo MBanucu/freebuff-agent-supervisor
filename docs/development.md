@@ -29,8 +29,9 @@ starts a real agent.
 | `.github/workflows/gui.yml` | CI job `gui`: same stub, runs `./gui-test.sh`. |
 | `README.md` | The user-facing reference: install, usage, behaviour, threat model, contributing. |
 
-`.worktrees/` and `.supervisor-briefs.jsonl` are runtime state, explained at
-the end of this file. Both are ignored; neither is committed.
+`.worktrees/`, `.supervisor-briefs.jsonl` and `.supervisor-hours` are runtime
+state, explained at the end of this file. All three are ignored; none is
+committed.
 
 ## How to add a subcommand
 
@@ -187,7 +188,7 @@ the TUI changes, update the fixture and say which release you captured. The
 suites never exercise the real TUI — verify marker changes with one controlled
 run when upgrading Freebuff.
 
-## `.worktrees/` and `.supervisor-briefs.jsonl`
+## `.worktrees/` and the root ledgers
 
 `.worktrees/<name>` is a real git worktree that `start` creates on the new
 branch. The agent works there; `stop`, autostop and `gc` only kill its
@@ -203,3 +204,10 @@ last 20, and refuses to send text whose hash is still in that window; refused
 hashes are kept past the window and never sent again. It is a safety guard
 against the vendor's repeated-message filter, not a cache: deleting it resets
 the guard instead of fixing a refusal.
+
+`.supervisor-hours` is the hours ledger, also excluded from git. A pane that
+draws the account's usage (`hours_quota`) is appended as
+`ts=<epoch> hours=N/M source=panel|footer session=fb-X`, and `status` and
+`sessions` read the last line when the pane has no fraction, printing it with
+its age. It is a cache of observations, so deleting it costs only the fallback
+reading; unlike the brief ledger it guards nothing.
