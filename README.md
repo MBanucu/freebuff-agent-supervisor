@@ -235,7 +235,10 @@ sessions whose run is already over. Freebuff counts live TUIs against its
 concurrent-session limit, not runs, so a `done` session still holds a slot
 until `gc` stops it. A `start` refused by that overlay names them
 (`holding_slot=a,b`) and prints the command that frees them, instead of leaving
-the next step to guesswork.
+the next step to guesswork. The hours overlay is refused the same way, as
+`refused=hours` with `hours=N/M` when the panel shows the account's usage and
+a `hint=` naming both ways out: free finished sessions with `gc`, or wait for
+the daily refill. Neither overlay is waited out as a submit timeout.
 
 `stop` is a hard kill. `stop --graceful` sends `Escape` to end the turn, waits
 up to `--wait` seconds (default 20) for the pane to reach `done`, `idle` or

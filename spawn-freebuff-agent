@@ -24,7 +24,8 @@
 #     repo_slug, tmux_bin, freebuff_bin, exclude_path, ensure_excludes
 #   state files and refusals:
 #     result_key, result_state, state_is_terminal, refusal_recorded,
-#     refusal_sentence, refusal_record, clear_refusal
+#     refusal_sentence, refusal_record, clear_refusal, refusal_is_hours,
+#     hours_quota, refusal_notes
 #   escaping and JSON:
 #     json_str, json_nullable_str, json_nullable_num, html_escape,
 #     json_unescape, json_scalar, state_class, action_form, stylesheet_file,
@@ -88,10 +89,15 @@ PROTECTED_RE='approval|approve|Allow once|Allow always|Run command|permission|ra
 # session that shows that answer is not healthy and idle: the account was
 # penalised. Keep the phrases specific enough that an agent discussing the
 # policy in its own prose does not match them.
-REFUSED_RE='session limit|Take over to stop another session|did not send this message to the model|Scripted or automated use|sent over and over|automated account or site farming|counts as strike [0-9]+|strike [0-9]+ today|account budget|daily budget|budget (is )?(exhausted|exceeded|reached|remaining|left)|remaining budget|out of (daily )?hours|daily hours (refill|reset)'
+REFUSED_RE='Not enough hours|session limit|Take over to stop another session|did not send this message to the model|Scripted or automated use|sent over and over|automated account or site farming|counts as strike [0-9]+|strike [0-9]+ today|account budget|daily budget|budget (is )?(exhausted|exceeded|reached|remaining|left)|remaining budget|out of (daily )?hours|daily hours (refill|reset)'
 # Only the overlay offers an Enter that takes over another live session, so
 # send refuses to type into a pane carrying one of these strings.
 REFUSAL_OVERLAY_RE='concurrent-session limit|session limit across CLI and Desktop|Take over to stop another session'
+# The account's other refusal: no hours are left for the chosen model, so the
+# brief cannot run until the daily refill or another model. Its Enter opens the
+# model picker instead of submitting, and a wait for submission would sit out
+# the whole --submit-timeout over a refusal that was already on screen.
+HOURS_OVERLAY_RE='Not enough hours'
 # A refusal is written here as well as to .supervisor.log. The file is what
 # keeps status at refused after the sentence has scrolled away; stop removes
 # it, so a refusal lasts until the session is explicitly stopped.
@@ -278,11 +284,12 @@ Notes:
     because Freebuff treats a repeated message as scripted use and counts a
     strike against the account. A brief the vendor refused is marked in the
     same ledger, kept past the window and never sent again.
-  - A refusal (the concurrent-session overlay or the vendor's anti-automation
-    answer in the turn text) is recorded in .worktrees/<name>/.refusal and
-    .supervisor.log. start prints refused=yes with the sentence and exits
-    non-zero; the overlay gets no keys at all, and status keeps refused until
-    stop clears it.
+  - A refusal (the concurrent-session or hours overlay, or the vendor's
+    anti-automation answer in the turn text) is recorded in
+    .worktrees/<name>/.refusal and .supervisor.log. start prints refused=yes,
+    or refused=hours with hours=N/M when the panel shows the account's usage,
+    plus a hint naming the next step, and exits non-zero; an overlay gets no
+    keys at all, and status keeps refused until stop clears it.
   - Completion is either the agent's .agent-result file (stock brief) or an
     idle pane after the window; the pane heuristic is tied to the TUI.
   - The tool never deletes a worktree or branch. Use git worktree remove and
@@ -470,6 +477,47 @@ clear_refusal() {
     local wt="$1"
     [ -d "$wt" ] || return 0
     rm -f "$wt/$REFUSAL_FILE"
+}
+
+refusal_is_hours() {
+    # refusal_is_hours SENTENCE -> 0 for the hours overlay, which is a refusal
+    # with its own next step instead of the concurrent-session one.
+    printf '%s\n' "${1-}" | grep -qiE "$HOURS_OVERLAY_RE"
+}
+
+hours_quota() {
+    # hours_quota PANE -> the `N/M` usage the hours panel draws when it shows
+    # one, empty otherwise. Only a fraction on a line that mentions hours
+    # counts: the model line already carries a date-like `10/17`.
+    printf '%s\n' "${1-}" | grep -i 'hour' |
+        grep -oE '[0-9]+(\.[0-9]+)?/[0-9]+' | tail -n 1 || true
+}
+
+refusal_notes() {
+    # refusal_notes SENTENCE PANE TMUX -> the refusal lines start prints.
+    # Every refusal is `refused=` plus the sentence. The overlays also name
+    # the next step: the hours overlay is `refused=hours` with the account's
+    # N/M usage when the panel draws it and a hint naming both ways out; the
+    # concurrent-session overlay names the finished sessions still holding a
+    # slot, because their run is already over and stopping them loses nothing.
+    local refusal=${1-} pane=${2-} tmux=${3:-} hours held
+    if refusal_is_hours "$refusal"; then
+        note 'refused=hours'
+        hours=$(hours_quota "$pane")
+        [ -z "$hours" ] || note "hours=$hours"
+        held=$(finished_live_names "$tmux")
+        [ -z "$held" ] || note "holding_slot=$held"
+        note "hint=stop finished sessions with: $(basename "$0") gc, or wait for the daily hours to refill"
+        return 0
+    fi
+    note 'refused=yes'
+    if printf '%s\n' "$refusal" | grep -qiE "$REFUSAL_OVERLAY_RE"; then
+        held=$(finished_live_names "$tmux")
+        if [ -n "$held" ]; then
+            note "holding_slot=$held"
+            note "hint=free them with: $(basename "$0") gc"
+        fi
+    fi
 }
 
 # ---- escaping and JSON ----
@@ -1429,7 +1477,7 @@ start() {
         return 0
     fi
 
-    local tmux fb cmd held
+    local tmux fb cmd
     tmux=$(tmux_bin) || die "start: tmux not found; install tmux or set FREEBUFF_TMUX"
     fb=$(freebuff_bin) || die "start: freebuff not found; set FREEBUFF_BIN"
     printf -v cmd 'TERM=xterm-256color %q --cwd %q --trust-agents' "$fb" "$wt"
@@ -1446,20 +1494,9 @@ start() {
         refusal_record "$wt" "$refusal"
         "$tmux" kill-session -t "$session" 2>/dev/null || true
         note "session=$session"
-        note 'refused=yes'
+        refusal_notes "$refusal" "$pane" "$tmux"
         note "refusal=$refusal"
         note 'sent=no'
-        # A concurrent-session refusal is about live TUIs, not runs, and the
-        # overlay names neither. Name the finished sessions that hold the slots
-        # and the one command that frees them, so the next step is not a guess:
-        # each of them has already reported its result, so nothing is lost.
-        if printf '%s\n' "$refusal" | grep -qiE "$REFUSAL_OVERLAY_RE"; then
-            held=$(finished_live_names "$tmux")
-            if [ -n "$held" ]; then
-                note "holding_slot=$held"
-                note "hint=free them with: $(basename "$0") gc"
-            fi
-        fi
         die "start: Freebuff refused the launch before the brief was sent: $refusal (no keys typed; worktree kept at $wt)"
     fi
     if [ "$ready_rc" -ne 0 ]; then
@@ -1509,8 +1546,11 @@ start() {
         # be typed again, even after it would have aged out of the window.
         brief_ledger_mark_refused "$brief_hash_value" "$name" "$branch"
         note "session=$session"
-        note 'refused=yes'
+        refusal_notes "$refusal" "$pane" "$tmux"
         note "refusal=$refusal"
+        # The overlay was already on screen at the first poll, so the window
+        # was not spent: name the elapsed time that proved it.
+        note "submit_elapsed=${SUBMIT_ELAPSED}s"
         note 'resent=no'
         die "start: Freebuff refused the brief: $refusal (not resent; worktree kept at $wt)"
     fi
@@ -2638,11 +2678,12 @@ send() {
     tmux=$(tmux_bin) || die "send: tmux not found"
     "$tmux" has-session -t "fb-$name" 2>/dev/null ||
         die "send: session fb-$name is not running"
-    # The overlay's Enter takes over and stops another live session. Never
-    # type into it: a follow-up is not worth killing a sibling agent.
+    # The overlay's Enter takes over and stops another live session, and the
+    # hours overlay's Enter opens the model picker. Never type into either: a
+    # follow-up is not worth killing a sibling agent or losing the text.
     pane=$("$tmux" capture-pane -p -t "fb-$name" -S "-$REFUSAL_WINDOW" 2>/dev/null || true)
-    if printf '%s\n' "$pane" | grep -qiE "$REFUSAL_OVERLAY_RE"; then
-        die "send: fb-$name is on the concurrent-session overlay; no keys were sent (Enter would take over another session; stop it first)"
+    if printf '%s\n' "$pane" | grep -qiE "$REFUSAL_OVERLAY_RE|$HOURS_OVERLAY_RE"; then
+        die "send: fb-$name is on the concurrent-session overlay or the hours overlay; no keys were sent (Enter would take over another session or open the model picker; stop it first)"
     fi
     "$tmux" send-keys -t "fb-$name" -l "$text"
     sleep 0.2
