@@ -14,7 +14,7 @@ HERE=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd) || exit 1
 . "$HERE/test/lib.sh"
 
 for area in cli-json snapshot-gui state-evidence lifecycle-sessions \
-    brief-refusals readiness-submission wait-actions; do
+    brief-refusals readiness-submission wait-actions hours; do
     # shellcheck source=/dev/null
     . "$HERE/test/$area.sh"
 done

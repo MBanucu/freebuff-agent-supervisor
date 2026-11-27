@@ -31,14 +31,16 @@
 #   state files and refusals:
 #     result_key, result_state, state_is_terminal, refusal_recorded,
 #     refusal_sentence, refusal_record, clear_refusal, refusal_is_hours,
-#     hours_quota, hours_source, hours_age_label, hours_read, refusal_notes
+#     hours_quota, hours_panel, hours_footer, hours_source, hours_age_label,
+#     hours_read, refusal_notes
 #   escaping and JSON:
 #     json_str, json_nullable_str, json_nullable_num, html_escape,
 #     json_unescape, json_scalar, state_class, action_form, stylesheet_file,
 #     pr_json_array
 #   state classification and evidence:
 #     sha256_hex, normalise_window, first_match, evidence_field,
-#     classify_chrome, emit_evidence, classify_state, session_state,
+#     classify_chrome, freebuff_config_dir, turn_log_path, turn_log_read,
+#     turn_log_evidence, emit_evidence, classify_state, session_state,
 #     session_activity, idle_seconds
 #   the brief:
 #     write_task, ready_polls, ready_elapsed, ready_note, wait_ready,
@@ -50,9 +52,9 @@
 #     gh_state_color, gh_state
 #   start:
 #     start
-#   status, list and sessions:
+#   status, list, sessions and hours:
 #     print_explanation, status, list_agents, watcher_state, live_sessions,
-#     live_session_count, finished_live, finished_live_names, sessions
+#     live_session_count, finished_live, finished_live_names, sessions, hours
 #   watch, autostop, reap and gc:
 #     reap, watch_run, watch, autostop, gc
 #   the GUI:
@@ -233,6 +235,7 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       --help             this text
 
   spawn-freebuff-agent status NAME [--lines N] [--no-gh] [--json] [--explain]
+                              [--source pane|log|auto] [--window N]
       Show the session, input mode, result state, pane tail, branch, last
       commit and PR. hours=N/M is this run's reading of the account usage;
       when the pane carries none, the last ledger line is shown with its age
@@ -240,9 +243,15 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       --lines N   pane lines to show (default: 25)
       --no-gh     do not ask gh for the PR
       --json      emit the same fields as one JSON object, plus an evidence
-                  object naming the rule, the matched line and the window
+                  object naming the source, the rule, the matched line and
+                  the window, and turn_state/turn_outcome from the turn log
       --explain   print the classification decision line by line: every
-                  marker checked and the pane the rule looked at
+                  marker checked and the pane or turn log the rule looked at
+      --source S  where the state comes from: pane (default) reads the
+                  terminal, log reads the client's per-chat turn log and
+                  reports turn_state=working|finished|failed with
+                  turn_outcome=lastMessage|error, auto prefers the log and
+                  falls back to the pane when it has no verdict
       --window N  pane lines the classifier reads (default: 40)
 
   spawn-freebuff-agent list
@@ -257,6 +266,15 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       Sessions with no worktree are listed here instead of only being
       reapable by gc --all. --json emits the same rows as an array of
       objects.
+
+  spawn-freebuff-agent hours [NAME] [--json]
+      Read the remaining Freebuff hour budget from a live pane: the welcome
+      panel's `N/M hours remaining` first, then the fraction in the footer
+      next to the model (`DeepSeek V4.1 Flash 10/17 • high`). NAME defaults
+      to any live fb-* session. The value is an observation with an age (the
+      seconds since the pane last changed), never an estimate.
+      --json      emit the same fields as one JSON object
+      Prints hours=unknown and exits 2 when no live pane can be read.
 
   spawn-freebuff-agent gui --snapshot FILE [--watch N] [--no-gh]
       Write one self-contained HTML page from `sessions --json`: one card
@@ -777,6 +795,25 @@ hours_quota() {
         grep -oE '[0-9]+(\.[0-9]+)?/[0-9]+' | tail -n 1 || true
 }
 
+hours_panel() {
+    # hours_panel PANE -> the `N/M` from the welcome panel's
+    # `N/M hours remaining` line, empty otherwise. The phrase is required, so
+    # a fraction in a sentence about hours is not read as the budget.
+    printf '%s\n' "${1-}" |
+        grep -iE '[0-9]+(\.[0-9]+)?/[0-9]+[[:space:]]+hours?[[:space:]]+remaining' |
+        grep -oE '[0-9]+(\.[0-9]+)?/[0-9]+' | tail -n 1 || true
+}
+
+hours_footer() {
+    # hours_footer PANE -> the `N/M` the footer draws next to the model, such
+    # as `DeepSeek V4.1 Flash 10/17 • high`; empty otherwise. The fraction has
+    # to sit next to the `•` separator, so the date-like fraction elsewhere in
+    # the footer's chat title is not read as a budget.
+    printf '%s\n' "${1-}" |
+        grep -E '[0-9]+(\.[0-9]+)?/[0-9]+[[:space:]]+•' |
+        grep -oE '[0-9]+(\.[0-9]+)?/[0-9]+' | tail -n 1 || true
+}
+
 hours_source() {
     # hours_source PANE -> `panel` when the reading sits in the hours overlay,
     # `footer` when the TUI drew the usage in its resting chrome instead.
@@ -1149,51 +1186,164 @@ classify_chrome() {
     fi
 }
 
+freebuff_config_dir() {
+    # freebuff_config_dir -> the client's config root. FREEBUFF_CONFIG_DIR
+    # wins, as it does in the client; otherwise the client's own default.
+    printf '%s' "${FREEBUFF_CONFIG_DIR:-${HOME:-}/.config/manicode}"
+}
+
+turn_log_path() {
+    # turn_log_path NAME -> the newest chat's log.jsonl, or nothing. The
+    # client names the project directory basename(cwd), so the worktree name
+    # is the project name; worktree names here are unique, which is what keeps
+    # two checkouts from sharing one project directory. The newest chat is the
+    # one whose run-state.json or chat-messages.json was written last, because
+    # the client rewrites those at every message boundary.
+    local name="$1" chats newest
+    chats="$(freebuff_config_dir)/projects/$(basename -- "$ROOT/.worktrees/$name")/chats"
+    [ -d "$chats" ] || return 0
+    newest=$(ls -1t "$chats"/*/run-state.json "$chats"/*/chat-messages.json \
+        2>/dev/null | head -n 1 || true)
+    if [ -n "$newest" ]; then
+        newest=$(dirname -- "$newest")
+    else
+        newest=$(ls -1dt "$chats"/*/ 2>/dev/null | head -n 1 || true)
+        newest=${newest%/}
+    fi
+    [ -n "$newest" ] || return 0
+    [ -f "$newest/log.jsonl" ] || return 0
+    printf '%s' "$newest/log.jsonl"
+}
+
+turn_log_read() {
+    # turn_log_read LOG -> tab-separated "start end outcome startline endline".
+    # A turn starts at `Sending message with sdk run config` and ends at
+    # `Main prompt finished`, whose data.outputType is the outcome. Only a
+    # complete JSON line counts, so a half-written final line is ignored and
+    # picked up on the next read instead of being guessed at.
+    awk '
+        /\}[[:space:]]*$/ && index($0, "Main prompt finished") {
+            end = NR; endline = $0
+            outcome = $0
+            sub(/.*"outputType"[[:space:]]*:[[:space:]]*"/, "", outcome)
+            if (outcome != $0) { sub(/".*/, "", outcome) } else { outcome = "" }
+        }
+        /\}[[:space:]]*$/ && index($0, "Sending message with sdk run config") {
+            start = NR; startline = $0
+        }
+        END {
+            printf "%d\t%d\t%s\t%s\t%s\n", start + 0, end + 0, outcome, startline, endline
+        }
+    ' "$1" 2>/dev/null || true
+}
+
+turn_log_evidence() {
+    # turn_log_evidence NAME [CHECKS] -> the evidence block from the turn log.
+    # `turn_state` is the start/end pair's verdict and `turn_outcome` the end's
+    # outputType. `state` maps a finished turn to `idle`, because the pane
+    # would rest at its prompt; `done` stays the result file's word, so the
+    # log cannot claim a run succeeded. A missing chat directory is
+    # `unknown`/`no-turn-log`, never an error.
+    local name="$1" checks="${2:-}"
+    local chats log parsed start end outcome startline endline
+    local state rule matched mapped log_checks
+    chats="$(freebuff_config_dir)/projects/$(basename -- "$ROOT/.worktrees/$name")/chats"
+    log=$(turn_log_path "$name")
+    if [ -z "$log" ]; then
+        log_checks="check: turn-log ($chats): no"
+        [ -z "$checks" ] || log_checks="$checks"$'\n'"$log_checks"
+        printf 'state=unknown\nsource=log\nrule=no-turn-log\nmatched=\nturn_state=unknown\nturn_outcome=\nturn_log=no\nwindow_lines=0\nwindow_sha256=\nstable_scans=0\n%s\npane_begin\npane_end\n' \
+            "$log_checks"
+        return 0
+    fi
+    parsed=$(turn_log_read "$log")
+    IFS=$'\t' read -r start end outcome startline endline <<<"$parsed" || true
+    is_num "$start" || start=0
+    is_num "$end" || end=0
+    if [ "$start" -eq 0 ] && [ "$end" -eq 0 ]; then
+        state=unknown
+        rule=no-turn-events
+        matched=''
+    elif [ "$start" -gt "$end" ]; then
+        state=working
+        rule=turn-started
+        matched=$startline
+        outcome=''
+    elif [ "$outcome" = error ]; then
+        state=failed
+        rule=turn-failed
+        matched=$endline
+    else
+        state=finished
+        rule=turn-finished
+        matched=$endline
+    fi
+    mapped=$state
+    [ "$state" != finished ] || mapped=idle
+    log_checks="check: turn-log ($log): yes"
+    log_checks+=$'\n'"check: turn-start (line $start): $([ "$start" -gt 0 ] && printf yes || printf no)"
+    log_checks+=$'\n'"check: turn-end (line $end): $([ "$end" -gt 0 ] && printf yes || printf no)"
+    [ -z "$checks" ] || log_checks="$checks"$'\n'"$log_checks"
+    printf 'state=%s\nsource=log\nrule=%s\nmatched=%s\nturn_state=%s\nturn_outcome=%s\nturn_log=yes\nwindow_lines=0\nwindow_sha256=\nstable_scans=0\n%s\npane_begin\npane_end\n' \
+        "$mapped" "$rule" "${matched:0:200}" "$state" "$outcome" "$log_checks"
+}
+
 # The classifier's window, shared by emit_evidence and the status view.
 EV_PANE=''
 EV_LINES=0
 EV_SHA=''
 
 emit_evidence() {
-    # emit_evidence STATE RULE MATCHED SCANS CHECKS -> the evidence block.
-    # The first line is `state=...` because session_state reads only that;
-    # everything after it is what --explain shows line by line.
-    local state="$1" rule="$2" matched="$3" scans="$4" checks="$5"
-    printf 'state=%s\nrule=%s\nmatched=%s\nwindow_lines=%s\nwindow_sha256=%s\nstable_scans=%s\n' \
-        "$state" "$rule" "${matched:0:200}" "$EV_LINES" "$EV_SHA" "$scans"
+    # emit_evidence STATE RULE MATCHED SCANS CHECKS [SOURCE] -> the evidence
+    # block. The first line is `state=...` because session_state reads only
+    # that; everything after it is what --explain shows line by line. `source`
+    # names what produced the verdict (pane, log, result-file or refusal) and
+    # is additive: the keys that were already there keep their meaning.
+    local state="$1" rule="$2" matched="$3" scans="$4" checks="$5" source="${6:-pane}"
+    printf 'state=%s\nsource=%s\nrule=%s\nmatched=%s\nwindow_lines=%s\nwindow_sha256=%s\nstable_scans=%s\n' \
+        "$state" "$source" "$rule" "${matched:0:200}" "$EV_LINES" "$EV_SHA" "$scans"
     [ -z "$checks" ] || printf '%s\n' "$checks"
     printf 'pane_begin\n%s\npane_end\n' "$EV_PANE"
 }
 
 classify_state() {
-    # classify_state NAME [WINDOW] -> evidence block; line one is
-    # `state=done|refused|working|idle|unknown|missing`. Read-only: captures
-    # only, never sends, stops or writes. A first scan that no rule claims is
-    # captured again after a pause, and only the same normalised window twice
-    # becomes `unknown`.
-    local name="$1" window="${2:-$REFUSAL_WINDOW}"
+    # classify_state NAME [WINDOW] [SOURCE] -> evidence block; line one is
+    # `state=done|refused|working|idle|unknown|missing`. SOURCE is pane (the
+    # default), log or auto. Read-only: captures and reads only, never sends,
+    # stops or writes. A first pane scan that no rule claims is captured again
+    # after a pause, and only the same normalised window twice becomes
+    # `unknown`.
+    local name="$1" window="${2:-$REFUSAL_WINDOW}" source="${3:-pane}"
     local session="fb-$name" wt="$ROOT/.worktrees/$name" tmux
     local sentence result pane chrome norm norm2 base_checks checks
+    local has_session=0 logblock logstate
     tmux=$(tmux_bin 2>/dev/null || true)
 
     EV_PANE=''
     EV_LINES=0
     EV_SHA=''
 
-    if [ -z "$tmux" ] || ! "$tmux" has-session -t "$session" 2>/dev/null; then
+    if [ -n "$tmux" ] && "$tmux" has-session -t "$session" 2>/dev/null; then
+        has_session=1
+        checks="check: session (fb-$name): yes"
+    else
         checks="check: session (fb-$name): no"
+    fi
+
+    # The pane and auto sources start from a live session. The log is a file,
+    # so it still answers after the TUI is gone.
+    if [ "$source" = pane ] && [ "$has_session" = 0 ]; then
         emit_evidence missing no-session '' 0 "$checks"
         return 0
     fi
-    checks="check: session (fb-$name): yes"
 
-    # A refusal recorded by start outranks the pane: the turn ends, the
+    # A refusal recorded by start outranks every source: the turn ends, the
     # sentence scrolls away and the prompt comes back, but the account is
     # still penalised. stop removes the file.
     sentence=$(refusal_recorded "$wt")
     checks+=$'\n'"check: recorded-refusal ($REFUSAL_FILE): $([ -n "$sentence" ] && printf yes || printf no)"
     if [ -n "$sentence" ]; then
-        emit_evidence refused recorded-refusal "$sentence" 0 "$checks"
+        emit_evidence refused recorded-refusal "$sentence" 0 "$checks" refusal
         return 0
     fi
     base_checks=$checks
@@ -1202,13 +1352,33 @@ classify_state() {
     base_checks+=$'\n'"check: result-file ($RESULT_FILE): ${result:-no}"
     case "$result" in
         done|blocked|failed)
-            # The result file names the outcome, so a blocked or failed run
-            # must not be reported as done: a wait contract built on `done`
-            # would otherwise call failure success.
-            emit_evidence "$result" result-file "$result" 0 "$base_checks"
+            # The result file names the outcome and stays the authority, so a
+            # blocked or failed run must not be reported as done: a wait
+            # contract built on `done` would otherwise call failure success.
+            emit_evidence "$result" result-file "$result" 0 "$base_checks" result-file
             return 0
             ;;
     esac
+
+    if [ "$source" = log ]; then
+        turn_log_evidence "$name" "$base_checks"
+        return 0
+    fi
+    if [ "$source" = auto ]; then
+        logblock=$(turn_log_evidence "$name" "$base_checks")
+        logstate=$(evidence_field "$logblock" turn_state)
+        if [ -n "$logstate" ] && [ "$logstate" != unknown ]; then
+            printf '%s\n' "$logblock"
+            return 0
+        fi
+        # No usable turn log: fall back to the pane, naming the loser so the
+        # disagreement is visible instead of silent.
+        base_checks+=$'\n'"check: log-verdict: ${logstate:-unknown}"
+        if [ "$has_session" = 0 ]; then
+            emit_evidence missing no-session '' 0 "$base_checks"
+            return 0
+        fi
+    fi
 
     EV_PANE=$("$tmux" capture-pane -p -t "$session" -S "-$window" 2>/dev/null || true)
     EV_LINES=$(printf '%s' "$EV_PANE" | awk 'END { print NR }')
@@ -2113,6 +2283,13 @@ print_explanation() {
     while IFS= read -r line; do
         case "$line" in
             state=*) ;;
+            source=*) printf 'explain: source=%s\n' "${line#source=}" ;;
+            turn_state=*) printf 'explain: turn_state=%s\n' "${line#turn_state=}" ;;
+            turn_outcome=*)
+                [ -z "${line#turn_outcome=}" ] ||
+                    printf 'explain: turn_outcome=%s\n' "${line#turn_outcome=}"
+                ;;
+            turn_log=*) printf 'explain: turn_log=%s\n' "${line#turn_log=}" ;;
             rule=*)
                 rule=${line#rule=}
                 printf 'explain: rule=%s\n' "$rule"
@@ -2143,11 +2320,12 @@ status() {
     # Both views come from the same fields: the JSON is a serialization of the
     # human output, not a second detection path. --explain adds the classifier's
     # decision line by line, from the same evidence block as --json.
-    local name="" lines=25 no_gh=0 json=0 explain=0 window="$REFUSAL_WINDOW"
+    local name="" lines=25 no_gh=0 json=0 explain=0 window="$REFUSAL_WINDOW" source=pane
     while [ $# -gt 0 ]; do
         case "$1" in
             --lines) lines=${2:-}; shift 2 ;;
             --window) window=${2:-}; shift 2 ;;
+            --source) source=${2:-}; shift 2 ;;
             --no-gh) no_gh=1; shift ;;
             --json) json=1; shift ;;
             --explain) explain=1; shift ;;
@@ -2162,16 +2340,35 @@ status() {
         ''|*[!0-9]*) die "status: --lines must be a number" ;;
     esac
     is_num "$window" || die "status: --window must be a number"
+    case "$source" in
+        pane|log|auto) ;;
+        *) die "status: --source must be pane, log or auto" ;;
+    esac
 
     local wt="$ROOT/.worktrees/$name" branch session tmux running=0 tty mode=unknown stty out
     local state rstate="" pane="" idle="" sstate="" last_commit dirty=no watcher=""
     local wake_lock="" hours=""
     local result_pr="" result_commit="" result_tests="" prs="" pr_json=null
-    local evidence="" ev_rule="" ev_matched="" ev_lines="" ev_sha="" ev_scans=""
+    local evidence="" ev_rule="" ev_matched="" ev_lines="" ev_sha="" ev_scans="" ev_source=""
+    local turn_evidence="" tstate="" tout="" turn_log=""
     [ -d "$wt" ] || die "status: no worktree at $wt"
     branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
     session="fb-$name"
     tmux=$(tmux_bin 2>/dev/null || true)
+
+    # The turn log is a file, so it can be read with or without a session. The
+    # human view shows its fields only when a source asks for it; --json always
+    # carries the keys, null when there is no chat directory.
+    if [ "$source" != pane ] || [ "$json" = 1 ]; then
+        turn_evidence=$(turn_log_evidence "$name")
+        tstate=$(evidence_field "$turn_evidence" turn_state)
+        tout=$(evidence_field "$turn_evidence" turn_outcome)
+        turn_log=$(evidence_field "$turn_evidence" turn_log)
+        if [ "$json" = 1 ] && [ "$turn_log" != yes ]; then
+            tstate=''
+            tout=''
+        fi
+    fi
 
     if [ "$json" = 0 ]; then
         printf 'name=%s\nbranch=%s\nworktree=%s\nsession=%s\n' \
@@ -2215,7 +2412,7 @@ status() {
                 fi
             fi
         fi
-        evidence=$(classify_state "$name" "$window")
+        evidence=$(classify_state "$name" "$window" "$source")
         sstate=$(evidence_field "$evidence" state)
         # Only a session that can still be idle has an idle time. The result
         # file outranks the pane, so `state` is the terminal answer even while
@@ -2228,25 +2425,38 @@ status() {
         if [ "$json" = 0 ]; then
             printf 'running=yes\ninput=%s\n' "$mode"
             printf 'session_state=%s\n' "$sstate"
+            if [ "$source" != pane ]; then
+                printf 'turn_state=%s\nturn_outcome=%s\n' "$tstate" "$tout"
+            fi
             [ "$explain" = 0 ] || print_explanation "$evidence"
             [ -z "$idle" ] || printf 'idle_seconds=%s\n' "$idle"
         fi
     else
         local sentence
-        sstate=missing
-        sentence=$(refusal_recorded "$wt")
-        # A recorded refusal outlives the session: start stops a refused
-        # launch, but status must keep saying refused until stop clears it.
-        if [ -n "$sentence" ]; then
-            sstate=refused
-            printf -v evidence 'state=%s\nrule=recorded-refusal\nmatched=%s\nwindow_lines=0\nwindow_sha256=\nstable_scans=0\ncheck: session (fb-%s): no\ncheck: recorded-refusal (%s): yes\npane_begin\npane_end\n' \
-                "$sstate" "$sentence" "$name" "$REFUSAL_FILE"
+        if [ "$source" != pane ]; then
+            # The log outlives the TUI, so a stopped session can still name
+            # its last turn; auto falls back to `missing` when there is none.
+            evidence=$(classify_state "$name" "$window" "$source")
+            sstate=$(evidence_field "$evidence" state)
         else
-            printf -v evidence 'state=missing\nrule=no-session\nmatched=\nwindow_lines=0\nwindow_sha256=\nstable_scans=0\ncheck: session (fb-%s): no\npane_begin\npane_end\n' \
-                "$name"
+            sstate=missing
+            sentence=$(refusal_recorded "$wt")
+            # A recorded refusal outlives the session: start stops a refused
+            # launch, but status must keep saying refused until stop clears it.
+            if [ -n "$sentence" ]; then
+                sstate=refused
+                printf -v evidence 'state=%s\nsource=refusal\nrule=recorded-refusal\nmatched=%s\nwindow_lines=0\nwindow_sha256=\nstable_scans=0\ncheck: session (fb-%s): no\ncheck: recorded-refusal (%s): yes\npane_begin\npane_end\n' \
+                    "$sstate" "$sentence" "$name" "$REFUSAL_FILE"
+            else
+                printf -v evidence 'state=missing\nsource=pane\nrule=no-session\nmatched=\nwindow_lines=0\nwindow_sha256=\nstable_scans=0\ncheck: session (fb-%s): no\npane_begin\npane_end\n' \
+                    "$name"
+            fi
         fi
         if [ "$json" = 0 ]; then
             printf 'running=no\nsession_state=%s\n' "$sstate"
+            if [ "$source" != pane ]; then
+                printf 'turn_state=%s\nturn_outcome=%s\n' "$tstate" "$tout"
+            fi
             [ "$explain" = 0 ] || print_explanation "$evidence"
         fi
     fi
@@ -2313,6 +2523,7 @@ status() {
     # be compared across scans. `unknown` remains the `state` placeholder for
     # "no result file" as before; the pane classifier's unknown is
     # `session_state`.
+    ev_source=$(evidence_field "$evidence" source)
     ev_rule=$(evidence_field "$evidence" rule)
     ev_matched=$(evidence_field "$evidence" matched)
     ev_lines=$(evidence_field "$evidence" window_lines)
@@ -2335,6 +2546,8 @@ status() {
     printf '  "running": %s,\n' "$([ "$running" = 1 ] && printf true || printf false)"
     printf '  "input": %s,\n' "$(json_str "$mode")"
     printf '  "session_state": %s,\n' "$(json_str "$sstate")"
+    printf '  "turn_state": %s,\n' "$(json_nullable_str "$tstate")"
+    printf '  "turn_outcome": %s,\n' "$(json_nullable_str "$tout")"
     printf '  "idle_seconds": %s,\n' "$(json_nullable_num "$idle")"
     printf '  "watcher": %s,\n' "$(json_nullable_str "$watcher")"
     printf '  "wake_lock": %s,\n' "$(json_nullable_str "$wake_lock")"
@@ -2347,6 +2560,7 @@ status() {
     printf '  "dirty": %s,\n' "$([ "$dirty" = yes ] && printf true || printf false)"
     printf '  "pr": %s,\n' "$pr_json"
     printf '  "evidence": {\n'
+    printf '    "source": %s,\n' "$(json_nullable_str "$ev_source")"
     printf '    "rule": %s,\n' "$(json_nullable_str "$ev_rule")"
     printf '    "matched": %s,\n' "$(json_nullable_str "$ev_matched")"
     printf '    "window_lines": %s,\n' "$(json_nullable_num "$ev_lines")"
@@ -2650,6 +2864,74 @@ sessions() {
         printf 'sessions=%s running=%s worktrees=%s orphans=%s finished=%s\n' \
             "$total" "$live" "$trees" "$((total - trees))" "$finished_count"
     fi
+}
+
+hours() {
+    # hours [NAME] [--json] -> the remaining hour budget, read from a live
+    # pane. It is an observation with an age, never an estimate: the welcome
+    # panel's `N/M hours remaining` wins over the footer fraction next to the
+    # model, and a pane that shows neither (or no live session at all) is
+    # unknown with exit 2.
+    local name="" json=0 tmux="" session="" pane="" value="" source='' age='' agedisp='-'
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) json=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            -*) die "hours: unsupported argument: $1" ;;
+            *)
+                [ -z "$name" ] || die "hours: at most one NAME"
+                name=$1; shift
+                ;;
+        esac
+    done
+    if [ -n "$name" ]; then
+        valid_name "$name" || die "hours: invalid name"
+        session="fb-$name"
+    fi
+    tmux=$(tmux_bin 2>/dev/null || true)
+    [ -n "$session" ] || session=$(live_sessions | head -n 1)
+
+    if [ -n "$tmux" ] && [ -n "$session" ] &&
+        "$tmux" has-session -t "$session" 2>/dev/null; then
+        pane=$("$tmux" capture-pane -p -t "$session" -S "-$REFUSAL_WINDOW" 2>/dev/null || true)
+        value=$(hours_panel "$pane")
+        if [ -n "$value" ]; then
+            source=panel
+        else
+            value=$(hours_footer "$pane")
+            [ -z "$value" ] || source=footer
+        fi
+        # The age is the time since tmux last saw activity, the last moment
+        # the pane could have changed: the reading is at least that old. A
+        # session that cannot report its activity has no age, not a zero.
+        age=$(idle_seconds "${session#fb-}" 2>/dev/null || true)
+        [ -z "$age" ] || agedisp="${age}s"
+        if [ -z "$value" ]; then
+            if [ "$json" = 1 ]; then
+                printf '{"hours":null,"session":%s,"age":%s,"source":null}\n' \
+                    "$(json_nullable_str "$session")" "$(json_nullable_num "$age")"
+            else
+                note "hours=unknown session=$session age=$agedisp source=none"
+            fi
+            exit 2
+        fi
+        if [ "$json" = 1 ]; then
+            printf '{"hours":%s,"session":%s,"age":%s,"source":%s}\n' \
+                "$(json_str "$value")" "$(json_str "$session")" \
+                "$(json_nullable_num "$age")" "$(json_str "$source")"
+        else
+            note "hours=$value session=$session age=$agedisp source=$source"
+        fi
+        return 0
+    fi
+
+    # No live pane: the tool cannot invent a number it has not read.
+    if [ "$json" = 1 ]; then
+        printf '{"hours":null,"session":null,"age":null,"source":null}\n'
+    else
+        note 'hours=unknown'
+    fi
+    exit 2
 }
 
 # ---- watch, autostop, reap and gc ----
@@ -3341,6 +3623,7 @@ case "$cmd" in
     status) status "$@" ;;
     list|ls) list_agents "$@" ;;
     sessions|ps) sessions "$@" ;;
+    hours) hours "$@" ;;
     gui) gui "$@" ;;
     attach) attach "$@" ;;
     send) send "$@" ;;

@@ -12,7 +12,7 @@ starts a real agent.
 
 | Path | What lives there |
 | --- | --- |
-| `spawn-freebuff-agent` | The whole shipped tool, in one bash file: `usage()` at the top, shared helpers, one function per subcommand (`start`, `status`, `sessions`, `gui`, `stop`, ...), and the subcommand dispatch at the bottom. |
+| `spawn-freebuff-agent` | The whole shipped tool, in one bash file: `usage()` at the top, shared helpers, one function per subcommand (`start`, `status`, `sessions`, `hours`, `gui`, `stop`, ...), and the subcommand dispatch at the bottom. |
 | `spawn-freebuff-agent-test.sh` | The deviceless runner. Sources `test/lib.sh`, then each area file in order, and prints `ok N checks`. |
 | `test/lib.sh` | The shared harness: temporary git repo, fake tmux/stty/freebuff, pane fixtures, `check`/`contains`/`json_ok`, and the cleanup trap. |
 | `test/cli-json.sh` | Area: the CLI surface, the git exclude list, `--json` output and the remaining flags. |
@@ -22,6 +22,7 @@ starts a real agent.
 | `test/brief-refusals.sh` | Area: the brief-hash ledger and the vendor refusal vocabulary and state. |
 | `test/readiness-submission.sh` | Area: the readiness deadline and proof that the brief was submitted. |
 | `test/wait-actions.sh` | Area: `gui --serve` — the read-only server, the POST actions and the ttyd route. |
+| `test/hours.sh` | Area: the remaining hour budget read from a live pane. |
 | `gui-test.sh` | The second suite: curl checks for `gui/server.py`. It reuses `test/lib.sh` and prints `ok N gui checks`. |
 | `gui/server.py` | The HTTP server for `gui --serve`, python3 standard library only. It shells out to the CLI, which stays the single source of state. |
 | `docs/freebuff-integration.md` | Research roadmap for MCP, hooks and completion notifications. Nothing in it is implemented. |
@@ -71,6 +72,7 @@ Find the area that owns the behaviour:
 | Brief ledger, refusals | `test/brief-refusals.sh` |
 | Readiness deadline, submission proof | `test/readiness-submission.sh` |
 | `gui --serve` routes and actions | `test/wait-actions.sh` |
+| Hours read from a pane | `test/hours.sh` |
 
 A check is one `check` call:
 

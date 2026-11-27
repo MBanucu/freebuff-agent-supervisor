@@ -24,6 +24,11 @@ TMP=$(mktemp -d) || exit 1
 REPO="$TMP/repo"
 FAKE_DIR="$TMP/fake"
 WT="$REPO/.worktrees/test-999"
+# The turn-log source reads <config>/projects/<name>/chats. Point it at the
+# temp tree so a suite never reads the real ~/.config/manicode, and so a
+# fixture chat directory is one mkdir away.
+export FREEBUFF_CONFIG_DIR="$TMP/freebuff-config"
+mkdir -p "$FREEBUFF_CONFIG_DIR"
 
 _cleanup() {
     local rc=$?
@@ -322,6 +327,15 @@ Allow once   Allow always   Deny'
 # Captured from 0.2.38: the startup banner sits inside the 12-line window
 # together with the resting prompt, so the prompt has to win.
 BANNER_IDLE_PANE=' Can.t reach Freebuff.s servers. Retrying… Try another network.
+╭──────────────────╮
+│  ▍Enter a coding task or / for commands
+╰──────────────────╯
+ DeepSeek V4.1 Flash 10/17 • high · /tmp/x/proj · /model to change · Chat: New chat'
+# The welcome panel (#106) draws the account's budget as `N/M hours remaining`
+# above the resting prompt. Its figure differs from the footer's, so a read
+# that prefers the panel is visible in its answer.
+HOURS_PANEL_PANE=' Welcome to Freebuff
+ 0/21 hours remaining
 ╭──────────────────╮
 │  ▍Enter a coding task or / for commands
 ╰──────────────────╯

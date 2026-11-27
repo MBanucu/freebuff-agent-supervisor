@@ -210,6 +210,18 @@ no busy marker is present, and the pane is unchanged for the window. A shell
 approval prompt, rate-limit notice or the concurrent-session overlay is never
 treated as idle.
 
+**The turn log (opt-in).** Freebuff also writes a per-chat debug log,
+`<config>/projects/<worktree>/chats/<newest>/log.jsonl`, with a
+`Sending message with sdk run config` line at each turn start and a
+`Main prompt finished` line at each end. `status --source log` reads it and
+reports `turn_state=working|finished|failed` from that pair, plus
+`turn_outcome=lastMessage|error`; a finished turn maps to
+`session_state=idle`, because the pane would rest at its prompt, and `done`
+stays the result file's word. `--source auto` prefers the log and falls back
+to the pane when there is no chat directory. It is an internal debug format,
+not a contract, so the pane and `.agent-result` remain the fallback and the
+authority.
+
 The marker vocabulary, captured from 0.2.38, how the classifier orders it,
 the `unknown` fallback for a pane none of them claims, and the unverified
 approval chrome are in
@@ -240,6 +252,10 @@ spawn-freebuff-agent status 103-example --lines 40
 spawn-freebuff-agent status 103-example --no-gh
 spawn-freebuff-agent status 103-example --json
 spawn-freebuff-agent status 103-example --explain
+spawn-freebuff-agent status 103-example --source log
+spawn-freebuff-agent status 103-example --source auto
+spawn-freebuff-agent hours                 # any live fb-* session
+spawn-freebuff-agent hours --json
 spawn-freebuff-agent attach 103-example   # detach with Ctrl-b d
 spawn-freebuff-agent send 103-example "Also run the new test"
 spawn-freebuff-agent watch 103-example --idle-seconds 120 --poll 5
@@ -267,7 +283,19 @@ the last line of `.supervisor-hours` is used and labelled `age=47m`; a repo
 with no history prints `hours=-` instead of dressing a guess as a reading.
 `--window N` sets the scrollback the classifier reads (default 40) and
 `--explain` adds the decision trail described in
-[machine-readable output](docs/machine-readable-output.md).
+[machine-readable output](docs/machine-readable-output.md). `--source` selects
+where `session_state` comes from: `pane` (the default, the terminal), `log`
+(the turn log above, which still answers after the session is gone) or `auto`
+(the log first, the pane when it has no verdict).
+
+`hours [NAME]` reads the remaining Freebuff hour budget from a live pane,
+never from a guess or a file: the welcome panel's `N/M hours remaining` first,
+then the footer fraction next to the model (`DeepSeek V4.1 Flash 10/17 •
+high`). `NAME` defaults to any live `fb-*` session. It prints
+`hours=N/M session=fb-X age=Ns source=panel|footer`, where the age is the
+seconds since the pane last changed, so a stale reading is visible. With no
+live session, or a pane that shows no figure, it prints `hours=unknown` and
+exits 2. `--json` emits the same fields as one object.
 
 `sessions` is the inventory: one row per `fb-*` session **and** per worktree,
 with `WORKTREE yes|missing`, the attached `autostop` watcher (`pid:N`, `dead`
