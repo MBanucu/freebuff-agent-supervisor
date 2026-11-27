@@ -21,6 +21,7 @@ what the pane is doing.
     "idle_seconds": null,
     "finished": false,
     "watcher": "pid:123",
+    "wake_lock": "acquired",
     "worktree": "yes",
     "result": "blocked",
     "branch": "test/999",
@@ -31,9 +32,9 @@ what the pane is doing.
 
 `status NAME --json` is one object with the same fields plus the detail view's:
 `running` and `dirty` as booleans, `input` (`raw|canonical|unknown`),
-`session_state`, `commit`, the `result_*` keys from `.agent-result`, the pane
-tail as a `pane` string, and the classifier's decision as the `evidence`
-object documented below.
+`session_state`, `commit`, `wake_lock`, the `result_*` keys from
+`.agent-result`, the pane tail as a `pane` string, and the classifier's
+decision as the `evidence` object documented below.
 
 `status --explain` prints the classification decision line by line: the rule
 that won, the line it matched, every marker that was checked, the window's line
@@ -62,8 +63,11 @@ A missing value is `null` rather than the table's `-`: `idle_seconds` when the
 session is not running or its state is terminal (`done`, `stopped`, `blocked`,
 `failed`) — a finished run has no idle time, so a done card cannot read `idle
 5495s` — `result` with no `.agent-result`, `branch` and `pr` for a session with
-no worktree, `watcher` with no autostop recorded, and `pane` when no session is
-running. Idle time comes back when the session is resumed and is no longer
+no worktree, `watcher` with no autostop recorded, `wake_lock` when the run did
+not ask for one, and `pane` when no session is running. `wake_lock` is the
+value `start` recorded (`acquired`, `unavailable` or `failed`), not a live
+status: `termux-wake-lock` has no query, and the lock is never released by the
+tool. Idle time comes back when the session is resumed and is no longer
 terminal. `finished` is `true` for a session that is still running but whose
 run is over — exactly the ones holding a vendor slot — and `false` otherwise,
 including for a session that has already stopped.
