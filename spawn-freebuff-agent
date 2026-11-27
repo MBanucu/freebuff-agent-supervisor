@@ -264,7 +264,7 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       last account hours reading (N/M for a live read, N/M age=47m for the
       .supervisor-hours ledger, - when there is neither).
       Sessions with no worktree are listed here instead of only being
-      reapable by gc --all. --json emits the same rows as an array of
+      reapable by plain gc. --json emits the same rows as an array of
       objects.
 
   spawn-freebuff-agent hours [NAME] [--json]
@@ -343,11 +343,14 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       to end, then stops, recording the pane state. It refuses to kill a
       session that is still working when the wait expires.
 
-  spawn-freebuff-agent gc [--idle-hours N] [--all] [--dry-run]
+  spawn-freebuff-agent gc [--idle-hours N] [--prune-worktrees] [--dry-run]
       Stop finished sessions, sessions idle past N hours (default: 12),
-      sessions stuck on the concurrent-session overlay, and with --all,
-      fb-* sessions whose worktree no longer exists. Busy and approval
-      panes are skipped. Worktrees and branches are never removed.
+      sessions stuck on the concurrent-session overlay, and fb-* sessions
+      whose worktree no longer exists. Busy and approval panes are skipped.
+      --prune-worktrees also prints the git worktree remove / git branch -d
+      command for each stopped session except a refused one; it never runs
+      the command. Worktrees and branches are never removed. --all is still
+      accepted, but a worktree-less session is stopped by plain gc now.
 
 Environment:
   FREEBUFF_BIN        freebuff executable (default: freebuff on PATH)
@@ -2716,7 +2719,7 @@ list_agents() {
     local wt name branch session tmux running state idle activity now idle_secs
     local orphans="" orphan
     # Sessions with no worktree are not in the table below; name them so they
-    # cannot be reaped by gc --all without ever having been seen.
+    # cannot be reaped by gc without ever having been seen.
     while IFS= read -r orphan; do
         [ -n "$orphan" ] || continue
         orphan=${orphan#fb-}
@@ -2811,25 +2814,29 @@ finished_live() {
 }
 
 finished_live_names() {
-    # finished_live_names [TMUX] -> the names of finished-but-live sessions,
-    # comma-separated, empty when none. `sessions` counts them and a refused
-    # `start` names them: the overlay says only that the limit was reached, and
-    # the next step is `gc`, not guessing which session to stop.
-    local tmux=${1:-} wt name out=''
+    # finished_live_names [TMUX] -> the names of live sessions that hold a
+    # vendor slot for nothing, comma-separated, empty when none. That is a
+    # session whose run is terminal, plus any session whose worktree is gone:
+    # it has no result file left to read, and only a slot to lose. `sessions`
+    # counts them and a refused `start` names them, so the next step is `gc`
+    # rather than guessing which session to stop.
+    local tmux=${1:-} name out=''
     [ -n "$tmux" ] || tmux=$(tmux_bin 2>/dev/null || true)
     [ -n "$tmux" ] || return 0
-    for wt in "$ROOT"/.worktrees/*; do
-        [ -d "$wt" ] || continue
-        name=$(basename "$wt")
-        finished_live "$name" "$tmux" || continue
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        name=${name#fb-}
+        if [ -d "$ROOT/.worktrees/$name" ]; then
+            finished_live "$name" "$tmux" || continue
+        fi
         out="${out:+$out,}$name"
-    done
+    done <<<"$(live_sessions)"
     printf '%s' "$out"
 }
 
 sessions() {
     # sessions -> one table over every fb-* session and every worktree, so a
-    # session with no worktree is visible before gc --all reaps it. --json is a
+    # session with no worktree is visible before gc reaps it. --json is a
     # serialization of the same rows: one array of objects, `[]` when empty.
     local no_gh=0 json=0 name wt worktree running state idle activity now idle_secs
     local watcher wake_lock result branch pr prs="" slug="" tmux total=0 live=0 trees=0
@@ -3280,19 +3287,26 @@ notify() {
 }
 
 gc() {
-    local idle_hours=12 dry=0 all=0
+    # Worktree removal is never automatic: --prune-worktrees only prints the
+    # cleanup commands. A refused launch is never offered for pruning, because
+    # its branch was never pushed and its worktree may hold the only copy of
+    # the agent's edits. A session whose worktree is already gone has nothing
+    # left to review, so plain gc stops it instead of leaving the vendor slot
+    # held behind --all.
+    local idle_hours=12 dry=0 prune=0
     while [ $# -gt 0 ]; do
         case "$1" in
             --idle-hours) idle_hours=${2:-}; shift 2 ;;
             --dry-run) dry=1; shift ;;
-            --all) all=1; shift ;;
+            --prune-worktrees) prune=1; shift ;;
+            --all) shift ;;  # accepted for compatibility; orphans are default
             -h|--help) usage; exit 0 ;;
             *) die "gc: unsupported argument: $1" ;;
         esac
     done
     is_num "$idle_hours" || die "gc: --idle-hours must be a number"
 
-    local tmux now wt name session state idle_secs branch stopped
+    local tmux now wt name session state idle_secs branch planned
     local names=() orphans=() listed
     tmux=$(tmux_bin) || die "gc: tmux not found"
     now=$(date +%s)
@@ -3312,7 +3326,7 @@ gc() {
     done <<<"$listed"
 
     for name in ${names[@]+"${names[@]}"}; do
-        stopped=0
+        planned=0
         state=$(session_state "$name")
         case "$state" in
             missing)
@@ -3321,33 +3335,35 @@ gc() {
             done|blocked|failed)
                 # All three are a finished agent: blocked and failed still stop
                 # the session, and the reason names the result state.
+                planned=1
                 if [ "$dry" = 1 ]; then
                     note "would-stop name=$name reason=$state"
                 else
                     note "stop name=$name reason=$state"
                     reap "$name" "$state"
-                    stopped=1
                 fi
                 ;;
             refused)
+                # The stop is fine (the TUI is dead weight), but the worktree
+                # is the evidence: never offer to prune it.
+                planned=1
                 if [ "$dry" = 1 ]; then
                     note "would-stop name=$name reason=refused"
                 else
                     note "stop name=$name reason=refused"
                     reap "$name" refused
-                    stopped=1
                 fi
                 ;;
             idle)
                 idle_secs=$(idle_seconds "$name" 2>/dev/null || true)
                 is_num "$idle_secs" || idle_secs=0
                 if [ "$idle_secs" -ge $((idle_hours * 3600)) ]; then
+                    planned=1
                     if [ "$dry" = 1 ]; then
                         note "would-stop name=$name reason=idle idle_seconds=$idle_secs"
                     else
                         note "stop name=$name reason=idle"
                         reap "$name" idle
-                        stopped=1
                     fi
                 else
                     note "skip name=$name reason=idle idle_seconds=$idle_secs"
@@ -3363,23 +3379,26 @@ gc() {
                 note "skip name=$name reason=busy"
                 ;;
         esac
-        if [ "$dry" = 0 ] && [ "$stopped" = 1 ]; then
+        if [ "$prune" = 1 ] && [ "$planned" = 1 ] && [ "$state" != refused ]; then
             branch=$(git -C "$ROOT/.worktrees/$name" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
-            [ -z "$branch" ] ||
-                note "cleanup=git worktree remove .worktrees/$name && git branch -d $branch"
+            [ -z "$branch" ] || {
+                if [ "$dry" = 1 ]; then
+                    note "would-prune name=$name cleanup=git worktree remove .worktrees/$name && git branch -d $branch"
+                else
+                    note "cleanup=git worktree remove .worktrees/$name && git branch -d $branch"
+                fi
+            }
         fi
     done
 
+    # No worktree means no result file and no branch to review, so the session
+    # only holds a vendor slot. Plain gc stops it; --all is no longer needed.
     for name in ${orphans[@]+"${orphans[@]}"}; do
-        if [ "$all" = 1 ]; then
-            if [ "$dry" = 1 ]; then
-                note "would-stop name=$name reason=orphan"
-            else
-                note "stop name=$name reason=orphan"
-                reap "$name" orphan
-            fi
+        if [ "$dry" = 1 ]; then
+            note "would-stop name=$name reason=orphan"
         else
-            note "skip name=$name reason=orphan (use --all)"
+            note "stop name=$name reason=orphan"
+            reap "$name" orphan
         fi
     done
 }

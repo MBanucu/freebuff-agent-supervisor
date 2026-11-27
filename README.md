@@ -326,7 +326,7 @@ column (`acquired`, `unavailable`, `failed` or `-` for a run that did not ask
 for the lock) and the HOURS column (`N/M` for a reading made this run,
 `N/M age=47m` for the `.supervisor-hours` ledger, `-` with neither). It
 starts from `tmux list-sessions`, so a session with no worktree appears there
-instead of only being found when `gc --all` kills it; `list` also names such
+instead of only being found when `gc` kills it; `list` also names such
 orphans.
 `--no-gh` skips the PR column. The last line counts what was listed —
 `sessions=`, `running=`, `worktrees=`, `orphans=` and `finished=`, the live
@@ -348,9 +348,12 @@ commit by accident.
 
 `gc` stops sessions that are `done`, `blocked` or `failed`, stuck on the
 concurrent-session overlay, idle for more than `--idle-hours` (default 12), or
-— with `--all` — `fb-*` sessions whose worktree no longer exists. Busy, approval and `unknown` panes
-are skipped with a reason, and `--dry-run` only reports. `gc` never removes worktrees or
-branches; it prints the cleanup commands instead:
+whose worktree no longer exists. Busy, approval and `unknown` panes are
+skipped with a reason, and `--dry-run` only reports. `gc` never removes
+worktrees or branches. `--prune-worktrees` opts in to the cleanup commands for
+sessions it stopped: it prints them and never runs them, and it never offers
+one for a `refused` launch, whose branch was never pushed and whose worktree
+may hold the only copy of the agent's edits.
 
 ```bash
 git worktree remove .worktrees/103-example
