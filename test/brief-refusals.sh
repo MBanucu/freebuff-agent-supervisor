@@ -228,6 +228,8 @@ check test -f "$HOURS_WT/.refusal"
 check contains "$(cat "$HOURS_WT/.refusal")" 'Not enough hours'
 check contains "$(cat "$HOURS_WT/.supervisor.log")" 'refused at='
 check test -z "$(grep -F 'pane:' "$HOURS_WT/.supervisor.log" || true)"
+# No fraction was on the panel, so no ledger line is invented for this session.
+check test -z "$(grep 'session=fb-test-refuse-hours$' "$REPO/.supervisor-hours" 2>/dev/null || true)"
 
 # A panel that also draws the account's usage reports it as hours=N/M; the
 # sentence alone does not carry a fraction, so nothing is guessed there.
@@ -238,6 +240,9 @@ check test "$rc" -ne 0
 check contains "$(cat "$TMP/start.out")" 'refused=hours'
 check contains "$(cat "$TMP/start.out")" 'hours=1/2'
 check test ! -s "$FAKE_DIR/sent"
+# The observation is appended to the repository ledger with its source (#108).
+check contains "$(cat "$REPO/.supervisor-hours")" \
+    'hours=1/2 source=panel session=fb-test-refuse-hours-quota'
 
 # The observed case: the pane was ready and the Enter was taken, then the
 # overlay appeared in place of the turn. That is the same refusal, so the

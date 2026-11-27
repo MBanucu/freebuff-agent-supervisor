@@ -287,8 +287,12 @@ or 4). `start --auto-stop` runs it detached.
 `list` prints the branch, session, running flag, live state and idle time.
 `status` prints the result state, the autostop `watcher`, `session_state`, idle
 seconds, the pane tail, the last commit, whether the worktree is dirty, and any
-open PR for the branch. `--window N` sets the scrollback the classifier reads
-(default 40) and `--explain` adds the decision trail described in
+open PR for the branch. It also prints `hours=N/M`, the account usage the TUI
+draws, from a live pane when there is one. When the pane carries no fraction,
+the last line of `.supervisor-hours` is used and labelled `age=47m`; a repo
+with no history prints `hours=-` instead of dressing a guess as a reading.
+`--window N` sets the scrollback the classifier reads (default 40) and
+`--explain` adds the decision trail described in
 [machine-readable output](docs/machine-readable-output.md). `--source` selects
 where `session_state` comes from: `pane` (the default, the terminal), `log`
 (the turn log above, which still answers after the session is gone) or `auto`
@@ -306,11 +310,13 @@ exits 2. `--json` emits the same fields as one object.
 `sessions` is the inventory: one row per `fb-*` session **and** per worktree,
 with `WORKTREE yes|missing`, the attached `autostop` watcher (`pid:N`, `dead`
 or `-`; the pid is the one `start --auto-stop` wrote to
-`.supervisor.log`), the result state, the branch, the open PR and the WAKE
+`.supervisor.log`), the result state, the branch, the open PR, the WAKE
 column (`acquired`, `unavailable`, `failed` or `-` for a run that did not ask
-for the lock). It starts from
-`tmux list-sessions`, so a session with no worktree appears there instead of
-only being found when `gc --all` kills it; `list` also names such orphans.
+for the lock) and the HOURS column (`N/M` for a reading made this run,
+`N/M age=47m` for the `.supervisor-hours` ledger, `-` with neither). It
+starts from `tmux list-sessions`, so a session with no worktree appears there
+instead of only being found when `gc --all` kills it; `list` also names such
+orphans.
 `--no-gh` skips the PR column. The last line counts what was listed —
 `sessions=`, `running=`, `worktrees=`, `orphans=` and `finished=`, the live
 sessions whose run is already over. Freebuff counts live TUIs against its
@@ -395,9 +401,10 @@ policy](docs/vendor-policy.md).
 
 - The tool writes only under `.worktrees/` in the target repository, plus
   `.supervisor-briefs.jsonl` in its root (the last 20 sent-brief hashes, plus
-  any refused hash) and `.git/info/exclude` entries for `.worktrees/`,
-  `.task.md`, `.agent-result`, `.supervisor.log`, `.supervisor-briefs.jsonl`
-  and `local.properties`. A refusal also writes
+  any refused hash), `.supervisor-hours` (one line per account-usage reading)
+  and `.git/info/exclude` entries for `.worktrees/`, `.task.md`,
+  `.agent-result`, `.supervisor.log`, `.supervisor-briefs.jsonl`,
+  `.supervisor-hours` and `local.properties`. A refusal also writes
   `.worktrees/<name>/.refusal`, which `stop` removes.
 - A running agent uses its normal shell approvals. Do not attach and type while
   it is working; use `send` for a deliberate follow-up.

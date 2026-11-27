@@ -31,7 +31,8 @@
 #   state files and refusals:
 #     result_key, result_state, state_is_terminal, refusal_recorded,
 #     refusal_sentence, refusal_record, clear_refusal, refusal_is_hours,
-#     hours_quota, hours_panel, hours_footer, refusal_notes
+#     hours_quota, hours_panel, hours_footer, hours_source, hours_age_label,
+#     hours_read, refusal_notes
 #   escaping and JSON:
 #     json_str, json_nullable_str, json_nullable_num, html_escape,
 #     json_unescape, json_scalar, state_class, action_form, stylesheet_file,
@@ -115,6 +116,21 @@ TRUST_PROMPT='Load and run these?'
 # keeps status at refused after the sentence has scrolled away; stop removes
 # it, so a refusal lasts until the session is explicitly stopped.
 REFUSAL_FILE='.refusal'
+# Every hours=N/M observation appends one line here, so the last reading
+# outlives the session that showed it (#108):
+#   ts=<epoch> hours=N/M source=panel|footer session=fb-X
+# A reading from the ledger is always shown with its age, never as current.
+HOURS_LEDGER='.supervisor-hours'
+# Scrollback read for an hours line: the overlay sits above the resting
+# prompt, and the footer is the last line.
+HOURS_WINDOW=40
+# Set by hours_read: the value and source of the reading, its age in seconds
+# (0 for a live read, the ledger age otherwise) and whether it was read from
+# the pane this run. FRESH=0 means the value came from the ledger.
+HOURS_VALUE=''
+HOURS_AGE=''
+HOURS_SOURCE=''
+HOURS_FRESH=0
 # Turn text sits above the visible prompt, so refusal detection reads this
 # many lines of scrollback rather than the 12-line chrome window.
 REFUSAL_WINDOW=40
@@ -221,7 +237,9 @@ Spawn parallel Freebuff agents in isolated git worktrees.
   spawn-freebuff-agent status NAME [--lines N] [--no-gh] [--json] [--explain]
                               [--source pane|log|auto] [--window N]
       Show the session, input mode, result state, pane tail, branch, last
-      commit and PR.
+      commit and PR. hours=N/M is this run's reading of the account usage;
+      when the pane carries none, the last ledger line is shown with its age
+      (hours=N/M age=47m), and no history at all is hours=-.
       --lines N   pane lines to show (default: 25)
       --no-gh     do not ask gh for the PR
       --json      emit the same fields as one JSON object, plus an evidence
@@ -242,7 +260,9 @@ Spawn parallel Freebuff agents in isolated git worktrees.
   spawn-freebuff-agent sessions [--no-gh] [--json]
       One table over every fb-* session and every worktree: live state, idle
       time, attached autostop watcher, whether a worktree exists, the result
-      state, the branch, the open PR and the wake lock recorded at start.
+      state, the branch, the open PR, the wake lock recorded at start and the
+      last account hours reading (N/M for a live read, N/M age=47m for the
+      .supervisor-hours ledger, - when there is neither).
       Sessions with no worktree are listed here instead of only being
       reapable by gc --all. --json emits the same rows as an array of
       objects.
@@ -350,6 +370,10 @@ Notes:
     and exits non-zero; the brief is not retyped.
   - A running agent runs shell commands with its normal approvals. Do not
     attach and type while it is working.
+  - Every hours=N/M observation is appended to .supervisor-hours, one line
+    per read, so status and sessions can still show the last account usage
+    after the session that showed it is gone. A ledger reading is always
+    labelled with its age; a number without an age came from this run.
   - A brief is hashed into .supervisor-briefs.jsonl (last 20 kept) before it
     is typed; a repeat inside that window is a hard error and sends nothing,
     because Freebuff treats a repeated message as scripted use and counts a
@@ -491,7 +515,7 @@ ensure_excludes() {
     file=$(exclude_path)
     mkdir -p "$(dirname "$file")"
     for entry in '.worktrees/' '.task.md' 'local.properties' "$RESULT_FILE" \
-        '.supervisor.log' "$GH_STATE_FILE" "$BRIEF_LEDGER"; do
+        '.supervisor.log' "$GH_STATE_FILE" "$BRIEF_LEDGER" "$HOURS_LEDGER"; do
         grep -qxF "$entry" "$file" 2>/dev/null || printf '%s\n' "$entry" >>"$file"
     done
 }
@@ -790,18 +814,88 @@ hours_footer() {
         grep -oE '[0-9]+(\.[0-9]+)?/[0-9]+' | tail -n 1 || true
 }
 
+hours_source() {
+    # hours_source PANE -> `panel` when the reading sits in the hours overlay,
+    # `footer` when the TUI drew the usage in its resting chrome instead.
+    if printf '%s\n' "${1-}" | grep -qiE "$HOURS_OVERLAY_RE"; then
+        printf 'panel'
+    else
+        printf 'footer'
+    fi
+}
+
+hours_age_label() {
+    # hours_age_label SECONDS -> a compact age for a cached reading: 47s, 47m,
+    # 3h, 2d. A cached number is only ever shown with this beside it.
+    local secs=${1:-0}
+    if [ "$secs" -lt 60 ]; then
+        printf '%ss' "$secs"
+    elif [ "$secs" -lt 3600 ]; then
+        printf '%sm' "$((secs / 60))"
+    elif [ "$secs" -lt 86400 ]; then
+        printf '%sh' "$((secs / 3600))"
+    else
+        printf '%sd' "$((secs / 86400))"
+    fi
+}
+
+hours_read() {
+    # hours_read SESSION PANE -> 0 when there is an hours reading to show, 1
+    # when neither the pane nor the ledger has one. A fraction in the pane is
+    # the reading: it is appended to the ledger and HOURS_FRESH=1 marks it as
+    # current, so the caller does not have to print an age for it. Otherwise
+    # the ledger's last line is used with its age, which is what keeps a
+    # stale value from being read as current. HOURS_VALUE/AGE/SOURCE carry
+    # the result; AGE is 0 for a live read and empty when nothing was found.
+    local session=${1-} pane=${2-} line ts
+    HOURS_VALUE=''
+    HOURS_AGE=''
+    HOURS_SOURCE=''
+    HOURS_FRESH=0
+    HOURS_VALUE=$(hours_quota "$pane")
+    if [ -n "$HOURS_VALUE" ]; then
+        HOURS_SOURCE=$(hours_source "$pane")
+        ts=$(date +%s)
+        printf 'ts=%s hours=%s source=%s session=%s\n' \
+            "$ts" "$HOURS_VALUE" "$HOURS_SOURCE" "$session" \
+            >>"$ROOT/$HOURS_LEDGER" 2>/dev/null || true
+        HOURS_AGE=0
+        HOURS_FRESH=1
+        return 0
+    fi
+    line=$(grep '^ts=[0-9][0-9]* hours=[^ ]* source=[^ ]*' \
+        "$ROOT/$HOURS_LEDGER" 2>/dev/null | tail -n 1 || true)
+    [ -n "$line" ] || return 1
+    ts=$(printf '%s\n' "$line" | sed -n 's/^ts=\([0-9][0-9]*\) .*/\1/p')
+    HOURS_VALUE=$(printf '%s\n' "$line" |
+        sed -n 's/^ts=[0-9][0-9]* hours=\([^ ]*\) .*/\1/p')
+    HOURS_SOURCE=$(printf '%s\n' "$line" |
+        sed -n 's/^ts=[0-9][0-9]* hours=[^ ]* source=\([^ ]*\) .*/\1/p')
+    if [ -z "$ts" ] || [ -z "$HOURS_VALUE" ]; then
+        HOURS_VALUE=''
+        HOURS_SOURCE=''
+        return 1
+    fi
+    HOURS_AGE=$(($(date +%s) - ts))
+    [ "$HOURS_AGE" -ge 0 ] || HOURS_AGE=0
+    return 0
+}
+
 refusal_notes() {
-    # refusal_notes SENTENCE PANE TMUX -> the refusal lines start prints.
-    # Every refusal is `refused=` plus the sentence. The overlays also name
-    # the next step: the hours overlay is `refused=hours` with the account's
-    # N/M usage when the panel draws it and a hint naming both ways out; the
+    # refusal_notes SENTENCE PANE TMUX SESSION -> the refusal lines start
+    # prints. Every refusal is `refused=` plus the sentence. The overlays also
+    # name the next step: the hours overlay is `refused=hours` with the
+    # account's N/M usage when the panel draws it and a hint naming both ways
+    # out; the observed usage is also appended to the hours ledger (#108). The
     # concurrent-session overlay names the finished sessions still holding a
     # slot, because their run is already over and stopping them loses nothing.
-    local refusal=${1-} pane=${2-} tmux=${3:-} hours held
+    local refusal=${1-} pane=${2-} tmux=${3:-} session=${4-} held
     if refusal_is_hours "$refusal"; then
         note 'refused=hours'
-        hours=$(hours_quota "$pane")
-        [ -z "$hours" ] || note "hours=$hours"
+        if [ -n "$session" ]; then
+            hours_read "$session" "$pane" || true
+        fi
+        [ -z "$HOURS_VALUE" ] || note "hours=$HOURS_VALUE"
         held=$(finished_live_names "$tmux")
         [ -z "$held" ] || note "holding_slot=$held"
         note "hint=stop finished sessions with: $(basename "$0") gc, or wait for the daily hours to refill"
@@ -2015,7 +2109,7 @@ start() {
         refusal_record "$wt" "$refusal"
         "$tmux" kill-session -t "$session" 2>/dev/null || true
         note "session=$session"
-        refusal_notes "$refusal" "$pane" "$tmux"
+        refusal_notes "$refusal" "$pane" "$tmux" "$session"
         note "refusal=$refusal"
         note 'sent=no'
         die "start: Freebuff refused the launch before the brief was sent: $refusal (no keys typed; worktree kept at $wt)"
@@ -2108,7 +2202,7 @@ start() {
         # be typed again, even after it would have aged out of the window.
         brief_ledger_mark_refused "$brief_hash_value" "$name" "$branch"
         note "session=$session"
-        refusal_notes "$refusal" "$pane" "$tmux"
+        refusal_notes "$refusal" "$pane" "$tmux" "$session"
         note "refusal=$refusal"
         # The overlay was already on screen at the first poll, so the window
         # was not spent: name the elapsed time that proved it.
@@ -2253,7 +2347,7 @@ status() {
 
     local wt="$ROOT/.worktrees/$name" branch session tmux running=0 tty mode=unknown stty out
     local state rstate="" pane="" idle="" sstate="" last_commit dirty=no watcher=""
-    local wake_lock=""
+    local wake_lock="" hours=""
     local result_pr="" result_commit="" result_tests="" prs="" pr_json=null
     local evidence="" ev_rule="" ev_matched="" ev_lines="" ev_sha="" ev_scans="" ev_source=""
     local turn_evidence="" tstate="" tout="" turn_log=""
@@ -2367,6 +2461,22 @@ status() {
         fi
     fi
 
+    # The hours reading is the live pane when it carries one, otherwise the
+    # ledger's last line with its age. A live read is what this run observed;
+    # a cached one is never printed without that age (#108).
+    if hours_read "$session" "$pane"; then
+        if [ "$HOURS_FRESH" = 1 ]; then
+            hours="hours=$HOURS_VALUE"
+        else
+            hours="hours=$HOURS_VALUE age=$(hours_age_label "$HOURS_AGE")"
+        fi
+    else
+        hours='hours=-'
+    fi
+    if [ "$json" = 0 ]; then
+        printf '%s\n' "$hours"
+    fi
+
     last_commit=$(git -C "$wt" log -1 --oneline 2>/dev/null || true)
     if [ -n "$(git -C "$wt" status --short 2>/dev/null || true)" ]; then
         dirty=yes
@@ -2441,6 +2551,11 @@ status() {
     printf '  "idle_seconds": %s,\n' "$(json_nullable_num "$idle")"
     printf '  "watcher": %s,\n' "$(json_nullable_str "$watcher")"
     printf '  "wake_lock": %s,\n' "$(json_nullable_str "$wake_lock")"
+    printf '  "hours": {\n'
+    printf '    "value": %s,\n' "$(json_nullable_str "$HOURS_VALUE")"
+    printf '    "age_seconds": %s,\n' "$(json_nullable_num "$HOURS_AGE")"
+    printf '    "source": %s\n' "$(json_nullable_str "$HOURS_SOURCE")"
+    printf '  },\n'
     printf '  "commit": %s,\n' "$(json_nullable_str "$last_commit")"
     printf '  "dirty": %s,\n' "$([ "$dirty" = yes ] && printf true || printf false)"
     printf '  "pr": %s,\n' "$pr_json"
@@ -2577,6 +2692,7 @@ sessions() {
     # serialization of the same rows: one array of objects, `[]` when empty.
     local no_gh=0 json=0 name wt worktree running state idle activity now idle_secs
     local watcher wake_lock result branch pr prs="" slug="" tmux total=0 live=0 trees=0
+    local pane hours
     local finished=no finished_count=0
     local names=() x first=1
     while [ $# -gt 0 ]; do
@@ -2627,11 +2743,11 @@ sessions() {
     if [ "$json" = 1 ]; then
         printf '[\n'
     elif [ -n "$prs" ]; then
-        printf '%-22s %-9s %-8s %-9s %-9s %-9s %-24s %-40s %s\n' \
-            NAME STATE IDLE WATCHER WORKTREE RESULT BRANCH PR WAKE
+        printf '%-22s %-9s %-8s %-9s %-9s %-9s %-24s %-40s %s %s\n' \
+            NAME STATE IDLE WATCHER WORKTREE RESULT BRANCH PR WAKE HOURS
     else
-        printf '%-22s %-9s %-8s %-9s %-9s %-9s %-40s %s\n' \
-            NAME STATE IDLE WATCHER WORKTREE RESULT BRANCH WAKE
+        printf '%-22s %-9s %-8s %-9s %-9s %-9s %-40s %s %s\n' \
+            NAME STATE IDLE WATCHER WORKTREE RESULT BRANCH WAKE HOURS
     fi
 
     for name in "${names[@]}"; do
@@ -2640,6 +2756,8 @@ sessions() {
         idle_secs=""
         pr=""
         wake_lock=""
+        pane=""
+        hours=""
         if [ -d "$wt" ]; then
             worktree=yes
             trees=$((trees + 1))
@@ -2677,12 +2795,26 @@ sessions() {
                     idle="${idle_secs}s"
                 fi
             fi
+            # The live pane is read for an hours line; a row whose session is
+            # not running, or whose pane carries none, falls back to the
+            # ledger and says how old that reading is (#108).
+            pane=$("$tmux" capture-pane -p -t "fb-$name" -S "-$HOURS_WINDOW" 2>/dev/null || true)
         elif [ "$worktree" = yes ]; then
             state=$(result_state "$wt")
             [ -n "$state" ] || state=stopped
             [ -z "$(refusal_recorded "$wt")" ] || state=refused
         else
             state=-
+        fi
+
+        if hours_read "fb-$name" "$pane"; then
+            if [ "$HOURS_FRESH" = 1 ]; then
+                hours=$HOURS_VALUE
+            else
+                hours="$HOURS_VALUE age=$(hours_age_label "$HOURS_AGE")"
+            fi
+        else
+            hours=-
         fi
 
         if [ -n "$prs" ] && [ "$branch" != '-' ]; then
@@ -2707,17 +2839,22 @@ sessions() {
             printf '    "worktree": %s,\n' "$(json_str "$worktree")"
             printf '    "result": %s,\n' "$(json_nullable_str "$result")"
             printf '    "branch": %s,\n' "$(json_nullable_str "$branch")"
-            printf '    "pr": %s\n' "$(json_nullable_str "$pr")"
+            printf '    "pr": %s,\n' "$(json_nullable_str "$pr")"
+            printf '    "hours": {\n'
+            printf '      "value": %s,\n' "$(json_nullable_str "$HOURS_VALUE")"
+            printf '      "age_seconds": %s,\n' "$(json_nullable_num "$HOURS_AGE")"
+            printf '      "source": %s\n' "$(json_nullable_str "$HOURS_SOURCE")"
+            printf '    }\n'
             printf '  }'
         elif [ -n "$prs" ] && [ "$branch" != '-' ]; then
             [ -n "$pr" ] || pr=-
-            printf '%-22s %-9s %-8s %-9s %-9s %-9s %-24s %-40s %s\n' \
+            printf '%-22s %-9s %-8s %-9s %-9s %-9s %-24s %-40s %s %s\n' \
                 "$name" "$state" "$idle" "$watcher" "$worktree" "$result" \
-                "$branch" "$pr" "${wake_lock:--}"
+                "$branch" "$pr" "${wake_lock:--}" "$hours"
         else
-            printf '%-22s %-9s %-8s %-9s %-9s %-9s %-40s %s\n' \
+            printf '%-22s %-9s %-8s %-9s %-9s %-9s %-40s %s %s\n' \
                 "$name" "$state" "$idle" "$watcher" "$worktree" "$result" \
-                "$branch" "${wake_lock:--}"
+                "$branch" "${wake_lock:--}" "$hours"
         fi
     done
 
