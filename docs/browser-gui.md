@@ -11,8 +11,8 @@ one amber, a failed or refused one red, and a session with no worktree carries
 a `no worktree` tag.
 
 ```bash
-spawn-freebuff-agent gui --snapshot /tmp/agents.html
-spawn-freebuff-agent gui --snapshot /tmp/agents.html --watch 5
+spawn-freebuff-agent gui --snapshot ${TMPDIR:-/tmp}/agents.html
+spawn-freebuff-agent gui --snapshot ${TMPDIR:-/tmp}/agents.html --watch 5
 ```
 
 There is no server, no network and no auth: the file is opened directly or

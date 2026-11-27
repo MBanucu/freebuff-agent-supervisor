@@ -192,11 +192,13 @@ Two Termux-specific path facts:
 
 - **`/tmp` is not writable by the Termux uid.** On this phone `/tmp` is
   `drwxrwx--x shell shell` **[device]**: the Termux app can traverse it but not
-  create files. The tool never writes there, but the README's examples use
-  `gui --snapshot /tmp/agents.html` **[repo]**, so that exact command fails with
-  `Permission denied`. Use `${TMPDIR:-/tmp}/agents.html`: Termux sets `TMPDIR`
-  to `$PREFIX/tmp`. `gui --serve` is unaffected — its rendered page goes through
-  Python's `tempfile.TemporaryDirectory`, which honours `TMPDIR`. **[repo]**
+  create files. The tool never writes there, but the README's examples used a
+  literal `--snapshot /tmp/agents.html` until #101 **[repo]**, so that exact
+  command failed with `Permission denied`. They now use
+  `${TMPDIR:-/tmp}/agents.html`, which is `$TMPDIR` on a phone (`$PREFIX/tmp`)
+  and `/tmp` on a desktop. `gui --serve` is unaffected — its rendered page goes
+  through Python's `tempfile.TemporaryDirectory`, which honours `TMPDIR`.
+  **[repo]**
 - **The checkout must be on a POSIX filesystem.** Termux's shared storage
   (`~/storage/shared`, `/sdcard`) is FUSE: no Unix permissions, no symlinks, no
   exec bit. `git worktree add` and `chmod +x` fail there. Keep the repository
@@ -284,7 +286,9 @@ Run inside Termux, in a checkout under `$HOME`.
    waiting out the 120-second readiness gate.
 2. **`spawn-freebuff-agent gui --snapshot /tmp/agents.html` →
    `Permission denied`.** `/tmp` is shell-owned and not writable by the Termux
-   uid. Use `$TMPDIR/agents.html`. **[device]**
+   uid. Use `$TMPDIR/agents.html`. Since #101 the README and
+   `docs/browser-gui.md` examples write `${TMPDIR:-/tmp}/agents.html`, which is
+   `$TMPDIR` on a phone and `/tmp` on a desktop. **[device]**
 3. **`spawn-freebuff-agent start --issue 89` on a fresh install →
    `start: tmux not found; install tmux or set FREEBUFF_TMUX`.** Since #98 it
    is preceded by `preflight=tmux missing=tmux hint=pkg install tmux`, and no
@@ -328,9 +332,8 @@ Ranked by what actually blocks a phone run:
    named after a few checks with its command and error, `FREEBUFF_STTY`
    overrides the binary, and `status` says `input=unknown` rather than
    `canonical`. **[repo]**
-4. **Path and example nits.** `/tmp` is not writable; the README `--snapshot`
-   examples need `TMPDIR`. Shared storage cannot hold a worktree. Docs-sized
-   (#101).
+4. **Path and example nits.** `/tmp` is not writable; the `--snapshot` examples
+   now use `${TMPDIR:-/tmp}` (#101). Shared storage cannot hold a worktree.
 5. **Everything else works.** tmux discovery, `FREEBUFF_TMUX`, `setsid`/`nohup`,
    `gh`/`python3`/`ttyd` as optional packages, hashing, date arithmetic, and
    the state files are all Termux-compatible as written. `flock`, `date -d`,
