@@ -384,6 +384,74 @@ check json_ok "$out"
 check contains "$out" '"turn_state": null'
 check contains "$out" '"turn_outcome": null'
 
+# ---- the turn-completion event (#74) ----
+# notify polls the same chat directory as #75 but keeps a cursor, so each turn
+# end is one event and a watcher can poll without re-reading history.
+chat_log lastMessage
+rm -f "$WT/.turn-log-cursor"
+if out=$(bash "$TOOL" --root "$REPO" notify test-999); then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+check contains "$out" 'event=none'
+check contains "$out" 'reason=armed'
+check test -f "$WT/.turn-log-cursor"
+
+TURN_LOG="$CHAT_ROOT/2026-11-25T10-32-52/log.jsonl"
+printf '%s\n' \
+    '{"msg":"[send-message] Sending message with sdk run config","data":{}}' \
+    '{"msg":"Main prompt finished","data":{"outputType":"error"}}' >>"$TURN_LOG"
+out=$(bash "$TOOL" --root "$REPO" notify test-999)
+check contains "$out" 'event=turn-end'
+check contains "$out" 'turn_state=failed'
+check contains "$out" 'turn_outcome=error'
+check contains "$out" "log=$TURN_LOG"
+
+# re-reading the same file does not fire twice
+out=$(bash "$TOOL" --root "$REPO" notify test-999)
+check contains "$out" 'event=none'
+check contains "$out" 'reason=no-new-turn'
+
+# a half-written final line is ignored and picked up once it is finished
+printf '%s\n' '{"msg":"[send-message] Sending message with sdk run config","data":{}}' >>"$TURN_LOG"
+printf '%s' '{"msg":"Main prompt finished","data":{"outputType":"lastMess' >>"$TURN_LOG"
+out=$(bash "$TOOL" --root "$REPO" notify test-999)
+check contains "$out" 'event=none'
+check contains "$out" 'reason=turn-running'
+printf '%s\n' 'age"}}' >>"$TURN_LOG"
+out=$(bash "$TOOL" --root "$REPO" notify test-999)
+check contains "$out" 'event=turn-end'
+check contains "$out" 'turn_state=finished'
+check contains "$out" 'turn_outcome=lastMessage'
+
+# a new chat directory is a new log: arm instead of replaying its history
+rm -rf "$FREEBUFF_CONFIG_DIR/projects"
+mkdir -p "$CHAT_ROOT/2026-11-26T09-00-00"
+printf '{"output":{"type":"error"}}\n' \
+    >"$CHAT_ROOT/2026-11-26T09-00-00/run-state.json"
+printf '%s\n' \
+    '{"msg":"[send-message] Sending message with sdk run config","data":{}}' \
+    '{"msg":"Main prompt finished","data":{"outputType":"lastMessage"}}' \
+    >"$CHAT_ROOT/2026-11-26T09-00-00/log.jsonl"
+out=$(bash "$TOOL" --root "$REPO" notify test-999)
+check contains "$out" 'event=none'
+check contains "$out" 'reason=armed'
+
+# a missing chat directory, or a chat without log.jsonl, is a reason and exit
+# 2, never a stack trace
+rm -rf "$FREEBUFF_CONFIG_DIR/projects"
+if out=$(bash "$TOOL" --root "$REPO" notify test-999 2>"$TMP/notify.err"); then rc=0; else rc=$?; fi
+check test "$rc" -eq 2
+check contains "$out" 'event=none'
+check contains "$out" 'reason=no-turn-log'
+check contains "$out" "chats=$CHAT_ROOT"
+check test -z "$(cat "$TMP/notify.err")"
+mkdir -p "$CHAT_ROOT/2026-11-26T09-00-00"
+printf '{"output":{"type":"error"}}\n' \
+    >"$CHAT_ROOT/2026-11-26T09-00-00/run-state.json"
+if out=$(bash "$TOOL" --root "$REPO" notify test-999); then rc=0; else rc=$?; fi
+check test "$rc" -eq 2
+check contains "$out" 'reason=no-turn-log'
+
 # leave the fixture out of the areas that run after this one
 rm -rf "$FREEBUFF_CONFIG_DIR/projects"
+rm -f "$WT/.turn-log-cursor"
 fake_session test-999 "$IDLE_PANE"

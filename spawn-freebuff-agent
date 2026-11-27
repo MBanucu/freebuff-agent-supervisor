@@ -40,8 +40,8 @@
 #   state classification and evidence:
 #     sha256_hex, normalise_window, first_match, evidence_field,
 #     classify_chrome, freebuff_config_dir, turn_log_path, turn_log_read,
-#     turn_log_evidence, emit_evidence, classify_state, session_state,
-#     session_activity, idle_seconds
+#     turn_log_evidence, turn_log_cursor, turn_log_poll, emit_evidence,
+#     classify_state, session_state, session_activity, idle_seconds
 #   the brief:
 #     write_task, ready_polls, ready_elapsed, ready_note, wait_ready,
 #     composer_line, chat_title, composer_cleared, turn_began,
@@ -55,8 +55,8 @@
 #   status, list, sessions and hours:
 #     print_explanation, status, list_agents, watcher_state, live_sessions,
 #     live_session_count, finished_live, finished_live_names, sessions, hours
-#   watch, autostop, reap and gc:
-#     reap, watch_run, watch, autostop, gc
+#   watch, autostop, notify, reap and gc:
+#     reap, watch_run, watch, autostop, notify, gc
 #   the GUI:
 #     snapshot_html, gui
 #   attach, send and stop:
@@ -325,6 +325,17 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       Watch, then stop fb-<name> and record the run evidence. This is what
       start --auto-stop runs detached. A done, blocked or failed result stops
       the session; the exit status is watch's (0, 3 or 4).
+
+  spawn-freebuff-agent notify NAME
+      Report the next turn end from the client's per-chat log.jsonl: a
+      turn end is an earlier signal than .agent-result, not a replacement for
+      it. Each call reads from a cursor in the worktree and advances it, so a
+      turn fires once; the first call arms the cursor at the end of the log
+      and reports nothing, so history is not replayed. A complete start/end
+      pair prints event=turn-end with turn_state=finished|failed and
+      turn_outcome=lastMessage|error; otherwise event=none with a reason.
+      Missing chat directory or log.jsonl prints reason=no-turn-log and
+      exits 2. It never sends, stops or waits.
 
   spawn-freebuff-agent stop NAME [--graceful [--wait N]]
       Kill the tmux session; the worktree and branch are left in place.
@@ -1286,6 +1297,136 @@ turn_log_evidence() {
     [ -z "$checks" ] || log_checks="$checks"$'\n'"$log_checks"
     printf 'state=%s\nsource=log\nrule=%s\nmatched=%s\nturn_state=%s\nturn_outcome=%s\nturn_log=yes\nwindow_lines=0\nwindow_sha256=\nstable_scans=0\n%s\npane_begin\npane_end\n' \
         "$mapped" "$rule" "${matched:0:200}" "$state" "$outcome" "$log_checks"
+}
+
+turn_log_cursor() {
+    # turn_log_cursor NAME -> the per-worktree cursor for the turn log. It
+    # lives inside .worktrees/, which is ignored and removed with the run
+    # evidence, so it is never committed and never outlives its worktree.
+    printf '%s' "$ROOT/.worktrees/$1/.turn-log-cursor"
+}
+
+turn_log_poll() {
+    # turn_log_poll NAME -> one turn-end event since the saved cursor, as
+    # key=value lines, and advances that cursor. A turn is a complete
+    # `Sending message with sdk run config` line followed by a complete
+    # `Main prompt finished` line; outputType picks finished (lastMessage) or
+    # failed (error), so the two outcomes stay distinct (#74).
+    #
+    # The first poll of a log arms the cursor at its current end instead of
+    # replaying turns already on disk, so a watcher started mid-session does
+    # not report history as news. Only complete lines are read: a half-written
+    # final line stays in the file and is picked up once the writer finishes
+    # it. There is no chat directory or no log.jsonl -> event=none with
+    # reason=no-turn-log and exit 2, never a stack trace and never a hang.
+    local name="$1" wt chats log cursor saved_log saved_offset size offset=0
+    local ends_nl=1 line i start_idx=-1 end_idx=-1 outcome='' state=''
+    local advance=0
+    local -a raw=()
+    local LC_ALL=C
+    wt="$ROOT/.worktrees/$name"
+    chats="$(freebuff_config_dir)/projects/$(basename -- "$wt")/chats"
+    log=$(turn_log_path "$name")
+    if [ -z "$log" ]; then
+        printf 'event=none\nreason=no-turn-log\nchats=%s\n' "$chats"
+        return 2
+    fi
+    cursor=$(turn_log_cursor "$name")
+    size=$(wc -c <"$log" 2>/dev/null | tr -d ' ' || true)
+    is_num "$size" || size=0
+
+    if [ -f "$cursor" ]; then
+        saved_log=$(sed -n 's/^log=//p' "$cursor" | tail -n 1)
+        saved_offset=$(sed -n 's/^offset=//p' "$cursor" | tail -n 1)
+        # A cursor from another chat directory, or one older than the file,
+        # says nothing about this log: arm again rather than guess.
+        if [ "$saved_log" = "$log" ] && is_num "$saved_offset" &&
+            [ "$saved_offset" -le "$size" ]; then
+            offset=$saved_offset
+        else
+            offset=-1
+        fi
+    else
+        offset=-1
+    fi
+    if [ "$offset" -lt 0 ]; then
+        printf 'log=%s\noffset=%s\n' "$log" "$size" >"$cursor"
+        printf 'event=none\nreason=armed\nlog=%s\noffset=%s\n' "$log" "$size"
+        return 0
+    fi
+
+    if [ "$size" -gt "$offset" ]; then
+        # wc -l on the last byte says whether the writer finished the line.
+        [ "$(tail -c 1 "$log" | wc -l)" -eq 1 ] || ends_nl=0
+        # `read` stops before a final line the writer has not terminated, so
+        # a half-written record never enters raw at all.
+        while IFS= read -r line; do
+            raw+=("$line")
+        done < <(tail -c +"$((offset + 1))" "$log" 2>/dev/null)
+    fi
+
+    for i in "${!raw[@]}"; do
+        line=${raw[$i]}
+        if [ "$start_idx" -lt 0 ]; then
+            case "$line" in
+                *"Sending message with sdk run config"*)
+                    if [[ $line == *'}' ]]; then
+                        start_idx=$i
+                    fi
+                    ;;
+            esac
+            continue
+        fi
+        case "$line" in
+            *"Main prompt finished"*)
+                [[ $line == *'}' ]] || continue
+                end_idx=$i
+                if [[ $line =~ \"outputType\"[[:space:]]*:[[:space:]]*\"([^\"]*)\" ]]; then
+                    outcome=${BASH_REMATCH[1]}
+                fi
+                break
+                ;;
+        esac
+    done
+
+    # Consume through the end of the fired turn. An unfinished turn keeps its
+    # start line for the next poll; lines before any start are noise to drop.
+    if [ "$end_idx" -ge 0 ]; then
+        for ((i = 0; i <= end_idx; i++)); do
+            advance=$((advance + ${#raw[$i]} + 1))
+        done
+    elif [ "$start_idx" -gt 0 ]; then
+        for ((i = 0; i < start_idx; i++)); do
+            advance=$((advance + ${#raw[$i]} + 1))
+        done
+    elif [ "$start_idx" -lt 0 ]; then
+        for ((i = 0; i < ${#raw[@]}; i++)); do
+            advance=$((advance + ${#raw[$i]} + 1))
+        done
+    fi
+    if [ "$advance" -gt 0 ]; then
+        printf 'log=%s\noffset=%s\n' "$log" "$((offset + advance))" >"$cursor"
+    fi
+
+    if [ "$end_idx" -ge 0 ]; then
+        case "$outcome" in
+            error) state=failed ;;
+            lastMessage) state=finished ;;
+            *) state=unknown ;;
+        esac
+        printf 'event=turn-end\nturn_state=%s\nturn_outcome=%s\nlog=%s\n' \
+            "$state" "$outcome" "$log"
+        return 0
+    fi
+    if [ "$start_idx" -ge 0 ]; then
+        printf 'event=none\nreason=turn-running\nlog=%s\n' "$log"
+        return 0
+    fi
+    if [ "$ends_nl" = 0 ]; then
+        printf 'event=none\nreason=partial-line\nlog=%s\n' "$log"
+        return 0
+    fi
+    printf 'event=none\nreason=no-new-turn\nlog=%s\n' "$log"
 }
 
 # The classifier's window, shared by emit_evidence and the status view.
@@ -3112,6 +3253,32 @@ autostop() {
     return "$rc"
 }
 
+notify() {
+    # notify NAME -> the next turn-end event from the client's per-chat log,
+    # one line group per call, for a watcher to poll. Each call advances the
+    # cursor in the worktree, so a turn fires once; the first call arms at the
+    # end of the log, so history is not replayed. It is an earlier signal than
+    # .agent-result, not a replacement: done stays the result file's word.
+    # Read-only otherwise: nothing is sent, stopped or written outside the
+    # cursor.
+    local name=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) usage; exit 0 ;;
+            -*) die "notify: unsupported argument: $1" ;;
+            *)
+                [ -z "$name" ] || die "notify: at most one NAME"
+                name=$1; shift
+                ;;
+        esac
+    done
+    [ -n "$name" ] || die "notify: NAME is required"
+    valid_name "$name" || die "notify: invalid name"
+    [ -d "$ROOT/.worktrees/$name" ] ||
+        die "notify: no worktree at $ROOT/.worktrees/$name"
+    turn_log_poll "$name"
+}
+
 gc() {
     local idle_hours=12 dry=0 all=0
     while [ $# -gt 0 ]; do
@@ -3629,6 +3796,7 @@ case "$cmd" in
     send) send "$@" ;;
     watch) watch "$@" ;;
     autostop) autostop "$@" ;;
+    notify) notify "$@" ;;
     gc) gc "$@" ;;
     stop) stop "$@" ;;
     -h|--help|help) usage ;;

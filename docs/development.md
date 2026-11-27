@@ -12,7 +12,7 @@ starts a real agent.
 
 | Path | What lives there |
 | --- | --- |
-| `spawn-freebuff-agent` | The whole shipped tool, in one bash file: `usage()` at the top, shared helpers, one function per subcommand (`start`, `status`, `sessions`, `hours`, `gui`, `stop`, ...), and the subcommand dispatch at the bottom. |
+| `spawn-freebuff-agent` | The whole shipped tool, in one bash file: `usage()` at the top, shared helpers, one function per subcommand (`start`, `status`, `sessions`, `hours`, `notify`, `gui`, `stop`, ...), and the subcommand dispatch at the bottom. |
 | `spawn-freebuff-agent-test.sh` | The deviceless runner. Sources `test/lib.sh`, then each area file in order, and prints `ok N checks`. |
 | `test/lib.sh` | The shared harness: temporary git repo, fake tmux/stty/freebuff, pane fixtures, `check`/`contains`/`json_ok`, and the cleanup trap. |
 | `test/cli-json.sh` | Area: the CLI surface, the git exclude list, `--json` output and the remaining flags. |
@@ -196,7 +196,8 @@ run when upgrading Freebuff.
 branch. The agent works there; `stop`, autostop and `gc` only kill its
 `fb-<name>` tmux session and leave the worktree and branch in place. It also
 holds the run evidence: `.supervisor.log` (readiness, submission, stop and
-autostop transitions), and when applicable `.refusal` and `.agent-result`.
+autostop transitions), `.turn-log-cursor` (where `notify` has read the
+client's turn log to), and when applicable `.refusal` and `.agent-result`.
 The directory is ignored by `.gitignore`; review happens through the branch
 and PR, not by committing the worktree.
 
