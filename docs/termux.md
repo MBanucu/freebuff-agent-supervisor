@@ -144,12 +144,15 @@ Three things could break the check on Termux:
 3. **`stty` missing entirely.** It is in the bootstrap, so this needs a broken
    install. **[package]**
 
-The failure mode is the real defect: if `stty` exits non-zero on every poll,
-`wait_ready` treats it as "not raw yet" and burns the whole `--ready-timeout`
-(120s by default), then kills the pane and reports only "never ready". A hard
-error is indistinguishable from a cold start. `status` has the same conflation:
-a tty it cannot read is reported `input=canonical` rather than `unknown`.
-**[repo]**
+That failure mode used to be invisible: if `stty` exited non-zero on every
+poll, `wait_ready` treated it as "not raw yet" and burned the whole
+`--ready-timeout` (120s by default), then killed the pane and reported only
+"never ready". Since #100, `wait_ready` distinguishes a missing session, a
+missing tty, a failing `stty` and "not raw yet": three consecutive hard
+failures stop the session and report `ready=no reason=stty`, the tty and the
+exact command with its error. `FREEBUFF_STTY` names the binary, like
+`FREEBUFF_TMUX`, and `status` reports `input=unknown` when stty cannot read
+the tty instead of claiming `canonical`. **[repo]**
 
 **[unverified]** No Termux shell was opened, so this exact command was not run:
 
@@ -162,9 +165,8 @@ stty -a -F "$tty" | grep -o -- '-\?icanon'
 ```
 
 Expected on a healthy Termux: `tty=/dev/pts/N`, `stty` is
-`$PREFIX/bin/stty`, and the flag is `-icanon` once the TUI is up. The readiness
-child (#100) is what should turn a failure of this command into a named error
-instead of a 120-second wait.
+`$PREFIX/bin/stty`, and the flag is `-icanon` once the TUI is up. #100 turns a
+failure of this command into a named error instead of a 120-second wait.
 
 ## 4. Paths and state
 
@@ -294,8 +296,10 @@ Run inside Termux, in a checkout under `$HOME`.
    symlinks; the worktree creation fails. Fix: keep the checkout under `$HOME`.
    **[unverified]** here, documented Termux behaviour.
 8. **`stty -a -F "$(tmux display-message -p '#{pane_tty}')"`** — see §3. It
-   should work with GNU stty; if it does not, the current failure is a 120s
-   timeout, not this command's error. Fix: #100. **[unverified]**
+   should work with GNU stty; if it does not, #100 makes `start` stop within a
+   few checks and report the command, tty and stty's own error. Point
+   `FREEBUFF_STTY` at `$PREFIX/bin/stty` if the `PATH` one is toybox.
+   **[unverified]**
 9. **`flock`, `date -d`, `ps`, `mktemp -d`** — not run by the tool, so there is
    no failing command to report. **[repo]**
 
@@ -311,9 +315,10 @@ Ranked by what actually blocks a phone run:
    exempt from battery optimisation and, on Android 12+, have the phantom
    process monitor off. This phone has all three; a fresh install does not. The
    tool does not check or request any of them (#99).
-3. **Readiness error reporting.** `pane_tty` is portable and GNU `stty` is
-   present, but a failing `stty -F` is reported as a timeout and `status` calls
-   it `canonical`. Small, invisible until it happens (#100).
+3. **Readiness error reporting.** Addressed by #100: a failing `stty -F` is
+   named after a few checks with its command and error, `FREEBUFF_STTY`
+   overrides the binary, and `status` says `input=unknown` rather than
+   `canonical`. **[repo]**
 4. **Path and example nits.** `/tmp` is not writable; the README `--snapshot`
    examples need `TMPDIR`. Shared storage cannot hold a worktree. Docs-sized
    (#101).

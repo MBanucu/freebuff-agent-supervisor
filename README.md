@@ -45,6 +45,8 @@ anything, and it never modifies the main worktree.
 - `freebuff` on `PATH` (or `FREEBUFF_BIN`).
 - `tmux`. On NixOS the tool finds it with `nix-shell -p tmux` and caches the
   path; otherwise install it or set `FREEBUFF_TMUX`.
+- GNU `stty` for the raw-mode check. A `PATH` that prefers toybox's `stty`
+  (no `-F`) can be overridden with `FREEBUFF_STTY`.
 - `gh` authenticated for the PR column and for the generated brief. The tool
   still works without it with `--title`/`--url` or `--no-gh`.
 - `python3` is optional and used only by `gui --serve`; every other command
@@ -248,7 +250,10 @@ sessions whose run is already over. Freebuff counts live TUIs against its
 concurrent-session limit, not runs, so a `done` session still holds a slot
 until `gc` stops it. A `start` refused by that overlay names them
 (`holding_slot=a,b`) and prints the command that frees them, instead of leaving
-the next step to guesswork.
+the next step to guesswork. The hours overlay is refused the same way, as
+`refused=hours` with `hours=N/M` when the panel shows the account's usage and
+a `hint=` naming both ways out: free finished sessions with `gc`, or wait for
+the daily refill. Neither overlay is waited out as a submit timeout.
 
 `stop` is a hard kill. `stop --graceful` sends `Escape` to end the turn, waits
 up to `--wait` seconds (default 20) for the pane to reach `done`, `idle` or
