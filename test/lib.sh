@@ -278,6 +278,12 @@ NOMARKER_PANE='⎘ • 6s • △▽
 │  ▍Add to the current task (/ for commands)'
 REFUSED_PANE='Your concurrent-session limit across CLI and Desktop is reached.
 Enter: take over  Esc: back to draft'
+# The hours overlay (#107): the account has no hours left for the chosen
+# model. Its Enter opens the model picker, so it is a refusal that takes no
+# keys either, and it must not be waited out as a submit timeout.
+HOURS_PANE='Not enough hours for DeepSeek V4.1 Flash: an hour on it takes 2 hours.
+Choose another model or visit https://freebuff.com/plans.
+Enter: choose another model   Esc: back to draft'
 # The anti-automation refusal is a finished turn, not chrome: the sentence
 # sits above the resting prompt, so a chrome-only check reads this as idle.
 STRIKE_PANE='Freebuff did not send this message to the model. It breaks the usage policy (Scripted or automated use): it is the same message sent over and over, or automated account or site farming. It counts as strike 1 today. Strikes reset at midnight, when your daily hours refill.
