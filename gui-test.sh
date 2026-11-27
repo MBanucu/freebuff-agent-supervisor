@@ -441,6 +441,51 @@ check test "$code" = 401
 
 check stop_server "$SERVER_PID" "$ro_base"
 
+# ---- --source concord drives the page and both JSON routes ----
+# A live pane and a disagreeing Concord export: the page must render the
+# chosen source, and the pane route must name the loser instead of hiding it.
+mkdir -p "$WT/.concord"
+printf '*\n' >"$WT/.concord/.gitignore"
+cat >"$WT/.concord/WORK_STATE.json" <<'EOF'
+{
+  "generated_at": "2026-11-27T10:00:00.000Z",
+  "presence": [],
+  "tasks": [
+    {
+      "task_id": "T68",
+      "status": "blocked",
+      "version": 1,
+      "updated_at": "2026-11-27T10:00:00.000Z",
+      "branch": "test/999"
+    }
+  ]
+}
+EOF
+fake_session test-999 "$IDLE_PANE" "$(($(date +%s) - 30))"
+start_server concord --source concord || true
+check test -n "$SERVER_PID"
+check test "$(sed -n 's/^source=//p' "$TMP/concord.out")" = concord
+code=$(curl -sS --max-time 10 -o "$TMP/concord.json" -w '%{http_code}' \
+    -H "Authorization: Bearer $TOKEN" "$SERVER_BASE/api/sessions" || true)
+check test "$code" = 200
+check contains "$(cat "$TMP/concord.json")" '"state": "blocked"'
+check contains "$(cat "$TMP/concord.json")" '"source": "concord"'
+code=$(curl -sS --max-time 10 -o "$TMP/concord-pane.json" -w '%{http_code}' \
+    -H "Authorization: Bearer $TOKEN" \
+    "$SERVER_BASE/api/session/test-999/pane" || true)
+check test "$code" = 200
+check json_ok "$(cat "$TMP/concord-pane.json")"
+check contains "$(cat "$TMP/concord-pane.json")" '"session_state": "blocked"'
+check contains "$(cat "$TMP/concord-pane.json")" '"source": "concord"'
+check contains "$(cat "$TMP/concord-pane.json")" '"concord_status": "blocked"'
+check contains "$(cat "$TMP/concord-pane.json")" '"loser_state": "idle"'
+code=$(curl -sS --max-time 10 -o "$TMP/concord-page.html" -w '%{http_code}' \
+    -H "Authorization: Bearer $TOKEN" "$SERVER_BASE/" || true)
+check test "$code" = 200
+check contains "$(cat "$TMP/concord-page.html")" '<span class="badge">blocked</span>'
+check stop_server "$SERVER_PID" "$SERVER_BASE"
+rm -rf "$WT/.concord"
+
 if [ "$failed" -ne 0 ]; then
     printf '%d/%d gui checks failed\n' "$failed" "$total" >&2
     exit 1

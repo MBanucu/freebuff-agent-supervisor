@@ -222,6 +222,7 @@ git -C "$REPO" worktree remove --force "$REPO/.worktrees/test-custom" \
 
 check contains "$(bash "$TOOL" --help 2>&1)" 'start'
 check contains "$(bash "$TOOL" --help 2>&1)" 'gui --serve'
+check contains "$(bash "$TOOL" --help 2>&1)" '--source pane|concord|auto'
 # help is about the tool, not a checkout: it answers outside a git repository
 out=$(CDPATH='' cd -- "$TMP" && bash "$TOOL" --help 2>&1)
 check contains "$out" '--prompt TEXT'

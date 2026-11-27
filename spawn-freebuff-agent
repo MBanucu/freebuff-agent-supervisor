@@ -38,8 +38,9 @@
 #     pr_json_array
 #   state classification and evidence:
 #     sha256_hex, normalise_window, first_match, evidence_field,
-#     classify_chrome, emit_evidence, classify_state, session_state,
-#     session_activity, idle_seconds
+#     classify_chrome, concord_file, concord_validate, concord_task_record,
+#     concord_map_state, concord_evidence, emit_evidence, classify_state,
+#     session_state, session_activity, idle_seconds
 #   the brief:
 #     write_task, ready_polls, ready_elapsed, ready_note, wait_ready,
 #     composer_line, chat_title, composer_cleared, turn_began,
@@ -70,6 +71,9 @@ COLS=180
 ROWS=55
 PROMPT='Read the file .task.md in this directory and execute it autonomously. Do not commit .task.md, .agent-result or local.properties. Follow the PR instructions in it exactly. Do not ask questions; if blocked, open a draft PR and explain.'
 RESULT_FILE='.agent-result'
+# Concord writes this export under the worktree's own .concord/ when an agent
+# uses its work-state tools. status can read it instead of the pane (#68).
+CONCORD_FILE='.concord/WORK_STATE.json'
 # Written next to a worktree at launch: issue and slug, so a transition later
 # (blocked, done, stopped) can label the right issue without asking the pane.
 GH_STATE_FILE='.supervisor-gh'
@@ -218,36 +222,47 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       --help             this text
 
   spawn-freebuff-agent status NAME [--lines N] [--no-gh] [--json] [--explain]
+                              [--source pane|concord|auto] [--window N]
       Show the session, input mode, result state, pane tail, branch, last
       commit and PR.
       --lines N   pane lines to show (default: 25)
       --no-gh     do not ask gh for the PR
       --json      emit the same fields as one JSON object, plus an evidence
-                  object naming the rule, the matched line and the window
+                  object naming the source, the rule, the matched line and
+                  the window, and the Concord fields when one is read
       --explain   print the classification decision line by line: every
-                  marker checked and the pane the rule looked at
+                  marker checked, the source that won, and when both are
+                  present, the losing source and its verdict
+      --source S  where session_state comes from: pane (default) reads the
+                  terminal, concord reads the worktree's .concord/
+                  WORK_STATE.json, auto prefers Concord and falls back to the
+                  pane with a concord=<reason> line when there is no verdict;
+                  missing or corrupt files never become unknown by accident
       --window N  pane lines the classifier reads (default: 40)
 
   spawn-freebuff-agent list
       List worktrees with session state, running flag and idle time.
 
-  spawn-freebuff-agent sessions [--no-gh] [--json]
+  spawn-freebuff-agent sessions [--no-gh] [--json] [--source S]
       One table over every fb-* session and every worktree: live state, idle
       time, attached autostop watcher, whether a worktree exists, the result
       state, the branch, the open PR and the wake lock recorded at start.
       Sessions with no worktree are listed here instead of only being
       reapable by gc --all. --json emits the same rows as an array of
-      objects.
+      objects. --source selects the live STATE column the same way status
+      does (pane, concord or auto).
 
-  spawn-freebuff-agent gui --snapshot FILE [--watch N] [--no-gh]
+  spawn-freebuff-agent gui --snapshot FILE [--watch N] [--no-gh] [--source S]
       Write one self-contained HTML page from `sessions --json`: one card
       per session with done-versus-working visible at a glance. No server,
       no script, no external assets, so it opens from file:// offline.
       --watch N   rewrite the file every N seconds (adds a meta refresh)
       --no-gh     do not ask gh for the PR
+      --source S  pane, concord or auto for the STATE column (see status)
 
   spawn-freebuff-agent gui --serve [--port N] [--host H] [--token T] [--read-only]
                               [--allow-host NAME] [--ttyd [--interactive]]
+                              [--source S]
       Serve the dashboard and JSON API from python3's standard library:
       GET / is the --snapshot page, GET /api/sessions is `sessions --json`
       verbatim and GET /api/session/<name>/pane is `status --json`. POST
@@ -270,6 +285,9 @@ Spawn parallel Freebuff agents in isolated git worktrees.
                       --interactive, which adds ttyd's -W.
       --interactive   let the browser type into the agent; refused with
                       --read-only
+      --source S      pane, concord or auto, forwarded to sessions and to
+                      the pane route's status, so the page and the JSON API
+                      name the same source and the same loser
 
   spawn-freebuff-agent attach NAME
       Attach to the tmux session (detach with Ctrl-b d).
@@ -1056,51 +1074,212 @@ classify_chrome() {
     fi
 }
 
+concord_file() {
+    # concord_file WORKTREE -> the generated work-state export
+    printf '%s/%s' "$1" "$CONCORD_FILE"
+}
+
+concord_validate() {
+    # concord_validate FILE -> 0 when FILE has the export's outer shape.
+    # The tool ships no JSON parser, so this is the strongest check that needs
+    # no runtime: a brace-delimited object with a tasks array. A file that
+    # fails it is corrupt, never "no tasks", so the caller can name the fault.
+    local file=$1 first last
+    [ -f "$file" ] && [ -s "$file" ] || return 1
+    first=$(grep -m1 -v '^[[:space:]]*$' "$file" 2>/dev/null |
+        sed -E 's/^[[:space:]]+//' || true)
+    [ "${first:0:1}" = '{' ] || return 1
+    last=$(grep -v '^[[:space:]]*$' "$file" 2>/dev/null | tail -n 1 |
+        sed -E 's/[[:space:]]+$//' || true)
+    [ "${last: -1}" = '}' ] || return 1
+    grep -qE '"tasks"[[:space:]]*:[[:space:]]*\[' "$file" || return 1
+    return 0
+}
+
+concord_task_record() {
+    # concord_task_record FILE BRANCH -> status, task_id, branch and
+    # updated_at of the task this worktree owns, tab-separated. Concord's
+    # workspace is shared by the main checkout and every linked worktree, so
+    # the worktree's branch selects its task; with no match a lone task is
+    # unambiguous, several are not, and `no-task` lets auto fall back.
+    local file=$1 branch=$2
+    awk -v branch="$branch" '
+        function value(line, key,    pat, v) {
+            pat = "\"" key "\"[[:space:]]*:[[:space:]]*\""
+            if (!match(line, pat)) return ""
+            v = substr(line, RSTART + RLENGTH)
+            sub(/".*/, "", v)
+            return v
+        }
+        function number(line, key,    pat, v) {
+            pat = "\"" key "\"[[:space:]]*:[[:space:]]*"
+            if (!match(line, pat)) return 0
+            v = substr(line, RSTART + RLENGTH)
+            sub(/[^0-9].*/, "", v)
+            return v + 0
+        }
+        /"tasks"[[:space:]]*:[[:space:]]*\[/ { in_tasks = 1; next }
+        in_tasks && /^[[:space:]]*\][[:space:]]*,?[[:space:]]*$/ {
+            in_tasks = 0; next
+        }
+        in_tasks && !in_rec && /^[[:space:]]*\{[[:space:]]*$/ {
+            in_rec = 1; status = ""; id = ""; br = ""; updated = ""; version = 0
+            next
+        }
+        in_tasks && in_rec && /^[[:space:]]*\},?[[:space:]]*$/ {
+            n++
+            t_status[n] = status; t_id[n] = id; t_branch[n] = br
+            t_updated[n] = updated; t_version[n] = version
+            in_rec = 0
+            next
+        }
+        in_tasks && in_rec {
+            key = $0
+            sub(/^[[:space:]]*"/, "", key)
+            sub(/".*/, "", key)
+            if (key == "status") status = value($0, "status")
+            else if (key == "task_id") id = value($0, "task_id")
+            else if (key == "branch") br = value($0, "branch")
+            else if (key == "updated_at") updated = value($0, "updated_at")
+            else if (key == "version") version = number($0, "version")
+        }
+        END {
+            best = 0
+            for (i = 1; i <= n; i++) {
+                if (branch != "" && t_branch[i] == branch) {
+                    if (best == 0 || t_updated[i] > t_updated[best] ||
+                        (t_updated[i] == t_updated[best] &&
+                         t_version[i] > t_version[best])) best = i
+                }
+            }
+            if (best == 0 && n == 1) best = 1
+            if (best == 0) {
+                printf "no-task\t\t\t\n"
+                exit
+            }
+            printf "%s\t%s\t%s\t%s\n", \
+                t_status[best], t_id[best], t_branch[best], t_updated[best]
+        }
+    ' "$file" 2>/dev/null || true
+}
+
+concord_map_state() {
+    # concord_map_state STATUS -> session_state, or `unknown` for a status
+    # that is not a run signal. The map uses only what an agent reported to
+    # Concord: active/assigned/handoff_offered are a turn in flight, blocked
+    # is a blocker, and review_ready/handed_off/complete/closed are a finished
+    # run. Concord has no failed or refused status, so those stay the result
+    # file's and the refusal file's words, never an inference from this file.
+    case "${1:-}" in
+        active|assigned|handoff_offered) printf 'working' ;;
+        blocked) printf 'blocked' ;;
+        review_ready|handed_off|complete|closed) printf 'done' ;;
+        *) printf 'unknown' ;;
+    esac
+}
+
+concord_evidence() {
+    # concord_evidence NAME [CHECKS] -> the evidence block from the Concord
+    # export. `concord_status` is the raw status an agent reported and
+    # `concord_reason` says why there is no verdict (missing, corrupt,
+    # no-task, unknown-status) or `task` when there is. A missing or corrupt
+    # file is `unknown`/concord-missing|concord-corrupt, never a guessed
+    # `working`, so auto can name the fallback instead of failing silently.
+    local name="$1" checks="${2:-}"
+    local wt="$ROOT/.worktrees/$name" file branch record
+    local status task tbranch updated state rule matched reason concord_checks
+    file=$(concord_file "$wt")
+    branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    concord_checks=""
+
+    if [ ! -e "$file" ]; then
+        state=unknown; rule=concord-missing; matched=''; reason=missing
+        concord_checks="check: concord ($file): no"
+    elif ! concord_validate "$file"; then
+        state=unknown; rule=concord-corrupt; matched=''; reason=corrupt
+        concord_checks="check: concord ($file): corrupt"
+    else
+        concord_checks="check: concord ($file): yes"
+        record=$(concord_task_record "$file" "$branch")
+        IFS=$'\t' read -r status task tbranch updated <<<"$record" || true
+        if [ -z "$status" ] || [ "$status" = no-task ]; then
+            state=unknown; rule=concord-no-task; matched=''; reason=no-task
+            concord_checks+=$'\n'"check: concord-task (branch ${branch:-?}): no"
+        else
+            concord_checks+=$'\n'"check: concord-task ($task): status=$status branch=${tbranch:--}"
+            state=$(concord_map_state "$status")
+            if [ "$state" = unknown ]; then
+                rule=concord-unknown-status
+                reason=unknown-status
+                matched="task $task status=$status"
+            else
+                rule=concord-task
+                reason=task
+                matched="task $task status=$status branch=${tbranch:--}"
+            fi
+        fi
+    fi
+    [ -z "$checks" ] || concord_checks="$checks"$'\n'"$concord_checks"
+    printf 'state=%s\nsource=concord\nrule=%s\nmatched=%s\nconcord_status=%s\nconcord_task=%s\nconcord_reason=%s\nwindow_lines=0\nwindow_sha256=\nstable_scans=0\n%s\n' \
+        "$state" "$rule" "${matched:0:200}" "${status:-}" "${task:-}" \
+        "$reason" "$concord_checks"
+}
+
 # The classifier's window, shared by emit_evidence and the status view.
 EV_PANE=''
 EV_LINES=0
 EV_SHA=''
 
 emit_evidence() {
-    # emit_evidence STATE RULE MATCHED SCANS CHECKS -> the evidence block.
-    # The first line is `state=...` because session_state reads only that;
-    # everything after it is what --explain shows line by line.
-    local state="$1" rule="$2" matched="$3" scans="$4" checks="$5"
-    printf 'state=%s\nrule=%s\nmatched=%s\nwindow_lines=%s\nwindow_sha256=%s\nstable_scans=%s\n' \
-        "$state" "$rule" "${matched:0:200}" "$EV_LINES" "$EV_SHA" "$scans"
+    # emit_evidence STATE RULE MATCHED SCANS CHECKS [SOURCE] -> the evidence
+    # block. The first line is `state=...` because session_state reads only
+    # that; everything after it is what --explain shows line by line. SOURCE
+    # names what produced the verdict (pane, result-file or refusal).
+    local state="$1" rule="$2" matched="$3" scans="$4" checks="$5" source="${6:-pane}"
+    printf 'state=%s\nsource=%s\nrule=%s\nmatched=%s\nwindow_lines=%s\nwindow_sha256=%s\nstable_scans=%s\n' \
+        "$state" "$source" "$rule" "${matched:0:200}" "$EV_LINES" "$EV_SHA" "$scans"
     [ -z "$checks" ] || printf '%s\n' "$checks"
     printf 'pane_begin\n%s\npane_end\n' "$EV_PANE"
 }
 
 classify_state() {
-    # classify_state NAME [WINDOW] -> evidence block; line one is
-    # `state=done|refused|working|idle|unknown|missing`. Read-only: captures
-    # only, never sends, stops or writes. A first scan that no rule claims is
+    # classify_state NAME [WINDOW] [SOURCE] -> evidence block; line one is
+    # `state=done|refused|working|idle|unknown|missing`. SOURCE is pane (the
+    # default), concord or auto. Read-only: captures and reads files only,
+    # never sends, stops or writes. A first pane scan that no rule claims is
     # captured again after a pause, and only the same normalised window twice
     # becomes `unknown`.
-    local name="$1" window="${2:-$REFUSAL_WINDOW}"
+    local name="$1" window="${2:-$REFUSAL_WINDOW}" source="${3:-pane}"
     local session="fb-$name" wt="$ROOT/.worktrees/$name" tmux
     local sentence result pane chrome norm norm2 base_checks checks
+    local has_session=0 cblock cstate creason pane_block pane_state
     tmux=$(tmux_bin 2>/dev/null || true)
 
     EV_PANE=''
     EV_LINES=0
     EV_SHA=''
 
-    if [ -z "$tmux" ] || ! "$tmux" has-session -t "$session" 2>/dev/null; then
+    if [ -n "$tmux" ] && "$tmux" has-session -t "$session" 2>/dev/null; then
+        has_session=1
+        checks="check: session (fb-$name): yes"
+    else
         checks="check: session (fb-$name): no"
+    fi
+
+    # The pane needs a live session. Concord is a file, so it still answers
+    # after the TUI is gone; auto decides after reading it.
+    if [ "$source" = pane ] && [ "$has_session" = 0 ]; then
         emit_evidence missing no-session '' 0 "$checks"
         return 0
     fi
-    checks="check: session (fb-$name): yes"
 
-    # A refusal recorded by start outranks the pane: the turn ends, the
+    # A refusal recorded by start outranks every source: the turn ends, the
     # sentence scrolls away and the prompt comes back, but the account is
     # still penalised. stop removes the file.
     sentence=$(refusal_recorded "$wt")
     checks+=$'\n'"check: recorded-refusal ($REFUSAL_FILE): $([ -n "$sentence" ] && printf yes || printf no)"
     if [ -n "$sentence" ]; then
-        emit_evidence refused recorded-refusal "$sentence" 0 "$checks"
+        emit_evidence refused recorded-refusal "$sentence" 0 "$checks" refusal
         return 0
     fi
     base_checks=$checks
@@ -1109,11 +1288,42 @@ classify_state() {
     base_checks+=$'\n'"check: result-file ($RESULT_FILE): ${result:-no}"
     case "$result" in
         done|blocked|failed)
-            # The result file names the outcome, so a blocked or failed run
-            # must not be reported as done: a wait contract built on `done`
-            # would otherwise call failure success.
-            emit_evidence "$result" result-file "$result" 0 "$base_checks"
+            # The result file names the outcome and stays the authority, so a
+            # blocked or failed run must not be reported as done: a wait
+            # contract built on `done` would otherwise call failure success.
+            emit_evidence "$result" result-file "$result" 0 "$base_checks" result-file
             return 0
+            ;;
+    esac
+
+    case "$source" in
+        concord|auto)
+            cblock=$(concord_evidence "$name" "$base_checks")
+            cstate=$(evidence_field "$cblock" state)
+            creason=$(evidence_field "$cblock" concord_reason)
+            if [ "$source" = concord ] || [ "$cstate" != unknown ]; then
+                # The chosen source is Concord. When a pane is also present
+                # and disagrees, name the loser so the disagreement is visible
+                # instead of silent; the pane still never outranks an explicit
+                # --source concord, it is only reported.
+                if [ "$has_session" = 1 ]; then
+                    pane_block=$(classify_state "$name" "$window" pane)
+                    pane_state=$(evidence_field "$pane_block" state)
+                    if [ "$pane_state" != "$cstate" ]; then
+                        cblock+=$'\n'"loser=pane"$'\n'"loser_state=$pane_state"
+                    fi
+                fi
+                printf '%s\n' "$cblock"
+                return 0
+            fi
+            # auto has no Concord verdict: fall back to the pane, but name
+            # the reason (missing, corrupt, no-task or unknown-status) so the
+            # fallback is evidence rather than an accidental `unknown`.
+            base_checks+=$'\n'"check: concord-verdict: ${creason:-unknown}"
+            if [ "$has_session" = 0 ]; then
+                emit_evidence missing no-session '' 0 "$base_checks"
+                return 0
+            fi
             ;;
     esac
 
@@ -1152,9 +1362,11 @@ classify_state() {
 }
 
 session_state() {
-    # session_state NAME -> done|blocked|failed|refused|working|idle|unknown|missing
+    # session_state NAME [SOURCE] -> done|blocked|failed|refused|working|idle|
+    # unknown|missing. SOURCE defaults to pane, so every existing caller keeps
+    # its meaning; sessions passes its own --source through.
     local block first
-    block=$(classify_state "$1")
+    block=$(classify_state "$1" "$REFUSAL_WINDOW" "${2:-pane}")
     first=${block%%$'\n'*}
     printf '%s' "${first#state=}"
 }
@@ -2020,6 +2232,25 @@ print_explanation() {
     while IFS= read -r line; do
         case "$line" in
             state=*) ;;
+            source=*) printf 'explain: source=%s\n' "${line#source=}" ;;
+            concord_status=*)
+                [ -z "${line#concord_status=}" ] ||
+                    printf 'explain: concord_status=%s\n' \
+                        "${line#concord_status=}"
+                ;;
+            concord_task=*)
+                [ -z "${line#concord_task=}" ] ||
+                    printf 'explain: concord_task=%s\n' \
+                        "${line#concord_task=}"
+                ;;
+            concord_reason=*)
+                case "${line#concord_reason=}" in
+                    ''|task) ;;
+                    *) printf 'explain: concord=%s\n' "${line#concord_reason=}" ;;
+                esac
+                ;;
+            loser=*) printf 'explain: loser=%s\n' "${line#loser=}" ;;
+            loser_state=*) printf 'explain: loser_state=%s\n' "${line#loser_state=}" ;;
             rule=*)
                 rule=${line#rule=}
                 printf 'explain: rule=%s\n' "$rule"
@@ -2051,10 +2282,12 @@ status() {
     # human output, not a second detection path. --explain adds the classifier's
     # decision line by line, from the same evidence block as --json.
     local name="" lines=25 no_gh=0 json=0 explain=0 window="$REFUSAL_WINDOW"
+    local source=pane
     while [ $# -gt 0 ]; do
         case "$1" in
             --lines) lines=${2:-}; shift 2 ;;
             --window) window=${2:-}; shift 2 ;;
+            --source) source=${2:-}; shift 2 ;;
             --no-gh) no_gh=1; shift ;;
             --json) json=1; shift ;;
             --explain) explain=1; shift ;;
@@ -2069,16 +2302,33 @@ status() {
         ''|*[!0-9]*) die "status: --lines must be a number" ;;
     esac
     is_num "$window" || die "status: --window must be a number"
+    case "$source" in
+        pane|concord|auto) ;;
+        *) die "status: --source must be pane, concord or auto" ;;
+    esac
 
     local wt="$ROOT/.worktrees/$name" branch session tmux running=0 tty mode=unknown stty out
     local state rstate="" pane="" idle="" sstate="" last_commit dirty=no watcher=""
     local wake_lock=""
     local result_pr="" result_commit="" result_tests="" prs="" pr_json=null
     local evidence="" ev_rule="" ev_matched="" ev_lines="" ev_sha="" ev_scans=""
+    local ev_source="" ev_loser="" ev_loser_state=""
+    local conc_block conc_status="" conc_task="" conc_reason=""
     [ -d "$wt" ] || die "status: no worktree at $wt"
     branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
     session="fb-$name"
     tmux=$(tmux_bin 2>/dev/null || true)
+
+    # Concord is a file, so its verdict can be named even when the session is
+    # gone. The classifier reads it again; this copy is what the human view
+    # and the additive JSON fields report, including the reason for a
+    # fallback (missing, corrupt, no-task or unknown-status).
+    if [ "$source" != pane ]; then
+        conc_block=$(concord_evidence "$name")
+        conc_status=$(evidence_field "$conc_block" concord_status)
+        conc_task=$(evidence_field "$conc_block" concord_task)
+        conc_reason=$(evidence_field "$conc_block" concord_reason)
+    fi
 
     if [ "$json" = 0 ]; then
         printf 'name=%s\nbranch=%s\nworktree=%s\nsession=%s\n' \
@@ -2122,12 +2372,12 @@ status() {
                 fi
             fi
         fi
-        evidence=$(classify_state "$name" "$window")
+        evidence=$(classify_state "$name" "$window" "$source")
         sstate=$(evidence_field "$evidence" state)
         # Only a session that can still be idle has an idle time. The result
-        # file outranks the pane, so `state` is the terminal answer even while
-        # the TUI process stays alive; `session_state` carries the same verdict
-        # on a branch that reports blocked and failed distinctly (#32).
+        # file outranks every source, so `state` is the terminal answer even
+        # while the TUI process stays alive; `session_state` carries the same
+        # verdict on a branch that reports blocked and failed distinctly (#32).
         if ! state_is_terminal "$state" && ! state_is_terminal "$sstate"; then
             idle=$(idle_seconds "$name" || true)
         fi
@@ -2135,25 +2385,44 @@ status() {
         if [ "$json" = 0 ]; then
             printf 'running=yes\ninput=%s\n' "$mode"
             printf 'session_state=%s\n' "$sstate"
+            if [ "$source" != pane ]; then
+                [ -z "$conc_status" ] || printf 'concord_status=%s\n' "$conc_status"
+                [ -z "$conc_task" ] || printf 'concord_task=%s\n' "$conc_task"
+                [ "$conc_reason" = task ] ||
+                    printf 'concord=%s\n' "${conc_reason:-unknown}"
+            fi
             [ "$explain" = 0 ] || print_explanation "$evidence"
             [ -z "$idle" ] || printf 'idle_seconds=%s\n' "$idle"
         fi
     else
         local sentence
-        sstate=missing
-        sentence=$(refusal_recorded "$wt")
-        # A recorded refusal outlives the session: start stops a refused
-        # launch, but status must keep saying refused until stop clears it.
-        if [ -n "$sentence" ]; then
-            sstate=refused
-            printf -v evidence 'state=%s\nrule=recorded-refusal\nmatched=%s\nwindow_lines=0\nwindow_sha256=\nstable_scans=0\ncheck: session (fb-%s): no\ncheck: recorded-refusal (%s): yes\npane_begin\npane_end\n' \
-                "$sstate" "$sentence" "$name" "$REFUSAL_FILE"
+        if [ "$source" != pane ]; then
+            # Concord is a file, so a stopped session can still name the task
+            # it was running; auto falls back to `missing` when it cannot.
+            evidence=$(classify_state "$name" "$window" "$source")
+            sstate=$(evidence_field "$evidence" state)
         else
-            printf -v evidence 'state=missing\nrule=no-session\nmatched=\nwindow_lines=0\nwindow_sha256=\nstable_scans=0\ncheck: session (fb-%s): no\npane_begin\npane_end\n' \
-                "$name"
+            sstate=missing
+            sentence=$(refusal_recorded "$wt")
+            # A recorded refusal outlives the session: start stops a refused
+            # launch, but status must keep saying refused until stop clears it.
+            if [ -n "$sentence" ]; then
+                sstate=refused
+                printf -v evidence 'state=%s\nsource=refusal\nrule=recorded-refusal\nmatched=%s\nwindow_lines=0\nwindow_sha256=\nstable_scans=0\ncheck: session (fb-%s): no\ncheck: recorded-refusal (%s): yes\npane_begin\npane_end\n' \
+                    "$sstate" "$sentence" "$name" "$REFUSAL_FILE"
+            else
+                printf -v evidence 'state=missing\nsource=pane\nrule=no-session\nmatched=\nwindow_lines=0\nwindow_sha256=\nstable_scans=0\ncheck: session (fb-%s): no\npane_begin\npane_end\n' \
+                    "$name"
+            fi
         fi
         if [ "$json" = 0 ]; then
             printf 'running=no\nsession_state=%s\n' "$sstate"
+            if [ "$source" != pane ]; then
+                [ -z "$conc_status" ] || printf 'concord_status=%s\n' "$conc_status"
+                [ -z "$conc_task" ] || printf 'concord_task=%s\n' "$conc_task"
+                [ "$conc_reason" = task ] ||
+                    printf 'concord=%s\n' "${conc_reason:-unknown}"
+            fi
             [ "$explain" = 0 ] || print_explanation "$evidence"
         fi
     fi
@@ -2204,8 +2473,11 @@ status() {
     # be compared across scans. `unknown` remains the `state` placeholder for
     # "no result file" as before; the pane classifier's unknown is
     # `session_state`.
+    ev_source=$(evidence_field "$evidence" source)
     ev_rule=$(evidence_field "$evidence" rule)
     ev_matched=$(evidence_field "$evidence" matched)
+    ev_loser=$(evidence_field "$evidence" loser)
+    ev_loser_state=$(evidence_field "$evidence" loser_state)
     ev_lines=$(evidence_field "$evidence" window_lines)
     ev_sha=$(evidence_field "$evidence" window_sha256)
     ev_scans=$(evidence_field "$evidence" stable_scans)
@@ -2226,6 +2498,9 @@ status() {
     printf '  "running": %s,\n' "$([ "$running" = 1 ] && printf true || printf false)"
     printf '  "input": %s,\n' "$(json_str "$mode")"
     printf '  "session_state": %s,\n' "$(json_str "$sstate")"
+    printf '  "concord_status": %s,\n' "$(json_nullable_str "$conc_status")"
+    printf '  "concord_task": %s,\n' "$(json_nullable_str "$conc_task")"
+    printf '  "concord_reason": %s,\n' "$(json_nullable_str "$conc_reason")"
     printf '  "idle_seconds": %s,\n' "$(json_nullable_num "$idle")"
     printf '  "watcher": %s,\n' "$(json_nullable_str "$watcher")"
     printf '  "wake_lock": %s,\n' "$(json_nullable_str "$wake_lock")"
@@ -2233,8 +2508,11 @@ status() {
     printf '  "dirty": %s,\n' "$([ "$dirty" = yes ] && printf true || printf false)"
     printf '  "pr": %s,\n' "$pr_json"
     printf '  "evidence": {\n'
+    printf '    "source": %s,\n' "$(json_nullable_str "$ev_source")"
     printf '    "rule": %s,\n' "$(json_nullable_str "$ev_rule")"
     printf '    "matched": %s,\n' "$(json_nullable_str "$ev_matched")"
+    printf '    "loser": %s,\n' "$(json_nullable_str "$ev_loser")"
+    printf '    "loser_state": %s,\n' "$(json_nullable_str "$ev_loser_state")"
     printf '    "window_lines": %s,\n' "$(json_nullable_num "$ev_lines")"
     printf '    "window_sha256": %s,\n' "$(json_nullable_str "$ev_sha")"
     printf '    "stable_scans": %s\n' "$(json_nullable_num "$ev_scans")"
@@ -2364,16 +2642,21 @@ sessions() {
     # serialization of the same rows: one array of objects, `[]` when empty.
     local no_gh=0 json=0 name wt worktree running state idle activity now idle_secs
     local watcher wake_lock result branch pr prs="" slug="" tmux total=0 live=0 trees=0
-    local finished=no finished_count=0
+    local finished=no finished_count=0 source=pane
     local names=() x first=1
     while [ $# -gt 0 ]; do
         case "$1" in
             --json) json=1; shift ;;
             --no-gh) no_gh=1; shift ;;
+            --source) source=${2:-}; shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) die "sessions: unsupported argument: $1" ;;
         esac
     done
+    case "$source" in
+        pane|concord|auto) ;;
+        *) die "sessions: --source must be pane, concord or auto" ;;
+    esac
     tmux=$(tmux_bin 2>/dev/null || true)
     now=$(date +%s)
 
@@ -2447,7 +2730,7 @@ sessions() {
         if [ -n "$tmux" ] && "$tmux" has-session -t "fb-$name" 2>/dev/null; then
             running=yes
             live=$((live + 1))
-            state=$(session_state "$name")
+            state=$(session_state "$name" "$source")
             # A finished run whose TUI is still alive holds a vendor slot. The
             # count is what a refused start points at; `gc` is what frees it.
             if state_is_terminal "$state"; then
@@ -2483,6 +2766,7 @@ sessions() {
             printf '  {\n'
             printf '    "name": %s,\n' "$(json_str "$name")"
             printf '    "state": %s,\n' "$(json_nullable_str "$state")"
+            printf '    "source": %s,\n' "$(json_str "$source")"
             printf '    "idle_seconds": %s,\n' "$(json_nullable_num "$idle_secs")"
             if [ "$finished" = yes ]; then
                 printf '    "finished": true,\n'
@@ -2995,7 +3279,7 @@ gui() {
     # The server itself is gui/server.py; python3 stays optional so the rest
     # of the CLI works on a host that does not have it.
     local snapshot='' watch='' no_gh=0 serve=0 first=1 json args py dir
-    local links='' note_text='' ttyd=0 interactive=0
+    local links='' note_text='' ttyd=0 interactive=0 source=pane
     local form_nonce='' flash_file='' flash_text=''
     local passthrough=()
     while [ $# -gt 0 ]; do
@@ -3006,6 +3290,7 @@ gui() {
             --serve) serve=1; shift ;;
             --ttyd) ttyd=1; passthrough+=(--ttyd); shift ;;
             --interactive) interactive=1; passthrough+=(--interactive); shift ;;
+            --source) source=${2:-}; passthrough+=(--source "${2:-}"); shift 2 ;;
             --terminal-links) links=/tty/; shift ;;
             --terminal-note) note_text=${2:-}; shift 2 ;;
             --form-nonce) form_nonce=${2:-}; shift 2 ;;
@@ -3018,6 +3303,10 @@ gui() {
             *) die "gui: unsupported argument: $1" ;;
         esac
     done
+    case "$source" in
+        pane|concord|auto) ;;
+        *) die "gui: --source must be pane, concord or auto" ;;
+    esac
 
     if [ "$serve" = 0 ] && { [ "$ttyd" = 1 ] || [ "$interactive" = 1 ]; }; then
         die "gui: --ttyd and --interactive belong to --serve"
@@ -3046,7 +3335,7 @@ gui() {
     fi
     mkdir -p "$(dirname "$snapshot")"
     while :; do
-        args=(--json)
+        args=(--json --source "$source")
         if [ "$no_gh" = 1 ]; then
             args+=(--no-gh)
         fi

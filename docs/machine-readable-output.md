@@ -18,6 +18,7 @@ what the pane is doing.
   {
     "name": "test-999",
     "state": "done",
+    "source": "pane",
     "idle_seconds": null,
     "finished": false,
     "watcher": "pid:123",
@@ -36,6 +37,15 @@ what the pane is doing.
 `.agent-result`, the pane tail as a `pane` string, and the classifier's
 decision as the `evidence` object documented below.
 
+`--source pane|concord|auto` selects where `session_state` comes from. The
+Concord fields are additive: `concord_status` is the raw status the agent
+reported in `.concord/WORK_STATE.json`, `concord_task` its task id, and
+`concord_reason` is `task` when the file produced a verdict or the reason it
+did not (`missing`, `corrupt`, `no-task`, `unknown-status`). All three are
+`null` on the default pane source. The result file and a recorded refusal
+outrank every source. `state` is still the result file's/placeholder value,
+not the selected source's state.
+
 `status --explain` prints the classification decision line by line: the rule
 that won, the line it matched, every marker that was checked, the window's line
 count and hash, how many consecutive scans agreed, and the pane the rule read.
@@ -44,20 +54,40 @@ The same block is in `status --json` as an additive `evidence` object:
 
 ```json
 "evidence": {
+  "source": "pane",
   "rule": "no-rule-matched",
   "matched": null,
+  "loser": null,
+  "loser_state": null,
   "window_lines": 40,
   "window_sha256": "9f2c...",
   "stable_scans": 2
 }
 ```
 
+`source` names what produced the verdict: `pane` (`pane` and `no-session`),
+`concord` (a Concord task), `result-file` or `refusal`. When both a live pane
+and Concord have a verdict and disagree, `loser` names the one that lost and
+`loser_state` its verdict; they are `null` when there is no disagreement or
+only one source.
+
 `rule` is one of `recorded-refusal`, `result-file`, `refusal-prose`,
 `busy-marker`, `resting-prompt`, `protected-window`, `no-rule-matched`,
-`unstable-window`, `no-session`. `matched` is the first matching line, cut to
-200 characters. `unstable-window` keeps the old safe `working` answer for a pane
-that changed between the two scans without matching a rule; it is rechecked on
-the next poll rather than reported as `unknown`.
+`unstable-window`, `no-session`, and for the Concord source `concord-task`,
+`concord-missing`, `concord-corrupt`, `concord-no-task` and
+`concord-unknown-status`. `matched` is the first matching line or the Concord
+task's status line, cut to 200 characters. `unstable-window` keeps the old
+safe `working` answer for a pane that changed between the two scans without
+matching a rule; it is rechecked on the next poll rather than reported as
+`unknown`.
+
+The Concord map is exactly the status the agent reported: `active`,
+`assigned` and `handoff_offered` are `working`; `blocked` is `blocked`;
+`review_ready`, `handed_off`, `complete` and `closed` are `done`. A status
+outside that set, including `proposed`, is `unknown` with the raw value in
+`concord_status`; `auto` then falls back to the pane. Concord has no `failed`
+or `refused` status, so those remain the result file's and the refusal file's
+words.
 
 A missing value is `null` rather than the table's `-`: `idle_seconds` when the
 session is not running or its state is terminal (`done`, `stopped`, `blocked`,

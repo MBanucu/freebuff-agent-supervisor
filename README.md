@@ -225,6 +225,26 @@ session_state=done          # live: done, blocked, failed, idle, working, refuse
                             #       unknown or missing
 ```
 
+**The Concord workspace (opt-in).** If the agent reports its work through
+[Concord](https://github.com/Get-Concord-AI/concord-mcp), the worktree has a
+`.concord/WORK_STATE.json` export. `status --source concord` reads the task on
+the worktree's branch (a Concord workspace is shared by the main checkout and
+every worktree, so the branch selects the run) and maps the status the agent
+reported: `active`, `assigned` and `handoff_offered` are `working`; `blocked`
+is `blocked`; `review_ready`, `handed_off`, `complete` and `closed` are
+`done`. Anything else, including `proposed`, is `unknown` with the raw status
+named. Concord has no `failed` or `refused` status, so those stay the result
+file's and the refusal file's words, and `.agent-result` outranks every
+source. `--source auto` uses Concord when it has a verdict and the pane
+otherwise, printing `concord=missing|corrupt|no-task|unknown-status` (and the
+rule in `--explain` or the `evidence` object) so a fallback is never silent.
+`--source pane` is the default. The export is read, never written, and
+reading it adds no dependency: `status` works without Concord installed.
+
+When both a live pane and Concord have a verdict and disagree, `--explain`
+names the source that won and the loser's verdict (`explain: source=concord`,
+`explain: loser=pane`, `explain: loser_state=idle`).
+
 The decision trail `status --explain` prints, and the `evidence` object
 `status --json` carries, are documented with the JSON in
 [machine-readable output](docs/machine-readable-output.md).
@@ -240,6 +260,9 @@ spawn-freebuff-agent status 103-example --lines 40
 spawn-freebuff-agent status 103-example --no-gh
 spawn-freebuff-agent status 103-example --json
 spawn-freebuff-agent status 103-example --explain
+spawn-freebuff-agent status 103-example --source concord --explain
+spawn-freebuff-agent sessions --source auto
+spawn-freebuff-agent gui --snapshot /tmp/agents.html --source concord
 spawn-freebuff-agent attach 103-example   # detach with Ctrl-b d
 spawn-freebuff-agent send 103-example "Also run the new test"
 spawn-freebuff-agent watch 103-example --idle-seconds 120 --poll 5
@@ -262,7 +285,9 @@ or 4). `start --auto-stop` runs it detached.
 `status` prints the result state, the autostop `watcher`, `session_state`, idle
 seconds, the pane tail, the last commit, whether the worktree is dirty, and any
 open PR for the branch. `--window N` sets the scrollback the classifier reads
-(default 40) and `--explain` adds the decision trail described in
+(default 40), `--source pane|concord|auto` selects where `session_state` comes
+from (`pane` by default; see the Concord paragraph above), and `--explain` adds
+the decision trail described in
 [machine-readable output](docs/machine-readable-output.md).
 
 `sessions` is the inventory: one row per `fb-*` session **and** per worktree,
@@ -273,7 +298,8 @@ column (`acquired`, `unavailable`, `failed` or `-` for a run that did not ask
 for the lock). It starts from
 `tmux list-sessions`, so a session with no worktree appears there instead of
 only being found when `gc --all` kills it; `list` also names such orphans.
-`--no-gh` skips the PR column. The last line counts what was listed —
+`--no-gh` skips the PR column, and `--source` selects the live STATE column
+the same way `status` does. The last line counts what was listed —
 `sessions=`, `running=`, `worktrees=`, `orphans=` and `finished=`, the live
 sessions whose run is already over. Freebuff counts live TUIs against its
 concurrent-session limit, not runs, so a `done` session still holds a slot
@@ -324,8 +350,10 @@ page from `sessions --json` — no server, no network and no external assets, so
 it works on a phone over `file://`. `gui --serve` serves the same page over
 HTTP from python3's standard library, with a token on every route, optional
 forms and an optional ttyd terminal per card; the CLI stays the only source of
-state. Headers, the nonce and `Origin` rules, ttyd and the routes are in
-[static snapshot and browser GUI](docs/browser-gui.md).
+state. `--source` is forwarded to `sessions` and to the pane route's `status`,
+so the cards, `/api/sessions` and `/api/session/<name>/pane` name the same
+source and the same loser. Headers, the nonce and `Origin` rules, ttyd and the
+routes are in [static snapshot and browser GUI](docs/browser-gui.md).
 
 ## Threat model and deployment
 
@@ -369,10 +397,13 @@ policy](docs/vendor-policy.md).
 
 ## Limitations
 
-This is a TUI supervisor, not a headless API: status is a pane capture and
-the markers are tied to the Freebuff release, and a session throttled
-mid-run reads as `idle`. What the deviceless suite covers, and the rest of
-the known limits, are in [limitations](docs/tui-constraints.md#limitations).
+This is a TUI supervisor, not a headless API: status is a pane capture by
+default, the markers are tied to the Freebuff release, and a session throttled
+mid-run reads as `idle`. The Concord source is opt-in and reads only an export
+another tool wrote; it does not install or drive Concord, and its `unknown`
+map means the pane stays the fallback. What the deviceless suite covers, and
+the rest of the known limits, are in
+[limitations](docs/tui-constraints.md#limitations).
 
 ## Upstream
 
