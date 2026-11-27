@@ -133,9 +133,13 @@ sessions-per-day cap, which are not hours either. A name the frame does not
 draw is searched for by scrolling the list before it is called missing, so an
 entry below the fold is reachable. An ambiguous or unknown name fails the launch after the
 session starts but before the brief is sent — the session is stopped, the
-worktree kept and nothing retyped. The switch writes the client's global model
-setting, so two launches that want different models must not run at the same
-moment.
+worktree kept and nothing retyped. The switch writes `freebuffModelKey` in the
+client's one `settings.json`, so `start` snapshots the value it found, switches
+under a lock in the same config dir, and writes the snapshot back once the
+brief is submitted; a launch that fails after the switch restores it too. Two
+launches may therefore overlap safely, and `model_key=before`, `model_key=set`
+and `model_key=restored` (or `model_key=restore-failed`) in `.supervisor.log`
+record what happened. A config whose key cannot be read is not switched at all.
 
 Before it creates anything, `start` checks the environment and prints one
 `preflight=<command>` line per check: `tmux`, `freebuff`, `stty` and `git`, plus

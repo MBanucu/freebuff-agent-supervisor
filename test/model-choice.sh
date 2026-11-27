@@ -18,7 +18,7 @@ rm -f "$FAKE_DIR/ready_after" "$FAKE_DIR/raw_after" "$FAKE_DIR/pane_after_send" 
 
 # The real sleeps in this area would only pay for polls: a picker that opens
 # on the first check and a walk of a few keys are both counted, not timed.
-REAL_SLEEP=$(command -v sleep)
+# $REAL_SLEEP comes from test/lib.sh, resolved before this wrapper existed.
 cat >"$TMP/bin/sleep" <<FAKE
 #!/usr/bin/env bash
 if [ -f "\${FAKE_TMUX_DIR:?}/fast_sleep" ]; then exit 0; fi
@@ -224,3 +224,119 @@ fake_clear
 if bash "$TOOL" --root "$REPO" models >"$TMP/models.out" 2>&1; then rc=0; else rc=$?; fi
 check test "$rc" -eq 1
 check contains "$(cat "$TMP/models.out")" 'no live fb-* session'
+
+# ---- the client's model key: switched under a lock, then put back (#134) ----
+
+# The switch is the picker's Enter, which writes freebuffModelKey in the one
+# settings.json every launch shares. A launch must not leave it on its own
+# choice, or the next session that passes no --model runs — and bills — this
+# one's model.
+SETTINGS="$FREEBUFF_CONFIG_DIR/settings.json"
+seed_key() {
+    # seed_key VALUE: the client's config as it stands before a launch
+    printf '{\n  "mode": "DEFAULT",\n  "adsEnabled": true,\n  "freebuffModelKey": "%s"\n}\n' \
+        "$1" >"$SETTINGS"
+}
+key_now() {
+    # key_now: the model key the config carries right now, empty when none
+    sed -nE 's/^[[:space:]]*"freebuffModelKey"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' \
+        "$SETTINGS" 2>/dev/null | head -n 1 || true
+}
+
+picker_on
+seed_key m-keep
+fresh
+if bash "$TOOL" --root "$REPO" start --issue 1110 --name test-key-keep \
+    --branch test/key-keep --title T --url U --model fast \
+    >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+key_log="$REPO/.worktrees/test-key-keep/.supervisor.log"
+check contains "$(cat "$key_log")" 'model_key=before value=m-keep'
+# The picker did move the key during the switch, so putting it back is a real
+# write and not a no-op the check could pass by accident.
+check contains "$(cat "$key_log")" 'model_key=set value=m-test-deepseek-v4-1-flash-fast'
+check test "$(key_now)" = m-keep
+check contains "$(cat "$key_log")" 'model_key=restored value=m-keep'
+
+# A launch that switched and then failed before the send was proven must put
+# the key back too: no brief ran, so nothing may keep its model.
+seed_key m-keep
+picker_on
+fresh
+printf '%s\n' "$SWALLOWED_PANE" >"$FAKE_DIR/pane_after_send"
+if bash "$TOOL" --root "$REPO" start --issue 1111 --name test-key-unsent \
+    --branch test/key-unsent --title T --url U --model fast --submit-timeout 2 \
+    >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 1
+check contains "$(cat "$TMP/start.out")" 'sent=no'
+check test "$(key_now)" = m-keep
+check contains "$(cat "$REPO/.worktrees/test-key-unsent/.supervisor.log")" \
+    'model_key=restored value=m-keep'
+rm -f "$FAKE_DIR/pane_after_send"
+
+# A config with no key gets the line removed again, and the file stays valid
+# JSON: the key is the object's last member, so its comma goes with it.
+printf '{\n  "mode": "DEFAULT",\n  "adsEnabled": true\n}\n' >"$SETTINGS"
+picker_on
+fresh
+if bash "$TOOL" --root "$REPO" start --issue 1112 --name test-key-none \
+    --branch test/key-none --title T --url U --model fast \
+    >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+check contains "$(cat "$REPO/.worktrees/test-key-none/.supervisor.log")" \
+    'model_key=before value=none'
+check test -z "$(key_now)"
+check json_ok "$(cat "$SETTINGS")"
+check contains "$(cat "$SETTINGS")" '"mode": "DEFAULT"'
+
+# ---- two overlapping switches cannot interleave (#134) ----
+
+fake_lane() {
+    # fake_lane DIR: a fake tmux of its own, so two launches can run at once
+    local d=$1
+    printf '%s\n' "$IDLE_PANE" >"$d/pane"
+    : >"$d/session"
+    : >"$d/killed"
+    : >"$d/sent"
+    : >"$d/launch"
+    : >"$d/tty"
+    : >"$d/escaped"
+    : >"$d/ready"
+    printf '%s\n' "$MODEL_PICKER_PANE" >"$d/picker_pane"
+    printf '%s\n' "$MODEL_AFTER_PANE" >"$d/pane_after_model"
+    printf '%s\n' "$TURN_PANE" >"$d/turn_pane"
+}
+
+seed_key m-keep
+mkdir -p "$TMP/fake-a" "$TMP/fake-b"
+fake_lane "$TMP/fake-a"
+fake_lane "$TMP/fake-b"
+# A walks the picker with real polls and its accepted send is held, so its
+# window stays open long enough for B to arrive inside it even on a busy
+# machine; B is only waiting, so it does not need to pay for the polls.
+: >"$TMP/fake-b/fast_sleep"
+printf '6\n' >"$TMP/fake-a/send_hold"
+FAKE_TMUX_DIR="$TMP/fake-a" bash "$TOOL" --root "$REPO" start --issue 1113 \
+    --name test-key-a --branch test/key-a --title T --url U --model fast \
+    >"$TMP/a.out" 2>&1 &
+a_pid=$!
+# B starts only once A's switch is written, so a second snapshot taken here
+# would read A's key instead of the one A found if the two interleaved. The
+# bound is generous: the assertion is that A wrote the key, not how fast.
+i=0
+while [ "$i" -lt 600 ] && [ "$(key_now)" = m-keep ]; do
+    "$REAL_SLEEP" 0.1
+    i=$((i + 1))
+done
+check test "$(key_now)" != m-keep
+if FAKE_TMUX_DIR="$TMP/fake-b" bash "$TOOL" --root "$REPO" start --issue 1114 \
+    --name test-key-b --branch test/key-b --title T --url U \
+    --model 'DeepSeek V4.1 Flash' >"$TMP/b.out" 2>&1; then rc=0; else rc=$?; fi
+check wait "$a_pid"
+check test "$rc" -eq 0
+check contains "$(cat "$REPO/.worktrees/test-key-b/.supervisor.log")" \
+    'model_key=before value=m-keep'
+check contains "$(cat "$REPO/.worktrees/test-key-a/.supervisor.log")" \
+    'model_key=restored value=m-keep'
+check test "$(key_now)" = m-keep
+check test ! -d "$FREEBUFF_CONFIG_DIR/.supervisor-model.lock"
