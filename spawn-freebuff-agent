@@ -57,9 +57,9 @@
 #   start:
 #     start
 #   status, list, sessions, hours and models:
-#     print_explanation, status, list_agents, watcher_state, live_sessions,
-#     live_session_count, finished_live, finished_live_names, sessions, hours,
-#     models
+#     print_explanation, launch_branch, worktree_branch, status, list_agents,
+#     watcher_state, live_sessions, live_session_count, finished_live,
+#     finished_live_names, sessions, hours, models
 #   watch, autostop, notify, reap and gc:
 #     reap, watch_run, watch, autostop, notify, gc
 #   the GUI:
@@ -111,6 +111,10 @@ REFUSAL_OVERLAY_RE='concurrent-session limit|session limit across CLI and Deskto
 # model picker instead of submitting, and a wait for submission would sit out
 # the whole --submit-timeout over a refusal that was already on screen.
 HOURS_OVERLAY_RE='Not enough hours'
+# A released session has no composer: its overlay offers Enter (retry with a
+# model, which starts a new session) and Escape, so typed text goes into the
+# overlay and is lost. send refuses it instead of typing (#121).
+RELEASED_OVERLAY_RE='This session was released|Choose a model to start a new session'
 # Freebuff's trust gate runs in the plain terminal before the TUI mounts: a
 # worktree with .agents/ (or an mcp.json) prints this and waits. The resting
 # prompt cannot appear while it is open, so the readiness wait must name it
@@ -369,7 +373,10 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       Attach to the tmux session (detach with Ctrl-b d).
 
   spawn-freebuff-agent send NAME TEXT
-      Send a follow-up message to a running agent.
+      Send a follow-up message to a running agent. `send NAME -- TEXT` passes
+      text that starts with a dash. It refuses a pane on the
+      concurrent-session, hours or released-session overlay instead of typing
+      into it.
 
   spawn-freebuff-agent watch NAME [--idle-seconds N] [--poll N] [--timeout N]
       Report working/idle/done/blocked/failed/refused/unknown/missing
@@ -2818,6 +2825,38 @@ start() {
 
 # ---- status, list and sessions ----
 # The three read views and the inventory helpers they share.
+launch_branch() {
+    # launch_branch WORKTREE -> the branch the launch recorded, or empty.
+    # `.supervisor-gh` is written by start when gh sync is on; `.task.md`
+    # always names the branch the worktree was created on. A worktree whose
+    # HEAD is detached cannot answer from git, so this is the record that keeps
+    # `HEAD` out of the inventory after a retry (#121).
+    local wt="$1" file branch=''
+    file="$wt/$GH_STATE_FILE"
+    if [ -f "$file" ]; then
+        branch=$(sed -n 's/^branch=//p' "$file" | head -n 1 || true)
+    fi
+    file="$wt/.task.md"
+    if [ -z "$branch" ] && [ -f "$file" ]; then
+        branch=$(sed -n 's/^Repo: .*Branch: `\([^`]*\)`.*$/\1/p' "$file" |
+            head -n 1 || true)
+    fi
+    printf '%s' "$branch"
+}
+
+worktree_branch() {
+    # worktree_branch WORKTREE -> the branch to report. The worktree's HEAD
+    # wins; a detached HEAD (rev-parse answers `HEAD`) or an unreadable one
+    # falls back to the launch record, so a retry does not turn the column
+    # into `HEAD` while the branch is still the one the work belongs to.
+    local branch
+    branch=$(git -C "$1" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    case "$branch" in
+        ''|HEAD) branch=$(launch_branch "$1") ;;
+    esac
+    printf '%s' "${branch:-?}"
+}
+
 print_explanation() {
     # print_explanation BLOCK -> the classifier's decision as `explain:` lines,
     # including every marker that was checked and the pane it looked at.
@@ -2894,7 +2933,7 @@ status() {
     local evidence="" ev_rule="" ev_matched="" ev_lines="" ev_sha="" ev_scans="" ev_source=""
     local turn_evidence="" tstate="" tout="" turn_log=""
     [ -d "$wt" ] || die "status: no worktree at $wt"
-    branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
+    branch=$(worktree_branch "$wt")
     session="fb-$name"
     tmux=$(tmux_bin 2>/dev/null || true)
 
@@ -3137,7 +3176,7 @@ list_agents() {
     for wt in "$ROOT"/.worktrees/*; do
         [ -d "$wt" ] || continue
         name=$(basename "$wt")
-        branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')
+        branch=$(worktree_branch "$wt")
         session="fb-$name"
         running=no
         state=unknown
@@ -3307,7 +3346,7 @@ sessions() {
         if [ -d "$wt" ]; then
             worktree=yes
             trees=$((trees + 1))
-            branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || printf '?')
+            branch=$(worktree_branch "$wt")
             result=$(result_state "$wt")
             [ -n "$result" ] || result=-
             watcher=$(watcher_state "$wt")
@@ -4185,7 +4224,26 @@ attach() {
 }
 
 send() {
-    local name=${1:-} text=${2:-} tmux pane
+    # send NAME TEXT, or send NAME -- TEXT for text that starts with a dash.
+    # `--` was previously taken as the text itself, so a message passed that
+    # way typed `--` (or landed in an overlay) instead of failing (#121).
+    local name='' text='' tmux pane
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help) usage; exit 0 ;;
+            --) shift; text="$*"; break ;;
+            *)
+                if [ -z "$name" ]; then
+                    name=$1
+                elif [ -z "$text" ]; then
+                    text=$1
+                else
+                    die "send: unexpected argument: $1 (quote the text as one argument)"
+                fi
+                ;;
+        esac
+        shift
+    done
     [ -n "$name" ] || die "send: NAME is required"
     valid_name "$name" || die "send: invalid name"
     [ -n "$text" ] || die "send: TEXT is required"
@@ -4198,6 +4256,11 @@ send() {
     pane=$("$tmux" capture-pane -p -t "fb-$name" -S "-$REFUSAL_WINDOW" 2>/dev/null || true)
     if printf '%s\n' "$pane" | grep -qiE "$REFUSAL_OVERLAY_RE|$HOURS_OVERLAY_RE"; then
         die "send: fb-$name is on the concurrent-session overlay or the hours overlay; no keys were sent (Enter would take over another session or open the model picker; stop it first)"
+    fi
+    # A released session draws no composer: Enter retries with the model
+    # picker's choice and starts a new session, so the text would be lost.
+    if printf '%s\n' "$pane" | grep -qiE "$RELEASED_OVERLAY_RE"; then
+        die "send: fb-$name is on the released-session overlay; no keys were sent (its Enter retries with a model and starts a new session; press Enter in the pane, then send again)"
     fi
     "$tmux" send-keys -t "fb-$name" -l "$text"
     sleep 0.2

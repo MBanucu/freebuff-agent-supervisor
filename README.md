@@ -296,6 +296,7 @@ spawn-freebuff-agent hours                 # any live fb-* session
 spawn-freebuff-agent hours --json
 spawn-freebuff-agent attach 103-example   # detach with Ctrl-b d
 spawn-freebuff-agent send 103-example "Also run the new test"
+spawn-freebuff-agent send 103-example -- "-a line that starts with a dash"
 spawn-freebuff-agent watch 103-example --idle-seconds 120 --poll 5
 spawn-freebuff-agent autostop 103-example
 spawn-freebuff-agent notify 103-example
@@ -369,6 +370,12 @@ the next step to guesswork. The hours overlay is refused the same way, as
 `refused=hours` with `hours=N/M` when the panel shows the account's usage and
 a `hint=` naming both ways out: free finished sessions with `gc`, or wait for
 the daily refill. Neither overlay is waited out as a submit timeout.
+
+`send NAME TEXT` types a follow-up into the live session and presses Enter;
+`send NAME -- TEXT` passes text that starts with a dash. It refuses to type
+into a pane showing the concurrent-session, hours or released-session overlay,
+where Enter takes over another session, opens the model picker or retries a
+released one instead of submitting the text, and says which overlay it saw.
 
 `stop` is a hard kill. `stop --graceful` sends `Escape` to end the turn, waits
 up to `--wait` seconds (default 20) for the pane to reach `done`, `idle` or
