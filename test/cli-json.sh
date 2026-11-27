@@ -128,6 +128,7 @@ check grep -qxF 'local.properties' "$REPO/.git/info/exclude"
 check grep -qxF '.worktrees/' "$REPO/.git/info/exclude"
 check grep -qxF '.agent-result' "$REPO/.git/info/exclude"
 check grep -qxF '.supervisor.log' "$REPO/.git/info/exclude"
+check grep -qxF '.supervisor-hours' "$REPO/.git/info/exclude"
 
 # The JSON section reads the last recorded watcher: seed a dead pid so it
 # is deterministic when this area runs alone.
@@ -198,6 +199,60 @@ check contains "$out" '\u0001'
 check test "$(printf '%s' "$out" | grep -c $'\t')" = 0
 
 rm -f "$WT/.agent-result"
+fake_clear
+
+# ---- the hours ledger (#108) ----
+
+# A live footer reading is current: status shows it without an age, appends
+# exactly one line to the ledger and names the source in JSON.
+rm -f "$REPO/.supervisor-hours"
+fake_session test-999 "$HOURS_FOOTER_PANE"
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-999)
+check json_ok "$out"
+check contains "$out" '"hours": {'
+check contains "$out" '"value": "3/4"'
+check contains "$out" '"age_seconds": 0'
+check contains "$out" '"source": "footer"'
+check test "$(grep -c . "$REPO/.supervisor-hours" || true)" = 1
+check contains "$(cat "$REPO/.supervisor-hours")" \
+    'hours=3/4 source=footer session=fb-test-999'
+out=$(bash "$TOOL" --root "$REPO" status --no-gh test-999)
+check contains "$out" 'hours=3/4'
+check test -z "$(printf '%s\n' "$out" | grep '^hours=.*age=' || true)"
+
+# Without a live reading the ledger's last line is shown with its age, so
+# 47 minutes old can never read as the current number.
+printf 'ts=%s hours=1/2 source=panel session=fb-old\n' \
+    "$(($(date +%s) - 2820))" >"$REPO/.supervisor-hours"
+fake_clear
+out=$(bash "$TOOL" --root "$REPO" status --no-gh test-999)
+check contains "$out" 'hours=1/2 age=47m'
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-999)
+check contains "$out" '"value": "1/2"'
+check contains "$out" '"source": "panel"'
+check test "$(printf '%s\n' "$out" | sed -n 's/.*"age_seconds": \([0-9][0-9]*\).*/\1/p')" -ge 2820
+check test "$(printf '%s\n' "$out" | sed -n 's/.*"age_seconds": \([0-9][0-9]*\).*/\1/p')" -le 2880
+
+# No history at all is `-` and nulls, not `unknown` dressed as a reading.
+rm -f "$REPO/.supervisor-hours"
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-999)
+check contains "$out" '"value": null'
+check test "$(printf '%s\n' "$out" | grep -c '"age_seconds": null')" = 1
+check contains "$out" '"source": null'
+out=$(bash "$TOOL" --root "$REPO" status --no-gh test-999)
+check contains "$out" 'hours=-'
+
+# sessions --json carries the same object per row, and the live read lands in
+# the ledger exactly once.
+fake_session test-999 "$HOURS_FOOTER_PANE"
+out=$(bash "$TOOL" --root "$REPO" sessions --json --no-gh)
+check json_ok "$out"
+check contains "$out" '"hours": {'
+check contains "$out" '"value": "3/4"'
+check contains "$out" '"source": "footer"'
+check test "$(grep -c . "$REPO/.supervisor-hours" || true)" = 1
+
+rm -f "$REPO/.supervisor-hours"
 fake_clear
 
 # ---- remaining checks ----

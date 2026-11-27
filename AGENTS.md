@@ -50,8 +50,8 @@ Run both suites before you commit:
 - Cleanup is the maintainer's explicit `git worktree remove` and
   `git branch -d`, which `gc` prints, not something the tool runs.
 - Do not commit generated state: `.task.md`, `.agent-result`,
-  `local.properties`, `.worktrees/`, `.supervisor.log` or
-  `.supervisor-briefs.jsonl`.
+  `local.properties`, `.worktrees/`, `.supervisor.log`,
+  `.supervisor-briefs.jsonl` or `.supervisor-hours`.
 
 ## Fixtures
 

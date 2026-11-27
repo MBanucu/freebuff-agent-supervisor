@@ -97,6 +97,23 @@ check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $3 }')" = -
 check test "$(printf '%s\n' "$out" | awk '$1 == "ghost" { print $3 }')" != -
 check contains "$out" 'sessions=2 running=2 worktrees=1 orphans=1'
 
+# the HOURS column: a live reading, then the ledger with its age, then - (#108)
+check contains "$out" 'HOURS'
+rm -f "$REPO/.supervisor-hours"
+fake_session test-999 "$HOURS_FOOTER_PANE"
+out=$(bash "$TOOL" --root "$REPO" sessions --no-gh)
+check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $NF }')" = 3/4
+printf 'ts=%s hours=1/2 source=panel session=fb-old\n' \
+    "$(($(date +%s) - 2820))" >"$REPO/.supervisor-hours"
+fake_clear
+out=$(bash "$TOOL" --root "$REPO" sessions --no-gh)
+check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $(NF-1) }')" = 1/2
+check test "$(printf '%s\n' "$out" | awk '$1 == "test-999" { print $NF }')" = age=47m
+rm -f "$REPO/.supervisor-hours"
+# restore the inventory the next checks read
+fake_session test-999 "$IDLE_PANE"
+fake_add_session ghost
+
 # a watcher that was recorded but has gone is not reported as alive
 printf 'autostop=pid:999999\n' >>"$WT/.supervisor.log"
 out=$(bash "$TOOL" --root "$REPO" sessions --no-gh)
@@ -296,8 +313,8 @@ check contains "$out" 'wake_lock=acquired'
 out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-wake)
 check contains "$out" '"wake_lock": "acquired"'
 out=$(bash "$TOOL" --root "$REPO" sessions --no-gh)
-check test "$(printf '%s\n' "$out" | awk '$1 == "test-wake" { print $NF }')" = acquired
-check test "$(printf '%s\n' "$out" | awk '$1 == "test-wake-two" { print $NF }')" = acquired
+check test "$(printf '%s\n' "$out" | awk '$1 == "test-wake" { print $(NF-1) }')" = acquired
+check test "$(printf '%s\n' "$out" | awk '$1 == "test-wake-two" { print $(NF-1) }')" = acquired
 
 # FREEBUFF_WAKE_LOCK=1 is the same switch for a shell that always wants it.
 : >"$TMP/wake.log"

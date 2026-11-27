@@ -25,16 +25,32 @@ what the pane is doing.
     "worktree": "yes",
     "result": "blocked",
     "branch": "test/999",
-    "pr": null
+    "pr": null,
+    "hours": {
+      "value": null,
+      "age_seconds": null,
+      "source": null
+    }
   }
 ]
 ```
 
+The `hours` object is the account usage the TUI draws, in all three values the
+human views show: `value` is the `N/M` string, `source` is `panel` when the
+reading came from the hours overlay and `footer` when it came from the rest of
+the pane, and `age_seconds` is `0` for a reading made this run. When neither
+the pane nor `.supervisor-hours` has a fraction, all three are `null` and the
+human view says `-`; a ledger reading keeps its `source` and reports how old
+it is, so a stale number is never passed off as current. Every reading is
+appended to `.supervisor-hours` as
+`ts=<epoch> hours=N/M source=panel|footer session=fb-X`.
+
 `status NAME --json` is one object with the same fields plus the detail view's:
 `running` and `dirty` as booleans, `input` (`raw|canonical|unknown`),
 `session_state`, `turn_state`, `turn_outcome`, `commit`, `wake_lock`, the
-`result_*` keys from `.agent-result`, the pane tail as a `pane` string, and the
-classifier's decision as the `evidence` object documented below.
+`hours` object, the `result_*` keys from `.agent-result`, the pane tail as a
+`pane` string, and the classifier's decision as the `evidence` object
+documented below.
 
 `turn_state` is the turn log's verdict (`working`, `finished`, `failed` or
 `unknown`) and `turn_outcome` its `outputType` (`lastMessage` or `error`).
@@ -92,7 +108,9 @@ session is not running or its state is terminal (`done`, `stopped`, `blocked`,
 `failed`) — a finished run has no idle time, so a done card cannot read `idle
 5495s` — `result` with no `.agent-result`, `branch` and `pr` for a session with
 no worktree, `watcher` with no autostop recorded, `wake_lock` when the run did
-not ask for one, and `pane` when no session is running. `wake_lock` is the
+not ask for one, and `pane` when no session is running. The `hours` values are
+`null` only when neither the pane nor the ledger has a reading; `age_seconds`
+is `0` for a live read and the ledger's age otherwise. `wake_lock` is the
 value `start` recorded (`acquired`, `unavailable` or `failed`), not a live
 status: `termux-wake-lock` has no query, and the lock is never released by the
 tool. Idle time comes back when the session is resumed and is no longer
