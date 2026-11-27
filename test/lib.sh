@@ -131,8 +131,8 @@ case "${1:-}" in
         case "$fmt" in
             *pane_tty*)
                 # Opt-in: ready_after N makes the pane report no tty for N
-                # checks, so a cold launch can be simulated as a poll count
-                # instead of a real 45-second wait.
+                # checks, so a tmux that cannot name its pane tty is
+                # simulated as a poll count instead of a real wait.
                 if [ -f "$d/ready_after" ]; then
                     left=$(cat "$d/ready_after" 2>/dev/null || printf '0')
                     if [ "$left" -gt 0 ]; then
@@ -206,9 +206,21 @@ export FAKE_TMUX_DIR="$FAKE_DIR"
 
 # A fake stty reports raw mode, and a stub freebuff keeps the launch path
 # honest on a runner without the real CLI. Areas that send put $TMP/bin on
-# PATH.
+# PATH. Opt-in: raw_after N reports canonical mode for N checks, so a cold
+# launch that has a tty but has not reached raw input yet is simulated as a
+# poll count instead of a real wait; the happy path stays raw.
 cat >"$TMP/bin/stty" <<'FAKE'
 #!/usr/bin/env bash
+d=${FAKE_TMUX_DIR:?}
+if [ -f "$d/raw_after" ]; then
+    left=$(cat "$d/raw_after" 2>/dev/null || printf '0')
+    if [ "$left" -gt 0 ]; then
+        printf '%s\n' "$((left - 1))" >"$d/raw_after"
+        printf '%s\n' 'speed 38400 baud; line = 0; icanon echo'
+        exit 0
+    fi
+    rm -f "$d/raw_after"
+fi
 printf '%s\n' 'speed 38400 baud; line = 0; -icanon -echo'
 FAKE
 cat >"$TMP/bin/freebuff" <<'FAKE'

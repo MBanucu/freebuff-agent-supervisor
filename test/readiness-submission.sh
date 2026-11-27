@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Area: the readiness deadline (#46) and submission proof (#39).
+# Area: the readiness deadline (#46), raw-mode failure evidence (#100) and
+# submission proof (#39).
 
 # shellcheck shell=bash
 . "$(dirname -- "${BASH_SOURCE[0]}")/lib.sh"
@@ -9,7 +10,8 @@
 PATH="$TMP/bin:$PATH"
 export PATH
 export FREEBUFF_BIN="$TMP/bin/freebuff"
-rm -f "$FAKE_DIR/ready_after" "$FAKE_DIR/pane_after_send" "$FAKE_DIR/fast_sleep"
+rm -f "$FAKE_DIR/ready_after" "$FAKE_DIR/raw_after" "$FAKE_DIR/pane_after_send" \
+    "$FAKE_DIR/fast_sleep"
 : >"$FAKE_DIR/ready"
 printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
 fake_clear
@@ -40,10 +42,12 @@ if bash "$TOOL" --root "$REPO" start --issue 1012 --name test-ready-bad \
 check test "$rc" -eq 1
 check contains "$(cat "$TMP/start.out")" '--ready-poll must be a positive number'
 
-# The old budget was 90 polls of 0.5 s. A pane that only reports a tty after
-# 100 polls used to be killed just before it became ready; the new default
-# deadline lets the same launch through, and the wait leaves a trace.
-printf '100\n' >"$FAKE_DIR/ready_after"
+# The old budget was 90 polls of 0.5 s. A pane that has a tty but only
+# reaches raw input after 100 polls used to be killed just before it became
+# ready; the new default deadline lets the same launch through, and the wait
+# leaves a trace. Only "not raw yet" gets the full budget: no tty and a
+# failing stty are faults and fail after READY_FAILS consecutive checks.
+printf '100\n' >"$FAKE_DIR/raw_after"
 printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
 fake_clear
 : >"$FAKE_DIR/sent"
@@ -57,7 +61,56 @@ check contains "$(cat "$SLOW_WT/.supervisor.log")" 'waiting-for-ready=yes elapse
 check contains "$(cat "$SLOW_WT/.supervisor.log")" \
     'ready=yes elapsed=50.0s timeout=120s poll=0.5s'
 check test -s "$FAKE_DIR/sent"
+rm -f "$FAKE_DIR/raw_after"
+fake_clear
+
+# A pane tmux cannot name a tty for can never pass the raw-mode check. Three
+# consecutive checks name the fault instead of waiting out --ready-timeout.
+printf '100\n' >"$FAKE_DIR/ready_after"
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+fake_clear
+: >"$FAKE_DIR/killed"
+if bash "$TOOL" --root "$REPO" start --issue 1014 --name test-no-tty \
+    --branch test/no-tty --title T --url U \
+    --ready-timeout 30 --ready-poll 0.5 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 1
+check contains "$(cat "$TMP/start.out")" 'ready=no reason=no-tty'
+check contains "$(cat "$TMP/start.out")" 'after 1.0s'
+check contains "$(cat "$TMP/start.out")" 'no pane tty'
+check grep -qxF 'fb-test-no-tty' "$FAKE_DIR/killed"
+check test -d "$REPO/.worktrees/test-no-tty"
+check contains "$(cat "$REPO/.worktrees/test-no-tty/.supervisor.log")" \
+    'ready=no reason=no-tty elapsed=1.0s timeout=30s poll=0.5s session=fb-test-no-tty'
 rm -f "$FAKE_DIR/ready_after"
+fake_clear
+
+# A tty exists but stty exits non-zero on it (toybox without -F, a pty the
+# user cannot open). That is not "not raw yet": after three checks start
+# stops the session and reports the exact command, tty and error.
+cat >"$TMP/fail-stty" <<'FAKE'
+#!/usr/bin/env bash
+printf 'stty: %s: tcgetattr: Inappropriate ioctl for device\n' "${!#}" >&2
+exit 1
+FAKE
+chmod +x "$TMP/fail-stty"
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+fake_clear
+: >"$FAKE_DIR/killed"
+if FREEBUFF_STTY="$TMP/fail-stty" bash "$TOOL" --root "$REPO" start \
+    --issue 1015 --name test-stty --branch test/stty --title T --url U \
+    --ready-timeout 30 --ready-poll 0.5 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 1
+check contains "$(cat "$TMP/start.out")" 'ready=no reason=stty'
+check contains "$(cat "$TMP/start.out")" "tty=$FAKE_DIR/tty"
+check contains "$(cat "$TMP/start.out")" "command=$TMP/fail-stty"
+check contains "$(cat "$TMP/start.out")" 'error=stty:'
+check contains "$(cat "$TMP/start.out")" 'after 1.0s'
+check grep -qxF 'fb-test-stty' "$FAKE_DIR/killed"
+check test -d "$REPO/.worktrees/test-stty"
+check contains "$(cat "$REPO/.worktrees/test-stty/.supervisor.log")" \
+    "ready=no reason=stty elapsed=1.0s timeout=30s poll=0.5s session=fb-test-stty"
+check contains "$(cat "$REPO/.worktrees/test-stty/.supervisor.log")" \
+    "tty=$FAKE_DIR/tty command=$TMP/fail-stty error=stty:"
 fake_clear
 
 # A pane that stays up but never draws the resting prompt is a hung TUI: the
@@ -65,7 +118,7 @@ fake_clear
 # still prints the last pane lines and the elapsed seconds.
 printf '%s\n' "$BUSY_PANE" >"$FAKE_DIR/pane"
 : >"$FAKE_DIR/killed"
-if bash "$TOOL" --root "$REPO" start --issue 1014 --name test-hung \
+if bash "$TOOL" --root "$REPO" start --issue 1016 --name test-hung \
     --branch test/hung --title T --url U \
     --ready-timeout 5 --ready-poll 0.5 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
 check test "$rc" -eq 1
@@ -84,7 +137,7 @@ check test -d "$HUNG_WT"
 # waiting line, only the outcome.
 printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
 fake_clear
-if bash "$TOOL" --root "$REPO" start --issue 1015 --name test-warm \
+if bash "$TOOL" --root "$REPO" start --issue 1017 --name test-warm \
     --branch test/warm --title T --url U \
     --ready-timeout 30 --ready-poll 0.5 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
 check test "$rc" -eq 0
@@ -174,6 +227,24 @@ check contains "$(cat "$TMP/start.out")" 'submit_proof=none'
 check contains "$(cat "$TMP/start.out")" 'Read the file .task.md'
 check test "$(grep -c -- '-l' "$FAKE_DIR/sent")" = 1
 check grep -qxF 'fb-test-proof-typed' "$FAKE_DIR/killed"
+# ---- status input mode: only what stty could read (#100) ----
+
+# A raw pane stays raw, a tty stty cannot read is unknown (not canonical),
+# and a missing tty stays unknown. --json carries the same domain.
+fake_session test-warm "$IDLE_PANE"
+out=$(bash "$TOOL" --root "$REPO" status test-warm --no-gh)
+check contains "$out" 'running=yes'
+check contains "$out" 'input=raw'
+out=$(FREEBUFF_STTY="$TMP/fail-stty" bash "$TOOL" --root "$REPO" status test-warm --no-gh)
+check contains "$out" 'input=unknown'
+check test -z "$(grep 'input=canonical' <<<"$out" || true)"
+out=$(FREEBUFF_STTY="$TMP/fail-stty" bash "$TOOL" --root "$REPO" status test-warm --no-gh --json)
+check json_ok "$out"
+check contains "$out" '"input": "unknown"'
+printf '100\n' >"$FAKE_DIR/ready_after"
+out=$(bash "$TOOL" --root "$REPO" status test-warm --no-gh)
+check contains "$out" 'input=unknown'
+rm -f "$FAKE_DIR/ready_after"
 fake_clear
 rm -f "$FAKE_DIR/fast_sleep"
 fake_clear
