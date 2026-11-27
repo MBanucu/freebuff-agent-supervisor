@@ -25,7 +25,7 @@ starts a real agent.
 | `test/readiness-submission.sh` | Area: the readiness deadline and proof that the brief was submitted. |
 | `test/wait-actions.sh` | Area: `gui --serve` — the read-only server, the POST actions and the ttyd route. |
 | `test/hours.sh` | Area: the remaining hour budget read from a live pane. |
-| `test/model-choice.sh` | Area: the `/model` picker — `start --model`, its scroll search, and `models`. |
+| `test/model-choice.sh` | Area: the `/model` picker — `start --model`, its scroll search, `models`, and the client's global model key it writes. |
 | `test/build-sync.sh` | Area: the artifact is what `src/` builds, and the check fails when it is stale. |
 | `gui-test.sh` | The second suite: curl checks for `gui/server.py`. It reuses `test/lib.sh` and prints `ok N gui checks`. |
 | `gui/server.py` | The HTTP server for `gui --serve`, python3 standard library only. It shells out to the CLI, which stays the single source of state. |
@@ -80,6 +80,7 @@ Find the area that owns the behaviour:
 | Readiness deadline, submission proof | `test/readiness-submission.sh` |
 | `gui --serve` routes and actions | `test/wait-actions.sh` |
 | Hours read from a pane | `test/hours.sh` |
+| Model picker, `--model`, the model key and its lock | `test/model-choice.sh` |
 
 A check is one `check` call:
 

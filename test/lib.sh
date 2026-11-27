@@ -23,6 +23,11 @@ TOOL="$ROOT/spawn-freebuff-agent"
 TMP=$(mktemp -d) || exit 1
 REPO="$TMP/repo"
 FAKE_DIR="$TMP/fake"
+# The real sleep, resolved before any area puts its fake $TMP/bin on PATH. An
+# area that shadows sleep has to exec this: `command -v sleep` taken later
+# finds the wrapper the area is about to write, or one an earlier area left,
+# and the wrapper execs itself forever.
+REAL_SLEEP=$(command -v sleep)
 WT="$REPO/.worktrees/test-999"
 # The turn-log source reads <config>/projects/<name>/chats. Point it at the
 # temp tree so a suite never reads the real ~/.config/manicode, and so a
@@ -217,6 +222,23 @@ case "${1:-}" in
                                 exit
                             }' "$d/pane")
                         rm -f "$d/picker_open"
+                        # Enter on the picker also writes the client's one
+                        # global model key (#134), which is what start has to
+                        # put back. A config with no key gets one as the last
+                        # member, the shape a restore has to undo.
+                        if [ -n "${FREEBUFF_CONFIG_DIR:-}" ] &&
+                            [ -d "${FREEBUFF_CONFIG_DIR:-}" ]; then
+                            key="m-test-$(printf '%s' "$sel" |
+                                tr -c 'A-Za-z0-9' '-' | tr 'A-Z' 'a-z')"
+                            f="$FREEBUFF_CONFIG_DIR/settings.json"
+                            if grep -q '"freebuffModelKey"' "$f" 2>/dev/null; then
+                                sed -E "s|^([[:space:]]*\"freebuffModelKey\"[[:space:]]*:[[:space:]]*)\"[^\"]*\"|\1\"$key\"|" \
+                                    "$f" >"$f.fake" && mv "$f.fake" "$f"
+                            else
+                                printf '{\n  "mode": "DEFAULT",\n  "freebuffModelKey": "%s"\n}\n' \
+                                    "$key" >"$f"
+                            fi
+                        fi
                         sed "s/@MODEL@/$sel/" "$d/pane_after_model" >"$d/pane"
                     elif [ -f "$d/picker_pane" ] &&
                         [ "$(cat "$d/last_text" 2>/dev/null)" = /model ]; then
@@ -230,6 +252,13 @@ case "${1:-}" in
                         # start now requires before started=yes.
                         mv "$d/pane_after_send" "$d/pane"
                     elif [ -f "$d/turn_pane" ]; then
+                        # Opt-in: $d/send_hold N holds the accepted send for N
+                        # seconds, so a second launch can be started inside the
+                        # first one's model-switch window (#134) without the
+                        # test racing that window on a loaded machine.
+                        if [ -f "$d/send_hold" ]; then
+                            sleep "$(cat "$d/send_hold")"
+                        fi
                         cp "$d/turn_pane" "$d/pane"
                     fi
                     ;;
