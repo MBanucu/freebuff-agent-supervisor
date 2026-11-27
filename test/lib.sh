@@ -120,6 +120,26 @@ chmod +x "$TMP/bin/gh"
 # GH_BIN so every area uses it whether or not $TMP/bin is on PATH.
 export GH_BIN="$TMP/bin/gh"
 
+# ---- fake curl: the account API, opt-in through PATH (#124) ----
+# The account source reads one authenticated GET. This fake answers with the
+# body and http code a test writes, and records the arguments so a check can
+# prove the bearer token and the URL. The defaults (empty body, 200, exit 0)
+# are a successful answer without figures, so an area that never sets them is
+# no worse off than a machine without a token. It sits in a directory of its
+# own on PATH: the areas that add $TMP/bin keep the real curl their GUI
+# checks drive, and only the account tests reach this one.
+mkdir -p "$TMP/account-bin"
+: >"$FAKE_DIR/curl_args"
+cat >"$TMP/account-bin/curl" <<'FAKE'
+#!/usr/bin/env bash
+d=${FAKE_TMUX_DIR:?}
+printf '%s\n' "$*" >>"$d/curl_args"
+[ -f "$d/curl_body" ] && cat "$d/curl_body"
+printf '\n%s' "$(cat "$d/curl_http" 2>/dev/null || printf '200')"
+exit "$(cat "$d/curl_status" 2>/dev/null || printf '0')"
+FAKE
+chmod +x "$TMP/account-bin/curl"
+
 # ---- fake tmux for lifecycle checks (#3, #4) ----
 
 : >"$FAKE_DIR/tty"

@@ -154,6 +154,13 @@ can still be named with `--title`/`--url` or `--no-gh`. A healthy run prints
 `preflight=ok`. `--no-check` or `FREEBUFF_SKIP_PREFLIGHT=1` skips the check and
 keeps the old late lookup for a caller that knows its environment.
 
+It then asks the account API for the remaining hours (the reader behind `hours
+--source account`) and refuses an empty budget before any worktree or session
+slot is spent: `refused=hours`, `hours=N/M`, `reset=<time>` and a hint, with
+nothing created. Only a definitive zero refuses — a missing token, a missing
+`curl` or a server that does not answer never blocks a launch — and `--model`
+skips the check because a free model spends no hours.
+
 `--wake-lock` (or `FREEBUFF_WAKE_LOCK=1`) asks Termux for a partial wake lock
 with `termux-wake-lock`, once, after the preflight and before `tmux new-session`.
 It is optional and never fatal: without the binary the run starts anyway, prints
@@ -346,6 +353,20 @@ seconds since the pane last changed, so a stale reading is visible. With no
 live session, or a pane that shows no figure, it prints `hours=unknown` and
 exits 2. `--json` emits the same fields as one object.
 
+`--source account` reads the same budget from the account instead of a pane:
+one authenticated `GET https://freebuff.com/api/web/freebuff-session` with
+the client's `default.authToken` from
+`~/.config/manicode/credentials.json`, no cookie jar and no fingerprint. It
+prints `hours=5/21 reset=2026-11-27T23:00:00Z session=- source=account`, where
+the figures are the daily `remaining` and `limit` divided by five, the unit
+the TUI draws, and `reset` is the daily refill. A token the server rejects is
+named as `hours=unknown source=account status=unauthorized` with exit 2, so a
+rejected token reads as the fixable state it is instead of a bare unknown
+figure. A missing or tokenless credentials file, a missing `curl` or a server
+that does not answer prints `account=unconfigured|nocurl|request` and falls
+back to the pane; no token means no request. `--json` carries `remaining`,
+`limit` and `reset_at` alongside `hours`, `session` and `source`.
+
 `models [NAME]` lists what the client offers, because it offers no catalog
 command: the `/model` picker is the catalog. It opens the picker in a live,
 resting session, walks it to the end of the list (the frame draws one page and
@@ -476,6 +497,10 @@ policy](docs/vendor-policy.md).
   it is working; use `send` for a deliberate follow-up.
 - Auto-stop and `gc` only kill `fb-<name>`, after appending the pane tail,
   commit, dirty flag and PR to `.worktrees/<name>/.supervisor.log`.
+- `hours --source account` and the `start` pre-flight make one read-only GET
+  to `freebuff.com` with the bearer token from the client's
+  `credentials.json`. Nothing else leaves the machine, and without a token no
+  request is made at all.
 - `stop`, auto-stop and `gc` leave the branch and worktree in place on purpose.
 
 ## Limitations

@@ -24,7 +24,7 @@ starts a real agent.
 | `test/brief-refusals.sh` | Area: the brief-hash ledger and the vendor refusal vocabulary and state. |
 | `test/readiness-submission.sh` | Area: the readiness deadline and proof that the brief was submitted. |
 | `test/wait-actions.sh` | Area: `gui --serve` — the read-only server, the POST actions and the ttyd route. |
-| `test/hours.sh` | Area: the remaining hour budget read from a live pane. |
+| `test/hours.sh` | Area: the remaining hour budget, read from a live pane or the account API. |
 | `test/model-choice.sh` | Area: the `/model` picker — `start --model`, its scroll search, `models`, and the client's global model key it writes. |
 | `test/build-sync.sh` | Area: the artifact is what `src/` builds, and the check fails when it is stale. |
 | `gui-test.sh` | The second suite: curl checks for `gui/server.py`. It reuses `test/lib.sh` and prints `ok N gui checks`. |
@@ -79,7 +79,7 @@ Find the area that owns the behaviour:
 | Brief ledger, refusals | `test/brief-refusals.sh` |
 | Readiness deadline, submission proof | `test/readiness-submission.sh` |
 | `gui --serve` routes and actions | `test/wait-actions.sh` |
-| Hours read from a pane | `test/hours.sh` |
+| Hours read from a pane or the account API | `test/hours.sh` |
 | Model picker, `--model`, the model key and its lock | `test/model-choice.sh` |
 
 A check is one `check` call:
@@ -185,7 +185,8 @@ same command the workflow runs (`./spawn-freebuff-agent-test.sh` or
 - the temporary git repo (`$REPO`), its initial commit and the
   `.worktrees/test-999` path (`$WT`);
 - the fake tmux (`$TMP/bin/tmux`, driven by `$FAKE_DIR`), the fake `stty`
-  that reports raw mode, and the stub `freebuff` that exits 0;
+  that reports raw mode, the stub `freebuff` that exits 0, the fake `gh` and
+  the fake `curl` that answers the account API from `$FAKE_DIR`;
 - the captured pane fixtures `IDLE_PANE`, `BUSY_PANE`, `REFUSED_PANE`,
   `STRIKE_PANE`, `BANNER_IDLE_PANE`, `TURN_PANE`, `SWALLOWED_PANE` and the
   rest, plus the `fake_session` / `fake_clear` / `fake_add_session` /
