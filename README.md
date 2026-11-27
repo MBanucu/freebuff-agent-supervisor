@@ -54,6 +54,16 @@ anything, and it never modifies the main worktree.
 - `ttyd` is optional and used only by `gui --serve --ttyd` (or
   `FREEBUFF_TTYD`); without it the dashboard simply has no terminal links.
 
+On Termux, `pkg install tmux git` is the base and `pkg install gh python ttyd`
+adds the optional parts. Keep the checkout under `$HOME`, not on
+`~/storage/shared` (`/sdcard`): shared storage has no Unix permissions or
+symlinks, so `git worktree add` fails there. For a run that outlives the
+screen, hold a wake lock with `termux-wake-lock` (or pass `--wake-lock`).
+Freebuff itself is not a Termux package — the client is a glibc binary and
+Termux is bionic — so a phone needs a glibc layer or a remote host before
+`start` can launch; the options and the rest of the Termux detail are in
+[subagent mode on Termux](docs/termux.md).
+
 ## Install
 
 ```bash
@@ -247,7 +257,7 @@ The decision trail `status --explain` prints, and the `evidence` object
 spawn-freebuff-agent list
 spawn-freebuff-agent sessions
 spawn-freebuff-agent sessions --json
-spawn-freebuff-agent gui --snapshot /tmp/agents.html --watch 5
+spawn-freebuff-agent gui --snapshot ${TMPDIR:-/tmp}/agents.html --watch 5
 spawn-freebuff-agent status 103-example --lines 40
 spawn-freebuff-agent status 103-example --no-gh
 spawn-freebuff-agent status 103-example --json
