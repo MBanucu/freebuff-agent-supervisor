@@ -97,8 +97,10 @@ check contains "$out" '"result_state": "blocked"'
 check contains "$out" '"result_pr": "https://example.test/pr/17"'
 check contains "$out" '"result_commit": "def5678"'
 check contains "$out" '"result_tests": "sessions --json"'
+# this area runs with the real stty and a tty fixture that is a plain file,
+# so stty cannot read it: the mode is unknown, not a guessed canonical (#100).
 check contains "$out" '"running": true'
-check contains "$out" '"input": "canonical"'
+check contains "$out" '"input": "unknown"'
 check contains "$out" '"session_state": "blocked"'
 check contains "$out" '"idle_seconds": null'
 check contains "$out" '"dirty": false'
