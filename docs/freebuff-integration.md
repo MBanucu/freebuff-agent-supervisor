@@ -207,11 +207,14 @@ silently nothing.
 - `~/.agents/mcp.json` *is* seen, by every worktree;
 - if a worktree does get its own `.agents/` (the only way to give one session
   extra tools), the launch stops at the trust prompt. Under tmux stdin is a TTY,
-  so the prompt is real, and `start` would sit in `waiting-for-ready` until
-  `--ready-timeout` and then kill the session.
+  so the prompt is real. #76 makes `start` detect it, name the directory and
+  both ways to proceed, and fail at once instead of waiting out
+  `--ready-timeout`; `start --trust-agents` is the explicit opt-in that
+  forwards the vendor flag. The default launch never pre-answers the gate.
 
-Today no worktree has `.agents/`, so this is latent. Any issue that adds MCP to
-worktrees has to solve the trust prompt in the same change.
+No worktree here has `.agents/` yet, so the prompt only appears once a worktree
+is given MCP tools. `--trust-agents` is available for that change; it is not a
+default, because it runs repository-supplied code with the user's permissions.
 
 ### There is no `/mcp` command
 

@@ -181,6 +181,9 @@ case "${1:-}" in
         fi
         ;;
     new-session)
+        # The command line is the last argument; keep it so a test can prove
+        # which flags start actually passed to Freebuff.
+        printf '%s\n' "${!#}" >>"$d/launch"
         # Opt-in: only a test that reaches the send path creates the ready
         # file, so a launch in a pane that cannot take input still fails fast
         # (wait_ready would otherwise poll for the whole window).
@@ -242,12 +245,14 @@ fake_session() {
     printf '%s\n' "${3:-$(date +%s)}" >"$FAKE_DIR/activity"
     : >"$FAKE_DIR/killed"
     : >"$FAKE_DIR/sent"
+    : >"$FAKE_DIR/launch"
 }
 
 fake_clear() {
     rm -f "$FAKE_DIR/session"
     : >"$FAKE_DIR/killed"
     : >"$FAKE_DIR/sent"
+    : >"$FAKE_DIR/launch"
 }
 
 fake_add_session() {
@@ -289,6 +294,10 @@ Enter: take over  Esc: back to draft'
 HOURS_PANE='Not enough hours for DeepSeek V4.1 Flash: an hour on it takes 2 hours.
 Choose another model or visit https://freebuff.com/plans.
 Enter: choose another model   Esc: back to draft'
+# The trust gate runs in the plain terminal before the TUI mounts, so this
+# pane never draws the resting prompt and the readiness wait must name it.
+TRUST_PANE='Found agent configuration in /tmp/x/repo/.worktrees/test-trust/.agents
+Load and run these? [y/N]'
 # The anti-automation refusal is a finished turn, not chrome: the sentence
 # sits above the resting prompt, so a chrome-only check reads this as idle.
 STRIKE_PANE='Freebuff did not send this message to the model. It breaks the usage policy (Scripted or automated use): it is the same message sent over and over, or automated account or site farming. It counts as strike 1 today. Strikes reset at midnight, when your daily hours refill.

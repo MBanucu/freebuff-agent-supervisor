@@ -148,6 +148,55 @@ check contains "$(cat "$WARM_WT/.supervisor.log")" \
     'ready=yes elapsed=0.0s timeout=30s poll=0.5s'
 check test -z "$(grep 'waiting-for-ready' "$WARM_WT/.supervisor.log" || true)"
 
+# ---- the trust prompt (#76) ----
+
+# A worktree with .agents/ stops Freebuff at a plain-terminal prompt before the
+# TUI mounts. The resting prompt never appears, so the old readiness wait spent
+# the whole timeout; start must name the directory and both ways to proceed on
+# the first poll, type nothing and stop the session.
+printf '%s\n' "$TRUST_PANE" >"$FAKE_DIR/pane"
+fake_clear
+if bash "$TOOL" --root "$REPO" start --issue 1020 --name test-trust \
+    --branch test/trust --title T --url U \
+    --ready-timeout 30 --ready-poll 0.5 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 1
+check contains "$(cat "$TMP/start.out")" 'trust_prompt=yes'
+check contains "$(cat "$TMP/start.out")" "$REPO/.worktrees/test-trust/.agents"
+check contains "$(cat "$TMP/start.out")" 'Answer y once'
+check contains "$(cat "$TMP/start.out")" '--trust-agents'
+check contains "$(cat "$TMP/start.out")" '--- pane lines the check read ---'
+check contains "$(cat "$TMP/start.out")" 'Load and run these?'
+check contains "$(cat "$TMP/start.out")" 'sent=no'
+check test ! -s "$FAKE_DIR/sent"
+check grep -qxF 'fb-test-trust' "$FAKE_DIR/killed"
+TRUST_WT="$REPO/.worktrees/test-trust"
+check test -d "$TRUST_WT"
+check contains "$(cat "$TRUST_WT/.supervisor.log")" \
+    'ready=trust-prompt elapsed=0.0s timeout=30s poll=0.5s'
+# The verdict lands on the first check, not after the deadline.
+check test -z "$(grep 'waiting-for-ready' "$TMP/start.out" || true)"
+# The default launch does not pre-answer the gate.
+check test -z "$(grep -F -- '--trust-agents' "$FAKE_DIR/launch" || true)"
+
+# The flag is opt-in: a pane without the prompt launches as before, and the
+# command handed to tmux carries --trust-agents only when it was asked for.
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+fake_clear
+if bash "$TOOL" --root "$REPO" start --issue 1021 --name test-trust-flag \
+    --branch test/trust-flag --title T --url U --trust-agents \
+    --ready-timeout 30 --ready-poll 0.5 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+check contains "$(cat "$TMP/start.out")" 'started=yes'
+check contains "$(cat "$FAKE_DIR/launch")" '--trust-agents'
+
+out=$(bash "$TOOL" --root "$REPO" start --issue 1022 --name test-trust-dry \
+    --branch test/trust-dry --title T --url U --dry-run)
+check contains "$out" 'trust_agents=no'
+out=$(bash "$TOOL" --root "$REPO" start --issue 1022 --name test-trust-dry \
+    --branch test/trust-dry --title T --url U --trust-agents --dry-run)
+check contains "$out" 'trust_agents=yes'
+check contains "$(bash "$TOOL" --help 2>&1)" '--trust-agents'
+
 # ---- submission proof: the Enter is not proof (#39) ----
 
 # Accepted: the composer clears and the turn is in flight. Exactly one
