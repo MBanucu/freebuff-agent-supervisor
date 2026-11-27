@@ -1,7 +1,7 @@
 # Machine-readable output
 
-`sessions --json` and `status NAME --json` emit the same data as the table and
-the `key=value` lines, for a GUI, a dashboard or a script. The human output is
+`sessions --json`, `status NAME --json` and `hours --json` emit the same data
+as the table and the `key=value` lines, for a GUI, a dashboard or a script. The human output is
 unchanged: `--json` is additive. There is no `jq` and no new dependency; the
 JSON is built in bash with a real string escaper, so a pane's tabs, newlines
 and the CR tmux leaves behind arrive as `\t`, `\n` and `\r` instead of raw
@@ -35,6 +35,17 @@ what the pane is doing.
 `session_state`, `commit`, `wake_lock`, the `result_*` keys from
 `.agent-result`, the pane tail as a `pane` string, and the classifier's
 decision as the `evidence` object documented below.
+
+`hours NAME --json` is one object with the human line's fields: `hours` is
+the `N/M` figure read from the pane, `session` the live session it came from,
+`age` the seconds since the pane last changed and `source` either `panel` or
+`footer`. A value the tool could not read is `null` and the command exits 2:
+with no live session all four are null, and a live pane that shows no figure
+has `hours` and `source` null but keeps `session` and `age`.
+
+```json
+{"hours":"10/17","session":"fb-103","age":42,"source":"footer"}
+```
 
 `status --explain` prints the classification decision line by line: the rule
 that won, the line it matched, every marker that was checked, the window's line

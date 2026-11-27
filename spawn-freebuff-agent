@@ -31,7 +31,7 @@
 #   state files and refusals:
 #     result_key, result_state, state_is_terminal, refusal_recorded,
 #     refusal_sentence, refusal_record, clear_refusal, refusal_is_hours,
-#     hours_quota, refusal_notes
+#     hours_quota, hours_panel, hours_footer, refusal_notes
 #   escaping and JSON:
 #     json_str, json_nullable_str, json_nullable_num, html_escape,
 #     json_unescape, json_scalar, state_class, action_form, stylesheet_file,
@@ -50,9 +50,9 @@
 #     gh_state_color, gh_state
 #   start:
 #     start
-#   status, list and sessions:
+#   status, list, sessions and hours:
 #     print_explanation, status, list_agents, watcher_state, live_sessions,
-#     live_session_count, finished_live, finished_live_names, sessions
+#     live_session_count, finished_live, finished_live_names, sessions, hours
 #   watch, autostop, reap and gc:
 #     reap, watch_run, watch, autostop, gc
 #   the GUI:
@@ -238,6 +238,15 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       Sessions with no worktree are listed here instead of only being
       reapable by gc --all. --json emits the same rows as an array of
       objects.
+
+  spawn-freebuff-agent hours [NAME] [--json]
+      Read the remaining Freebuff hour budget from a live pane: the welcome
+      panel's `N/M hours remaining` first, then the fraction in the footer
+      next to the model (`DeepSeek V4.1 Flash 10/17 • high`). NAME defaults
+      to any live fb-* session. The value is an observation with an age (the
+      seconds since the pane last changed), never an estimate.
+      --json      emit the same fields as one JSON object
+      Prints hours=unknown and exits 2 when no live pane can be read.
 
   spawn-freebuff-agent gui --snapshot FILE [--watch N] [--no-gh]
       Write one self-contained HTML page from `sessions --json`: one card
@@ -751,6 +760,25 @@ hours_quota() {
     # one, empty otherwise. Only a fraction on a line that mentions hours
     # counts: the model line already carries a date-like `10/17`.
     printf '%s\n' "${1-}" | grep -i 'hour' |
+        grep -oE '[0-9]+(\.[0-9]+)?/[0-9]+' | tail -n 1 || true
+}
+
+hours_panel() {
+    # hours_panel PANE -> the `N/M` from the welcome panel's
+    # `N/M hours remaining` line, empty otherwise. The phrase is required, so
+    # a fraction in a sentence about hours is not read as the budget.
+    printf '%s\n' "${1-}" |
+        grep -iE '[0-9]+(\.[0-9]+)?/[0-9]+[[:space:]]+hours?[[:space:]]+remaining' |
+        grep -oE '[0-9]+(\.[0-9]+)?/[0-9]+' | tail -n 1 || true
+}
+
+hours_footer() {
+    # hours_footer PANE -> the `N/M` the footer draws next to the model, such
+    # as `DeepSeek V4.1 Flash 10/17 • high`; empty otherwise. The fraction has
+    # to sit next to the `•` separator, so the date-like fraction elsewhere in
+    # the footer's chat title is not read as a budget.
+    printf '%s\n' "${1-}" |
+        grep -E '[0-9]+(\.[0-9]+)?/[0-9]+[[:space:]]+•' |
         grep -oE '[0-9]+(\.[0-9]+)?/[0-9]+' | tail -n 1 || true
 }
 
@@ -2516,6 +2544,74 @@ sessions() {
     fi
 }
 
+hours() {
+    # hours [NAME] [--json] -> the remaining hour budget, read from a live
+    # pane. It is an observation with an age, never an estimate: the welcome
+    # panel's `N/M hours remaining` wins over the footer fraction next to the
+    # model, and a pane that shows neither (or no live session at all) is
+    # unknown with exit 2.
+    local name="" json=0 tmux="" session="" pane="" value="" source='' age='' agedisp='-'
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json) json=1; shift ;;
+            -h|--help) usage; exit 0 ;;
+            -*) die "hours: unsupported argument: $1" ;;
+            *)
+                [ -z "$name" ] || die "hours: at most one NAME"
+                name=$1; shift
+                ;;
+        esac
+    done
+    if [ -n "$name" ]; then
+        valid_name "$name" || die "hours: invalid name"
+        session="fb-$name"
+    fi
+    tmux=$(tmux_bin 2>/dev/null || true)
+    [ -n "$session" ] || session=$(live_sessions | head -n 1)
+
+    if [ -n "$tmux" ] && [ -n "$session" ] &&
+        "$tmux" has-session -t "$session" 2>/dev/null; then
+        pane=$("$tmux" capture-pane -p -t "$session" -S "-$REFUSAL_WINDOW" 2>/dev/null || true)
+        value=$(hours_panel "$pane")
+        if [ -n "$value" ]; then
+            source=panel
+        else
+            value=$(hours_footer "$pane")
+            [ -z "$value" ] || source=footer
+        fi
+        # The age is the time since tmux last saw activity, the last moment
+        # the pane could have changed: the reading is at least that old. A
+        # session that cannot report its activity has no age, not a zero.
+        age=$(idle_seconds "${session#fb-}" 2>/dev/null || true)
+        [ -z "$age" ] || agedisp="${age}s"
+        if [ -z "$value" ]; then
+            if [ "$json" = 1 ]; then
+                printf '{"hours":null,"session":%s,"age":%s,"source":null}\n' \
+                    "$(json_nullable_str "$session")" "$(json_nullable_num "$age")"
+            else
+                note "hours=unknown session=$session age=$agedisp source=none"
+            fi
+            exit 2
+        fi
+        if [ "$json" = 1 ]; then
+            printf '{"hours":%s,"session":%s,"age":%s,"source":%s}\n' \
+                "$(json_str "$value")" "$(json_str "$session")" \
+                "$(json_nullable_num "$age")" "$(json_str "$source")"
+        else
+            note "hours=$value session=$session age=$agedisp source=$source"
+        fi
+        return 0
+    fi
+
+    # No live pane: the tool cannot invent a number it has not read.
+    if [ "$json" = 1 ]; then
+        printf '{"hours":null,"session":null,"age":null,"source":null}\n'
+    else
+        note 'hours=unknown'
+    fi
+    exit 2
+}
+
 # ---- watch, autostop, reap and gc ----
 # The lifecycle: follow a run, stop what has finished or gone quiet, and record
 # the evidence the review needs.
@@ -3205,6 +3301,7 @@ case "$cmd" in
     status) status "$@" ;;
     list|ls) list_agents "$@" ;;
     sessions|ps) sessions "$@" ;;
+    hours) hours "$@" ;;
     gui) gui "$@" ;;
     attach) attach "$@" ;;
     send) send "$@" ;;
