@@ -18,7 +18,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # Full history: the artifact rule below diffs against the base branch's
+      # merge base, which a depth-1 clone does not have.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       # The suite never launches Freebuff, but `start` resolves the binary
       # before it reaches the launch gate, so a stub keeps that path honest
@@ -34,6 +38,16 @@ jobs:
       # ship code the suite never built, so the build is checked before it runs.
       - name: Check the artifact is what src/ builds
         run: ./build.sh --check
+
+      # A stale artifact reads as "run ./build.sh", which is the wrong fix when
+      # the edit was made in the artifact itself. This says which part the edit
+      # belongs in (#140).
+      - name: Artifact edits come with a src/ part
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags origin \
+            "+refs/heads/$GITHUB_BASE_REF:refs/remotes/origin/$GITHUB_BASE_REF"
+          ./build.sh --edited "origin/$GITHUB_BASE_REF"
 
       - name: Run the deviceless suite
         run: ./spawn-freebuff-agent-test.sh
