@@ -35,8 +35,12 @@ Run both suites before you commit:
 - Each prints one `ok N checks` line and exits 0; a failure prints
   `FAIL <area>:<line> <command>`.
 - The check counts must not drop. A pure move keeps the count identical; an
-  issue that adds coverage says the new count in its PR. At the time of
-  writing the baselines are `ok 517 checks` and `ok 107 gui checks`.
+  issue that adds coverage says the new count in its PR. There is no number in
+  this file to compare against: the suite grows with every area that lands, so a
+  literal here is wrong within a week. Read the count `main` last answered with
+  from CI (`gh run view --log | grep 'ok .* checks'` on the newest green run of
+  the `deviceless` and `gui` workflows) and treat that as the baseline for your
+  branch.
 - `gui-test.sh` skips with exit 0 when `python3` or `curl` is missing. If it
   skipped for you, say so in the PR instead of reporting a gui pass.
 - Add a check in the area file that owns the topic. Only add a new area file
