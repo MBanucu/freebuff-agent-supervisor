@@ -8,6 +8,7 @@ start() {
     local ready_timeout="$READY_TIMEOUT" ready_poll="$READY_POLL"
     local submit_timeout="$SUBMIT_TIMEOUT" trust_agents=0
     local prompt_text="" sent brief_hash_value jitter_max jitter=0
+    local launch_jitter_max=0 launch_jitter=0 live_before=0 launch_slots=0
     local model_want="" model_key_set=""
     local ready_rc=0 submit_rc=0 pane refusal="" title_before trust_dir
     while [ $# -gt 0 ]; do
@@ -102,6 +103,21 @@ start() {
     sent=$(compose_brief "$name" "$branch" "$wt" "$issue" "$prompt_text")
     brief_hash_value=$(brief_hash "$sent")
     jitter_max=$(brief_jitter_max "$max_sessions")
+    # A launch can race another client's boot, not only a send (#138): two
+    # cold clients started in the same second left the second pane drawn and
+    # its tty canonical until the readiness gate gave up. The send already
+    # jitters by --max-sessions, so the launch gets the same bound, but only
+    # while a live session has not proven its own submission yet. A session
+    # that has been running for hours is not racing this one and delays
+    # nothing.
+    live_before=$(booting_session_count)
+    launch_slots=$max_sessions
+    if [ "$live_before" -gt "$launch_slots" ]; then
+        launch_slots=$((live_before + 1))
+    fi
+    if [ "$live_before" -gt 0 ]; then
+        launch_jitter_max=$(brief_jitter_max "$launch_slots")
+    fi
 
     if [ -z "$title" ] || [ -z "$url" ]; then
         if [ -n "$slug" ] && command -v "${GH_BIN:-gh}" >/dev/null 2>&1; then
@@ -127,6 +143,8 @@ start() {
         note "brief_hash=$brief_hash_value"
         note "brief_chars=${#sent}"
         [ "$jitter_max" = 0 ] || note "jitter_max=${jitter_max}s"
+        [ "$launch_jitter_max" = 0 ] ||
+            note "launch_jitter_max=${launch_jitter_max}s booting=$live_before"
         note "ready_timeout=${ready_timeout}s ready_poll=${ready_poll}s"
         note "trust_agents=$([ "$trust_agents" = 1 ] && printf yes || printf no)"
         if [ -n "$model_want" ]; then
@@ -245,6 +263,16 @@ start() {
     else
         printf -v cmd 'TERM=xterm-256color %q --cwd %q' "$fb" "$wt"
     fi
+    # Stagger the launch itself, not only the send: a second client that
+    # reaches tmux in the same second as a booting one is the case #138
+    # stopped on, and a retry succeeding seconds later is the proof it is a
+    # race. The bound is the one the send uses, and the line is recorded so a
+    # launch that then times out shows the delay it already paid.
+    if [ "$launch_jitter_max" -gt 0 ]; then
+        launch_jitter=$((RANDOM % (launch_jitter_max + 1)))
+        ready_note "$wt" "launch_delay=${launch_jitter}s max=${launch_jitter_max}s booting=$live_before"
+        sleep "$launch_jitter"
+    fi
     "$tmux" new-session -d -s "$session" -x "$COLS" -y "$ROWS" -c "$wt" "$cmd"
 
     wait_ready "$tmux" "$session" "$wt" "$ready_timeout" "$ready_poll" || ready_rc=$?
@@ -286,8 +314,14 @@ start() {
         die "start: Freebuff stopped at its trust prompt for $trust_dir in $session: it loads repository-supplied .agents files and mcp.json only after that directory is trusted. Answer y once in an interactive launch in $wt (freebuff --cwd $wt), or rerun start with --trust-agents to load it without asking. No key was typed; stopped it, worktree kept ($wt)."
     fi
     if [ "$ready_rc" -ne 0 ]; then
+        pane=$("$tmux" capture-pane -p -t "$session" -S -15 2>/dev/null || true)
         printf '%s\n' '--- last pane lines ---'
-        "$tmux" capture-pane -p -t "$session" -S -15 2>/dev/null || true
+        printf '%s\n' "$pane"
+        # The session is stopped below, so this frame is the last evidence of
+        # why it never took input. Record it, with the stty reading in the
+        # timeout lines, so the next occurrence is diagnosable after the
+        # terminal is gone (#138; the first two left nothing in the log).
+        ready_pane_dump "$wt" "$pane"
         # A pane that never reached raw input can never accept the brief, so it
         # is dead weight. Kill only the session; the worktree and branch stay.
         "$tmux" kill-session -t "$session" 2>/dev/null || true
@@ -307,9 +341,17 @@ start() {
                 ready_note "$wt" "ready=no reason=no-session elapsed=${READY_ELAPSED}s timeout=${ready_timeout}s poll=${ready_poll}s session=$session"
                 die "start: session $session disappeared before it reached raw input after ${READY_ELAPSED}s; stopped it, worktree kept ($wt)."
                 ;;
+            canonical-drawn)
+                # The pane is drawn and its tty never went raw: a brief typed
+                # here is line-buffered, not submitted, and the deadline is
+                # not the problem. Name the race and the retry instead of
+                # sending the operator back to --ready-timeout.
+                ready_note "$wt" "ready=timeout reason=canonical-drawn elapsed=${READY_ELAPSED}s timeout=${ready_timeout}s poll=${ready_poll}s session=$session tty=$READY_TTY stty_out=$READY_STTY_OUT retry=safe"
+                die "start: the TUI is drawn in $session but its tty never left canonical mode after ${READY_ELAPSED}s (tty=$READY_TTY, stty: $READY_STTY_OUT): the resting prompt is on screen, yet a brief typed there would be line-buffered rather than submitted. A client that came up while another one was booting is the usual cause — every launch shares one account and its admission lock, and a retry seconds later usually clears it — and a larger --ready-timeout cannot fix a pane that is already drawn. Nothing was typed and the worktree is kept ($wt); retry=safe: launch the same issue under another --name, or remove that worktree and branch first."
+                ;;
             *)
-                ready_note "$wt" "ready=timeout elapsed=${READY_ELAPSED}s timeout=${ready_timeout}s poll=${ready_poll}s session=$session"
-                die "start: TUI did not reach raw input in $session after ${READY_ELAPSED}s (--ready-timeout $ready_timeout, --ready-poll $ready_poll); stopped it, worktree kept ($wt). A cold first launch can need a larger --ready-timeout."
+                ready_note "$wt" "ready=timeout elapsed=${READY_ELAPSED}s timeout=${ready_timeout}s poll=${ready_poll}s session=$session tty=${READY_TTY:-none} stty_out=${READY_STTY_OUT:-none} retry=safe"
+                die "start: TUI did not reach raw input in $session after ${READY_ELAPSED}s (--ready-timeout $ready_timeout, --ready-poll $ready_poll); stopped it, worktree kept ($wt). A cold first launch can need a larger --ready-timeout. Nothing was typed, so retry=safe: launch the same issue under another --name, or remove the kept worktree and branch first."
                 ;;
         esac
     fi

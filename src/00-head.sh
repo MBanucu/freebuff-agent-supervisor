@@ -46,7 +46,8 @@
 #     concord_evidence, emit_evidence, classify_state, session_state,
 #     session_activity, idle_seconds
 #   the brief:
-#     write_task, ready_polls, ready_elapsed, ready_note, wait_ready,
+#     write_task, ready_polls, ready_elapsed, ready_note, ready_pane_dump,
+#     wait_ready,
 #     composer_line, chat_title, composer_cleared, turn_began,
 #     await_submission, brief_hash, brief_ledger_file, brief_ledger_seen,
 #     brief_ledger_trim, brief_ledger_record, brief_ledger_mark_refused,
@@ -63,8 +64,8 @@
 #     start
 #   status, list, sessions, hours and models:
 #     print_explanation, launch_branch, worktree_branch, status, list_agents,
-#     watcher_state, live_sessions, live_session_count, finished_live,
-#     finished_live_names, sessions, hours, models
+#     watcher_state, live_sessions, live_session_count, booting_session_count,
+#     finished_live, finished_live_names, sessions, hours, models
 #   watch, autostop, notify, reap and gc:
 #     reap, watch_run, watch, autostop, notify, gc
 #   the GUI:

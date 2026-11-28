@@ -205,8 +205,9 @@ run when upgrading Freebuff.
 branch. The agent works there; `stop`, autostop and `gc` only kill its
 `fb-<name>` tmux session and leave the worktree and branch in place. It also
 holds the run evidence: `.supervisor.log` (readiness, submission, stop and
-autostop transitions), `.turn-log-cursor` (where `notify` has read the
-client's turn log to), and when applicable `.refusal` and `.agent-result`.
+autostop transitions, and the `pane|` lines a readiness timeout read),
+`.turn-log-cursor` (where `notify` has read the client's turn log to), and
+when applicable `.refusal` and `.agent-result`.
 The directory is ignored by `.gitignore`; review happens through the branch
 and PR, not by committing the worktree.
 

@@ -71,6 +71,21 @@ ready_note() {
     printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >>"$wt/.supervisor.log"
 }
 
+ready_pane_dump() {
+    # ready_pane_dump WORKTREE PANE -> the pane lines in .supervisor.log, one
+    # prefixed line each. A launch that times out stops the session it read
+    # them from, so this is the only copy of what the TUI was showing (#138).
+    # The prefix keeps a frame distinct from the transitions around it, and a
+    # blank line inside the frame stays one log line.
+    local wt="$1" line stamp
+    [ -d "$wt" ] || return 0
+    [ -n "${2-}" ] || return 0
+    stamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    printf '%s\n' "${2%$'\n'}" | while IFS= read -r line; do
+        printf '%s pane| %s\n' "$stamp" "$line" >>"$wt/.supervisor.log"
+    done
+}
+
 wait_ready() {
     # wait_ready TMUX SESSION WORKTREE TIMEOUT POLL -> 0 ready, 2 refused,
     # 3 trust prompt, 1 did not become ready. A refusal is checked first: the
@@ -89,6 +104,10 @@ wait_ready() {
     # in READY_REASON and the evidence in READY_ELAPSED/READY_TTY/READY_STTY/
     # READY_ERROR. A cool-down is not a hard failure: a tty that reports
     # canonical mode, or a raw pane without the resting prompt, keeps polling.
+    # A deadline that expires with the resting prompt already drawn reports
+    # reason=canonical-drawn instead of a plain timeout: the TUI is up and its
+    # pty never went raw, so the frame is in READY_DRAWN and the last reading
+    # in READY_STTY_OUT, which is a late client rather than a cold start.
     local tmux="$1" session="$2" wt="$3" timeout="$4" poll="$5"
     local polls i=0 tty pane stty out rc fails=0 no_tty=0
     polls=$(ready_polls "$timeout" "$poll")
@@ -98,6 +117,8 @@ wait_ready() {
     READY_STTY=''
     READY_TTY=''
     READY_ERROR=''
+    READY_STTY_OUT=''
+    READY_DRAWN=0
     while :; do
         if ! "$tmux" has-session -t "$session" 2>/dev/null; then
             READY_ELAPSED=$(ready_elapsed "$i" "$poll")
@@ -141,6 +162,11 @@ wait_ready() {
                 READY_STTY=${stty:-stty}
                 READY_TTY=$tty
                 READY_ERROR=${out//$'\n'/ }
+                # This check did not read the mode, so it cannot call the
+                # frame canonical: the timeout line names that instead of an
+                # older reading that may no longer hold.
+                READY_STTY_OUT=''
+                READY_DRAWN=0
                 if [ "$fails" -ge "$READY_FAILS" ]; then
                     READY_ELAPSED=$(ready_elapsed "$i" "$poll")
                     READY_REASON=stty
@@ -148,8 +174,18 @@ wait_ready() {
                 fi
             else
                 fails=0
+                READY_TTY=$tty
+                READY_STTY_OUT=${out//$'\n'/ }
+                # A resting prompt on a canonical tty is the #138 timeout: the
+                # TUI is drawn and no keystroke can be accepted, so a longer
+                # --ready-timeout buys nothing. Remember the last frame drawn.
+                if printf '%s' "$pane" | grep -q 'Enter a coding task'; then
+                    READY_DRAWN=1
+                else
+                    READY_DRAWN=0
+                fi
                 if printf '%s' "$out" | grep -q -- '-icanon' &&
-                    printf '%s' "$pane" | grep -q 'Enter a coding task'; then
+                    [ "$READY_DRAWN" = 1 ]; then
                     READY_ELAPSED=$(ready_elapsed "$i" "$poll")
                     ready_note "$wt" "ready=yes elapsed=${READY_ELAPSED}s timeout=${timeout}s poll=${poll}s"
                     return 0
@@ -159,7 +195,11 @@ wait_ready() {
         i=$((i + 1))
         if [ "$i" -ge "$polls" ]; then
             READY_ELAPSED=$(ready_elapsed "$i" "$poll")
-            READY_REASON=timeout
+            if [ "$READY_DRAWN" = 1 ]; then
+                READY_REASON=canonical-drawn
+            else
+                READY_REASON=timeout
+            fi
             return 1
         fi
         if [ $((i % READY_NOTE_POLLS)) -eq 0 ]; then

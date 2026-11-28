@@ -131,7 +131,45 @@ check grep -qxF 'fb-test-hung' "$FAKE_DIR/killed"
 HUNG_WT="$REPO/.worktrees/test-hung"
 check contains "$(cat "$HUNG_WT/.supervisor.log")" \
     'ready=timeout elapsed=5.0s timeout=5s poll=0.5s'
+# The session is gone after the timeout, so the frame it drew is kept in the
+# log with the stty reading and the retry hint (#138).
+check contains "$(cat "$HUNG_WT/.supervisor.log")" 'pane| thinking...'
+check contains "$(cat "$HUNG_WT/.supervisor.log")" 'stty_out='
+check contains "$(cat "$HUNG_WT/.supervisor.log")" 'retry=safe'
 check test -d "$HUNG_WT"
+
+# ---- a drawn pane on a canonical tty is not a cold start (#138) ----
+
+# The second client of a back-to-back launch drew its resting prompt while its
+# pty stayed in canonical mode. The deadline is not the fault, so the failure
+# names canonical-drawn, keeps the stty reading and the frame, and offers the
+# retry instead of pointing at --ready-timeout.
+printf '100000\n' >"$FAKE_DIR/raw_after"
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+fake_clear
+: >"$FAKE_DIR/sent"
+if bash "$TOOL" --root "$REPO" start --issue 1023 --name test-canonical \
+    --branch test/canonical --title T --url U \
+    --ready-timeout 5 --ready-poll 0.5 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 1
+check contains "$(cat "$TMP/start.out")" 'ready=timeout reason=canonical-drawn'
+check contains "$(cat "$TMP/start.out")" 'retry=safe'
+check contains "$(cat "$TMP/start.out")" 'never left canonical mode'
+check test -z "$(grep 'did not reach raw input' "$TMP/start.out" || true)"
+check contains "$(cat "$TMP/start.out")" '--- last pane lines ---'
+check contains "$(cat "$TMP/start.out")" 'Enter a coding task'
+check test ! -s "$FAKE_DIR/sent"
+check grep -qxF 'fb-test-canonical' "$FAKE_DIR/killed"
+CANON_WT="$REPO/.worktrees/test-canonical"
+check contains "$(cat "$CANON_WT/.supervisor.log")" \
+    'ready=timeout reason=canonical-drawn elapsed=5.0s timeout=5s poll=0.5s'
+check contains "$(cat "$CANON_WT/.supervisor.log")" \
+    'stty_out=speed 38400 baud; line = 0; icanon echo'
+check contains "$(cat "$CANON_WT/.supervisor.log")" 'pane| │  ▍Enter a coding task'
+check contains "$(cat "$CANON_WT/.supervisor.log")" 'retry=safe'
+check test -d "$CANON_WT"
+rm -f "$FAKE_DIR/raw_after"
+fake_clear
 
 # A warm pane is ready on the first check: no poll is paid and the log has no
 # waiting line, only the outcome.
@@ -147,6 +185,40 @@ WARM_WT="$REPO/.worktrees/test-warm"
 check contains "$(cat "$WARM_WT/.supervisor.log")" \
     'ready=yes elapsed=0.0s timeout=30s poll=0.5s'
 check test -z "$(grep 'waiting-for-ready' "$WARM_WT/.supervisor.log" || true)"
+
+# ---- launches are staggered while another client boots (#138) ----
+
+# The send jitter does not help a launch that reaches tmux in the same second
+# as a booting client. A live session with no proven submission is booting, so
+# the launch pays a delay before tmux starts; the dry run names the bound.
+fake_session test-booting "$IDLE_PANE"
+out=$(bash "$TOOL" --root "$REPO" start --issue 1024 --name test-stagger-dry \
+    --branch test/stagger-dry --title T --url U --dry-run)
+check contains "$out" 'launch_jitter_max=4s booting=1'
+check test ! -e "$REPO/.worktrees/test-stagger-dry"
+
+# A session that already proved its submission is not booting, so it delays
+# nothing: only a cold client races this launch.
+fake_session test-warm "$IDLE_PANE"
+out=$(bash "$TOOL" --root "$REPO" start --issue 1025 --name test-quiet-dry \
+    --branch test/quiet-dry --title T --url U --dry-run)
+check test -z "$(printf '%s\n' "$out" | grep 'launch_jitter_max' || true)"
+
+# The delay is paid, not only planned: the launch records it and still
+# reaches the send. FREEBUFF_START_JITTER keeps the wait at most one second.
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane"
+fake_session test-booting "$IDLE_PANE"
+: >"$FAKE_DIR/ready"
+: >"$FAKE_DIR/sent"
+if FREEBUFF_START_JITTER=1 bash "$TOOL" --root "$REPO" start --issue 1026 \
+    --name test-stagger --branch test/stagger --title T --url U \
+    --ready-timeout 30 --ready-poll 0.5 >"$TMP/start.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+check contains "$(cat "$TMP/start.out")" 'started=yes'
+check contains "$(cat "$TMP/start.out")" 'launch_delay='
+check grep -qE 'launch_delay=[01]s max=1s booting=1' \
+    "$REPO/.worktrees/test-stagger/.supervisor.log"
+fake_clear
 
 # ---- the trust prompt (#76) ----
 
