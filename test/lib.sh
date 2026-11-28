@@ -76,7 +76,10 @@ check() {
 
 contains() {
     # contains <text> <needle>
-    printf '%s' "$1" | grep -qF -- "$2"
+    # A here-string, not `printf | grep -q`: grep -q exits at the match, and
+    # under `pipefail` the writer's SIGPIPE on a large text (the usage block)
+    # made the same check pass or fail depending on scheduling.
+    grep -qF -- "$2" <<<"$1"
 }
 
 json_ok() {

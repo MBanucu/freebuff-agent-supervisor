@@ -341,6 +341,8 @@ spawn-freebuff-agent send 103-example -- "-a line that starts with a dash"
 spawn-freebuff-agent watch 103-example --idle-seconds 120 --poll 5
 spawn-freebuff-agent autostop 103-example
 spawn-freebuff-agent notify 103-example
+spawn-freebuff-agent monitor --once      # one scan, for cron
+spawn-freebuff-agent monitor             # follow every live session
 spawn-freebuff-agent stop 103-example            # hard kill
 spawn-freebuff-agent stop 103-example --graceful # end the turn first
 spawn-freebuff-agent gc --dry-run
@@ -354,6 +356,30 @@ file says `blocked` and `4` when it says `failed`. It never stops anything.
 `autostop` is `watch` followed by a stop and an evidence record; a `done`,
 `blocked` or `failed` result is stopped and the exit status is watch's (0, 3
 or 4). `start --auto-stop` runs it detached.
+
+`monitor` follows every live `fb-*` session at once and records what changes,
+not what is steady: each scan classifies each session with the same state
+function `status` uses and appends one line to `.state-monitor.jsonl` in the
+repository root, mode `0600`,
+`{ts,name,state,prev,rule,fingerprint,stuck_seconds}`. It prints one line per
+transition (`ts=… name=… state=… prev=… rule=…`) and nothing while a session
+holds its state, so its output is the history rather than a heartbeat. The
+fingerprint is the window hash behind the verdict, or the state and rule when
+a file gave it, so two records can say whether the same pane produced the
+same state. A scan reads each pane once (aside from the classifier's own
+unknown rescan), and the ledger is the monitor's only memory, so a cron
+`--once` and a long `--interval` loop see the same past. It reports two
+conditions beyond the raw state: `stuck`, a
+non-terminal state held past `--stuck-after` (default 1800s), flagged once
+per run of that state; and `flapping`, more than three transitions within ten
+minutes, which usually means the pane markers disagree rather than the agent
+being busy, and is reported once at the crossing. `--once` runs a single scan
+and never sleeps; without it the monitor polls every `--interval` seconds
+(default 10). It never sends, stops or waits. `--fail-on unknown` makes the
+exit status `3` when a session is unclassified, for CI. The ledger is rotated
+to `.1` at `--ledger-max-bytes` (default 1 MB), and each record is one short
+append, so two monitors on one ledger interleave whole lines and never a
+truncated one.
 
 `list` prints the branch, session, running flag, live state and idle time.
 `status` prints the result state, the autostop `watcher`, `session_state`, idle
@@ -531,11 +557,13 @@ policy](docs/vendor-policy.md).
 
 - The tool writes only under `.worktrees/` in the target repository, plus
   `.supervisor-briefs.jsonl` in its root (the last 20 sent-brief hashes, plus
-  any refused hash), `.supervisor-hours` (one line per account-usage reading)
-  and `.git/info/exclude` entries for `.worktrees/`, `.task.md`,
-  `.agent-result`, `.supervisor.log`, `.supervisor-briefs.jsonl`,
-  `.supervisor-hours` and `local.properties`. A refusal also writes
-  `.worktrees/<name>/.refusal`, which `stop` removes.
+  any refused hash), `.supervisor-hours` (one line per account-usage reading),
+  `.state-monitor.jsonl` when `monitor` runs (one line per state transition,
+  rotated to `.state-monitor.jsonl.1`) and `.git/info/exclude` entries for
+  `.worktrees/`, `.task.md`, `.agent-result`, `.supervisor.log`,
+  `.supervisor-briefs.jsonl`, `.supervisor-hours`, `.state-monitor.jsonl` and
+  `local.properties`. A refusal also writes `.worktrees/<name>/.refusal`,
+  which `stop` removes.
 - A running agent uses its normal shell approvals. Do not attach and type while
   it is working; use `send` for a deliberate follow-up.
 - Auto-stop and `gc` only kill `fb-<name>`, after appending the pane tail,

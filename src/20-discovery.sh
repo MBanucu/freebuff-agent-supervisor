@@ -85,7 +85,7 @@ ensure_excludes() {
     # reported dirty and cannot commit the export (#154).
     for entry in '.worktrees/' '.task.md' 'local.properties' "$RESULT_FILE" \
         '.supervisor.log' "$GH_STATE_FILE" "$BRIEF_LEDGER" "$HOURS_LEDGER" \
-        '.concord/'; do
+        '.concord/' "$STATE_LEDGER"; do
         grep -qxF "$entry" "$file" 2>/dev/null || printf '%s\n' "$entry" >>"$file"
     done
 }
