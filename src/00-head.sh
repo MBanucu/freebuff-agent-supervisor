@@ -48,10 +48,12 @@
 #     await_submission, brief_hash, brief_ledger_file, brief_ledger_seen,
 #     brief_ledger_trim, brief_ledger_record, brief_ledger_mark_refused,
 #     refuse_sent_brief, compose_brief, brief_jitter_max
-#   the model picker:
+#   the model picker and the key it writes:
 #     model_norm, picker_frame, picker_entries, picker_names, picker_selected,
 #     picker_price, model_hours_cost, model_state, model_footer, model_resolve,
-#     picker_wait, model_choose
+#     picker_wait, model_choose, model_settings_path, model_lock_dir,
+#     model_key_value, model_key_snapshot, model_key_write, model_key_drop,
+#     model_lock_acquire, model_lock_release, model_key_take, model_key_put_back
 #   the issue mirror:
 #     gh_state_color, gh_state
 #   start:

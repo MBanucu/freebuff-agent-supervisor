@@ -26,6 +26,7 @@ PARTS=(
     70-evidence.sh
     75-brief.sh
     78-picker.sh
+    79-model-key.sh
     80-mirror.sh
     85-start.sh
     88-views.sh

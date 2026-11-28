@@ -314,17 +314,3 @@ model_choose() {
     return 1
 }
 
-brief_jitter_max() {
-    # brief_jitter_max MAX_SESSIONS -> upper bound for the random delay before
-    # a send. Only a pool of several slots is paced: one slot cannot fire two
-    # starts at once. FREEBUFF_START_JITTER overrides it, 0 disables the wait.
-    local max=$1 bound
-    [ "${max:-0}" -gt 1 ] || {
-        printf '0'
-        return 0
-    }
-    bound=${FREEBUFF_START_JITTER:-$((max * 2))}
-    is_num "$bound" || bound=0
-    printf '%s' "$bound"
-}
-
