@@ -129,6 +129,19 @@ check grep -qxF '.worktrees/' "$REPO/.git/info/exclude"
 check grep -qxF '.agent-result' "$REPO/.git/info/exclude"
 check grep -qxF '.supervisor.log' "$REPO/.git/info/exclude"
 check grep -qxF '.supervisor-hours' "$REPO/.git/info/exclude"
+# Concord's export is local coordination state, excluded the same way (#154)
+check grep -qxF '.concord/' "$REPO/.git/info/exclude"
+
+# A worktree that used its work-state tools carries .concord/WORK_STATE.json.
+# It must not make the run read as dirty, while a real edit still does.
+mkdir -p "$WT/.concord"
+printf '{"tasks":[]}\n' >"$WT/.concord/WORK_STATE.json"
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-999)
+check contains "$out" '"dirty": false'
+printf 'x\n' >"$WT/untracked-edit.txt"
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-999)
+check contains "$out" '"dirty": true'
+rm -f "$WT/untracked-edit.txt"
 
 # The JSON section reads the last recorded watcher: seed a dead pid so it
 # is deterministic when this area runs alone.
