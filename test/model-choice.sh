@@ -213,6 +213,18 @@ check contains "$(cat "$TMP/models.json")" '"count": 3'
 check contains "$(cat "$TMP/models.json")" '"hours": "free"'
 check contains "$(cat "$TMP/models.json")" '"price": "2x · May use data for AI training"'
 
+# --free is the shortlist a launch picks from when hours are short: only the
+# entries whose price line carries no hour multiplier (#136).
+printf '%s\n' "$IDLE_PANE" >"$FAKE_DIR/pane_after_escape"
+if bash "$TOOL" --root "$REPO" models test-999 --free >"$TMP/models.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+out=$(cat "$TMP/models.out")
+check contains "$out" 'model=DeepSeek V4.1 Flash Fast hours=free'
+check test -z "$(printf '%s\n' "$out" | grep 'hours=2x' || true)"
+check test -z "$(printf '%s\n' "$out" | grep 'hours=paid' || true)"
+check contains "$out" 'models=1 session=fb-test-999'
+check contains "$(bash "$TOOL" --help 2>&1)" '--free'
+
 # A turn in flight, and a session with no picker to read, get no keys at all.
 fake_session test-999 "$BUSY_PANE"
 if bash "$TOOL" --root "$REPO" models >"$TMP/models.out" 2>&1; then rc=0; else rc=$?; fi

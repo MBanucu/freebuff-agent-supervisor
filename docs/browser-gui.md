@@ -4,11 +4,13 @@
 
 `gui --snapshot FILE [--watch N]` writes one self-contained HTML page from
 `sessions --json`: one card per session with name, state, idle time (only while
-the session can still take a turn), watcher, worktree, result, branch, PR, and
+the session can still take a turn), watcher, worktree, result, branch, the
+model it was launched with and its cost class (`free`, `2x`, ...), PR, and
 — for a session with a worktree — the
 commit and the result file's `tests` line. A done session is green, a working
 one amber, a failed or refused one red, and a session with no worktree carries
-a `no worktree` tag.
+a `no worktree` tag. A run that chose no model has no model row, so `free` and
+`2x` sessions are told apart at a glance without grepping a log.
 
 ```bash
 spawn-freebuff-agent gui --snapshot ${TMPDIR:-/tmp}/agents.html

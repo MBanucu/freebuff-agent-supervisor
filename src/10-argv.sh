@@ -213,7 +213,9 @@ Spawn parallel Freebuff agents in isolated git worktrees.
   spawn-freebuff-agent status NAME [--lines N] [--no-gh] [--json] [--explain]
                               [--source pane|log|auto] [--window N]
       Show the session, input mode, result state, pane tail, branch, last
-      commit and PR. hours=N/M is this run's reading of the account usage;
+      commit and PR. model=<name> hours=<free|Nx|paid|daily> is the model
+      the run was launched with, absent when it chose none. hours=N/M is
+      this run's reading of the account usage;
       when the pane carries none, the last ledger line is shown with its age
       (hours=N/M age=47m), and no history at all is hours=-.
       --lines N   pane lines to show (default: 25)
@@ -236,12 +238,13 @@ Spawn parallel Freebuff agents in isolated git worktrees.
   spawn-freebuff-agent sessions [--no-gh] [--json]
       One table over every fb-* session and every worktree: live state, idle
       time, attached autostop watcher, whether a worktree exists, the result
-      state, the branch, the open PR, the wake lock recorded at start and the
-      last account hours reading (N/M for a live read, N/M age=47m for the
-      .supervisor-hours ledger, - when there is neither).
+      state, the branch, the open PR, the model the run was launched with
+      (`Name (free)`, `Name (2x)` or -), the wake lock recorded at start and
+      the last account hours reading (N/M for a live read, N/M age=47m for
+      the .supervisor-hours ledger, - when there is neither).
       Sessions with no worktree are listed here instead of only being
       reapable by plain gc. --json emits the same rows as an array of
-      objects.
+      objects, with the model as its own object ({name, hours}).
 
   spawn-freebuff-agent hours [NAME] [--json]
       Read the remaining Freebuff hour budget from a live pane: the welcome
@@ -252,7 +255,7 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       --json      emit the same fields as one JSON object
       Prints hours=unknown and exits 2 when no live pane can be read.
 
-  spawn-freebuff-agent models [NAME] [--json]
+  spawn-freebuff-agent models [NAME] [--free] [--json]
       List the models the client offers, read from a live session's /model
       picker: one `model=<name> hours=<free|2x|paid|daily>` line each, where
       `free` means the entry carries no hour multiplier, so a session on it
@@ -263,12 +266,16 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       submitted, so listing spends no hours. NAME defaults to any live fb-*
       session. Prints model=none and exits 1 when there is no live session,
       and refuses to type into a working or refused one.
+      --free      only the entries that carry no hour multiplier: the list a
+                  launch should pick from when the account's hours are short
       --json      emit the same rows as one JSON object
 
   spawn-freebuff-agent gui --snapshot FILE [--watch N] [--no-gh]
       Write one self-contained HTML page from `sessions --json`: one card
-      per session with done-versus-working visible at a glance. No server,
-      no script, no external assets, so it opens from file:// offline.
+      per session with done-versus-working visible at a glance and the model
+      it was launched with, with its cost class, beside the hours reading.
+      No server, no script, no external assets, so it opens from file://
+      offline.
       --watch N   rewrite the file every N seconds (adds a meta refresh)
       --no-gh     do not ask gh for the PR
 
@@ -374,9 +381,10 @@ Notes:
     types /model, moves the `›` marker with the arrow keys the frame prints,
     and presses Enter only once that marker sits on the chosen name. The
     footer must then name the model, or the launch fails with no brief sent
-    and the session stopped. The switch writes the client's global model
-    setting, so two launches that want different models must not run at the
-    same moment.
+    and the session stopped. The choice and its cost class are recorded in
+    .supervisor.log, and status, sessions and the GUI card report them. The
+    switch writes the client's global model setting, so two launches that
+    want different models must not run at the same moment.
   - A ready pane can still swallow the Enter. After typing, start waits for
     the input line to clear and for the turn to begin (or the chat title to
     change) and prints sent=yes with the signal that proved it. A send that

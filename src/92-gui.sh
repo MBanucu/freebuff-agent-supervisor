@@ -15,6 +15,7 @@ snapshot_html() {
     local file="$1" json="$2" watch="$3" link_prefix=${4:-} note_text=${5:-}
     local form_nonce=${6:-} flash_text=${7:-}
     local line key value name state idle watcher worktree result branch pr
+    local model_name model_hours in_model=0
     local tests="" commit="" wt generated total=0 live=0 trees=0 cards='' card
     local cls pr_html refresh='' css_file
     css_file=$(stylesheet_file)
@@ -29,7 +30,7 @@ snapshot_html() {
         case "$line" in
             '  {'*)
                 name='' state='' idle='' watcher='' worktree='' result=''
-                branch='' pr=''
+                branch='' pr='' model_name='' model_hours='' in_model=0
                 continue
                 ;;
             '  }'*)
@@ -65,6 +66,13 @@ snapshot_html() {
                 card+="<dt>worktree</dt><dd>$(html_escape "$worktree")</dd>"$'\n'
                 card+="<dt>result</dt><dd>$(html_escape "${result:--}")</dd>"$'\n'
                 card+="<dt>branch</dt><dd><code>$(html_escape "${branch:--}")</code></dd>"$'\n'
+                # The model and its cost class are one row, so `free` and
+                # `2x` are visible at a glance next to the hours reading (#136).
+                if [ -n "$model_name" ]; then
+                    card+="<dt>model</dt><dd>$(html_escape "$model_name")"
+                    card+=" <span class=\"tag\">"
+                    card+="$(html_escape "$model_hours")</span></dd>"$'\n'
+                fi
                 # A terminal link exists only for a served page with ttyd
                 # behind it, and only for a name the tool accepts.
                 if [ -n "$link_prefix" ] && [ "$worktree" = yes ] &&
@@ -111,6 +119,31 @@ snapshot_html() {
                 fi
                 card+='</article>'$'\n'
                 cards+=$card
+                continue
+                ;;
+            '    "model": {'*)
+                in_model=1
+                continue
+                ;;
+            # The model object is the only nested one the card reads; its
+            # closing brace ends the read so the account hours object below it
+            # is not mistaken for the model's own hours.
+            '    }'*)
+                in_model=0
+                continue
+                ;;
+            '      "name": '*)
+                [ "$in_model" = 1 ] || continue
+                value=${line#*: }
+                value=${value%,}
+                model_name=$(json_scalar "$value")
+                continue
+                ;;
+            '      "hours": '*)
+                [ "$in_model" = 1 ] || continue
+                value=${line#*: }
+                value=${value%,}
+                model_hours=$(json_scalar "$value")
                 continue
                 ;;
             '    "'*) ;;
