@@ -90,6 +90,24 @@ model_hours_cost() {
     printf 'free'
 }
 
+model_state() {
+    # model_state WORKTREE -> `NAME<TAB>HOURS` for the model start recorded in
+    # .supervisor.log, empty when the run chose none. The line is the one
+    # `--model` writes once the footer named the choice,
+    # `model=<name> price=<free|Nx|paid|daily>`; a `model=no want=...` line is
+    # a launch that sent no brief, not a choice, so it is not read here. The
+    # name itself carries spaces, which is why the two values are separated
+    # by a tab instead of by the line's own spaces.
+    local wt=$1 line name hours
+    line=$(grep -E ' model=.+ price=[^ ]+' "$wt/.supervisor.log" 2>/dev/null |
+        tail -n 1 || true)
+    [ -n "$line" ] || return 0
+    name=$(printf '%s\n' "$line" | sed -E 's/^.* model=(.*) price=[^ ]+.*$/\1/')
+    hours=$(printf '%s\n' "$line" | sed -E 's/^.* price=([^ ]+).*$/\1/')
+    [ -n "$name" ] || return 0
+    printf '%s\t%s' "$name" "$hours"
+}
+
 model_footer() {
     # model_footer PANE -> the model name the resting footer draws, such as
     # `DeepSeek V4.1 Flash Fast` in `... • high · /model to change`. The line

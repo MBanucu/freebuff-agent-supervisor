@@ -103,7 +103,7 @@ status() {
 
     local wt="$ROOT/.worktrees/$name" branch session tmux running=0 tty mode=unknown stty out
     local state rstate="" pane="" idle="" sstate="" last_commit dirty=no watcher=""
-    local wake_lock="" hours=""
+    local wake_lock="" hours="" model model_name="" model_hours=""
     local result_pr="" result_commit="" result_tests="" prs="" pr_json=null
     local evidence="" ev_rule="" ev_matched="" ev_lines="" ev_sha="" ev_scans="" ev_source=""
     local turn_evidence="" tstate="" tout="" turn_log=""
@@ -135,10 +135,17 @@ status() {
     [ -n "$state" ] || state=unknown
     watcher=$(watcher_state "$wt")
     wake_lock=$(wake_lock_state "$wt")
+    # The model is what start recorded at launch, the same evidence the wake
+    # lock is: a run that chose none has no line and prints no field (#136).
+    model=$(model_state "$wt")
+    model_name=${model%%$'\t'*}
+    model_hours=${model#*$'\t'}
     if [ "$json" = 0 ]; then
         printf 'state=%s\n' "$state"
         printf 'watcher=%s\n' "$watcher"
         [ -z "$wake_lock" ] || printf 'wake_lock=%s\n' "$wake_lock"
+        [ -z "$model_name" ] ||
+            printf 'model=%s hours=%s\n' "$model_name" "$model_hours"
     fi
     if [ -f "$wt/$RESULT_FILE" ]; then
         rstate=$state
@@ -307,6 +314,10 @@ status() {
     printf '  "idle_seconds": %s,\n' "$(json_nullable_num "$idle")"
     printf '  "watcher": %s,\n' "$(json_nullable_str "$watcher")"
     printf '  "wake_lock": %s,\n' "$(json_nullable_str "$wake_lock")"
+    printf '  "model": {\n'
+    printf '    "name": %s,\n' "$(json_nullable_str "$model_name")"
+    printf '    "hours": %s\n' "$(json_nullable_str "$model_hours")"
+    printf '  },\n'
     printf '  "hours": {\n'
     printf '    "value": %s,\n' "$(json_nullable_str "$HOURS_VALUE")"
     printf '    "age_seconds": %s,\n' "$(json_nullable_num "$HOURS_AGE")"
@@ -452,7 +463,7 @@ sessions() {
     # serialization of the same rows: one array of objects, `[]` when empty.
     local no_gh=0 json=0 name wt worktree running state idle activity now idle_secs
     local watcher wake_lock result branch pr prs="" slug="" tmux total=0 live=0 trees=0
-    local pane hours
+    local pane hours model model_name model_hours model_show
     local finished=no finished_count=0
     local names=() x first=1
     while [ $# -gt 0 ]; do
@@ -503,11 +514,11 @@ sessions() {
     if [ "$json" = 1 ]; then
         printf '[\n'
     elif [ -n "$prs" ]; then
-        printf '%-22s %-9s %-8s %-9s %-9s %-9s %-24s %-40s %s %s\n' \
-            NAME STATE IDLE WATCHER WORKTREE RESULT BRANCH PR WAKE HOURS
+        printf '%-22s %-9s %-8s %-9s %-9s %-9s %-24s %-40s %-32s %s %s\n' \
+            NAME STATE IDLE WATCHER WORKTREE RESULT BRANCH PR MODEL WAKE HOURS
     else
-        printf '%-22s %-9s %-8s %-9s %-9s %-9s %-40s %s %s\n' \
-            NAME STATE IDLE WATCHER WORKTREE RESULT BRANCH WAKE HOURS
+        printf '%-22s %-9s %-8s %-9s %-9s %-9s %-40s %-32s %s %s\n' \
+            NAME STATE IDLE WATCHER WORKTREE RESULT BRANCH MODEL WAKE HOURS
     fi
 
     for name in "${names[@]}"; do
@@ -518,6 +529,9 @@ sessions() {
         wake_lock=""
         pane=""
         hours=""
+        model_name=""
+        model_hours=""
+        model_show=-
         if [ -d "$wt" ]; then
             worktree=yes
             trees=$((trees + 1))
@@ -526,6 +540,12 @@ sessions() {
             [ -n "$result" ] || result=-
             watcher=$(watcher_state "$wt")
             wake_lock=$(wake_lock_state "$wt")
+            # The model start recorded, with its cost class, so a mixed pool
+            # can be read straight from the table (#136).
+            model=$(model_state "$wt")
+            model_name=${model%%$'\t'*}
+            model_hours=${model#*$'\t'}
+            [ -z "$model_name" ] || model_show="$model_name ($model_hours)"
         else
             worktree=missing
             branch=-
@@ -596,6 +616,10 @@ sessions() {
             fi
             printf '    "watcher": %s,\n' "$(json_nullable_str "$watcher")"
             printf '    "wake_lock": %s,\n' "$(json_nullable_str "$wake_lock")"
+            printf '    "model": {\n'
+            printf '      "name": %s,\n' "$(json_nullable_str "$model_name")"
+            printf '      "hours": %s\n' "$(json_nullable_str "$model_hours")"
+            printf '    },\n'
             printf '    "worktree": %s,\n' "$(json_str "$worktree")"
             printf '    "result": %s,\n' "$(json_nullable_str "$result")"
             printf '    "branch": %s,\n' "$(json_nullable_str "$branch")"
@@ -608,13 +632,13 @@ sessions() {
             printf '  }'
         elif [ -n "$prs" ] && [ "$branch" != '-' ]; then
             [ -n "$pr" ] || pr=-
-            printf '%-22s %-9s %-8s %-9s %-9s %-9s %-24s %-40s %s %s\n' \
+            printf '%-22s %-9s %-8s %-9s %-9s %-9s %-24s %-40s %-32s %s %s\n' \
                 "$name" "$state" "$idle" "$watcher" "$worktree" "$result" \
-                "$branch" "$pr" "${wake_lock:--}" "$hours"
+                "$branch" "$pr" "$model_show" "${wake_lock:--}" "$hours"
         else
-            printf '%-22s %-9s %-8s %-9s %-9s %-9s %-40s %s %s\n' \
+            printf '%-22s %-9s %-8s %-9s %-9s %-9s %-40s %-32s %s %s\n' \
                 "$name" "$state" "$idle" "$watcher" "$worktree" "$result" \
-                "$branch" "${wake_lock:--}" "$hours"
+                "$branch" "$model_show" "${wake_lock:--}" "$hours"
         fi
     done
 
@@ -703,11 +727,12 @@ models() {
     # the session as it was. Nothing is submitted, so the walk spends no
     # hours. Only a resting session is touched: a turn in flight or a refused
     # session gets no keys at all.
-    local name="" json=0 tmux="" session="" wt="" pane="" opened=0
+    local name="" json=0 tmux="" session="" wt="" pane="" opened=0 free_only=0
     local listed="" rows="" n pr sel step=0 count=0 first=1
     while [ $# -gt 0 ]; do
         case "$1" in
             --json) json=1; shift ;;
+            --free) free_only=1; shift ;;
             -h|--help) usage; exit 0 ;;
             -*) die "models: unsupported argument: $1" ;;
             *)
@@ -776,6 +801,17 @@ models() {
     # exactly as it was found; one that was already open is left open.
     if [ "$opened" = 1 ]; then
         "$tmux" send-keys -t "$session" Escape 2>/dev/null || true
+    fi
+    # --free is the shortlist a launch picks from when hours are short: the
+    # entries whose price line carries no hour multiplier. The count follows
+    # the filter, so `models=N` is the number of rows printed.
+    if [ "$free_only" = 1 ]; then
+        rows=$(printf '%s\n' "$rows" | while IFS=$'\t' read -r n pr; do
+            [ -n "$n" ] || continue
+            [ "$(model_hours_cost "$pr")" = free ] || continue
+            printf '%s\t%s\n' "$n" "$pr"
+        done || true)
+        count=$(printf '%s\n' "$rows" | grep -c . || true)
     fi
     if [ "$json" = 1 ]; then
         printf '{\n  "session": %s,\n  "count": %s,\n  "models": [\n' \

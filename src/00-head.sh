@@ -50,8 +50,8 @@
 #     refuse_sent_brief, compose_brief, brief_jitter_max
 #   the model picker:
 #     model_norm, picker_frame, picker_entries, picker_names, picker_selected,
-#     picker_price, model_hours_cost, model_footer, model_resolve, picker_wait,
-#     model_choose
+#     picker_price, model_hours_cost, model_state, model_footer, model_resolve,
+#     picker_wait, model_choose
 #   the issue mirror:
 #     gh_state_color, gh_state
 #   start:
