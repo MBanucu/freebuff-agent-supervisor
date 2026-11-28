@@ -13,7 +13,7 @@ starts a real agent.
 | Path | What lives there |
 | --- | --- |
 | `spawn-freebuff-agent` | The whole shipped tool, in one bash file: `usage()` at the top, shared helpers, one function per subcommand (`start`, `status`, `sessions`, `hours`, `models`, `notify`, `gui`, `stop`, ...), and the subcommand dispatch at the bottom. It is **generated** — edit `src/` and run `./build.sh`. |
-| `src/` | The source of truth, one part per area, in the order `build.sh` concatenates them: `00-head.sh` (shebang, the function map, constants), `10-argv.sh`, `20-discovery.sh`, `30-preflight.sh`, `40-wakelock.sh`, `50-refusal.sh`, `60-json.sh`, `70-evidence.sh`, `75-brief.sh`, `78-picker.sh`, `80-mirror.sh`, `85-start.sh`, `88-views.sh`, `90-watch.sh`, `92-gui.sh`, `94-send.sh`, `99-dispatch.sh`. |
+| `src/` | The source of truth, one part per area, in the order `build.sh` concatenates them: `00-head.sh` (shebang, the function map, constants), `10-argv.sh`, `20-discovery.sh`, `30-preflight.sh`, `40-wakelock.sh`, `50-refusal.sh`, `60-json.sh`, `70-evidence.sh`, `75-brief.sh`, `78-picker.sh`, `79-model-key.sh`, `80-mirror.sh`, `85-start.sh`, `88-views.sh`, `90-watch.sh`, `92-gui.sh`, `94-send.sh`, `99-dispatch.sh`. |
 | `build.sh` | Concatenates `src/` into the artifact and checks it: `--check` fails when the shipped file is stale, `--out FILE` builds elsewhere. Bash only; the order of parts is the `PARTS` array. |
 | `spawn-freebuff-agent-test.sh` | The deviceless runner. Sources `test/lib.sh`, then each area file in order, and prints `ok N checks`. |
 | `test/lib.sh` | The shared harness: temporary git repo, fake tmux/stty/freebuff, pane fixtures, `check`/`contains`/`json_ok`, and the cleanup trap. |
@@ -25,7 +25,7 @@ starts a real agent.
 | `test/readiness-submission.sh` | Area: the readiness deadline and proof that the brief was submitted. |
 | `test/wait-actions.sh` | Area: `gui --serve` — the read-only server, the POST actions and the ttyd route. |
 | `test/hours.sh` | Area: the remaining hour budget read from a live pane. |
-| `test/model-choice.sh` | Area: the `/model` picker — `start --model`, its scroll search, and `models`. |
+| `test/model-choice.sh` | Area: the `/model` picker — `start --model`, its scroll search, `models`, and the client's global model key it writes. |
 | `test/build-sync.sh` | Area: the artifact is what `src/` builds, and the check fails when it is stale. |
 | `gui-test.sh` | The second suite: curl checks for `gui/server.py`. It reuses `test/lib.sh` and prints `ok N gui checks`. |
 | `gui/server.py` | The HTTP server for `gui --serve`, python3 standard library only. It shells out to the CLI, which stays the single source of state. |
@@ -80,6 +80,7 @@ Find the area that owns the behaviour:
 | Readiness deadline, submission proof | `test/readiness-submission.sh` |
 | `gui --serve` routes and actions | `test/wait-actions.sh` |
 | Hours read from a pane | `test/hours.sh` |
+| Model picker, `--model`, the model key and its lock | `test/model-choice.sh` |
 
 A check is one `check` call:
 

@@ -67,7 +67,15 @@ price line are recorded as `model=<name> price=<free|Nx|paid|daily>` in
 back, so a mixed free/paid pool is auditable without opening a log. A choice
 that cannot be made or confirmed stops the session
 with no brief sent and keeps the worktree. Because the selection is a global
-setting, two launches that want different models must be run in sequence.
+setting, `start` does not leave it on its own choice: it snapshots
+`freebuffModelKey` before the switch, takes a lock beside it
+(`.supervisor-model.lock` in the config dir, with `mkdir` as the mutex, so no
+`flock` is needed), and writes the snapshot back once the brief is submitted —
+and from an `EXIT` trap on every failure after the switch. The log records
+`model_key=before value=...`, `model_key=set value=...` and
+`model_key=restored value=...`, so a launch that leaves the key behind is
+visible after the fact instead of silent. A config whose key cannot be read is
+not switched at all.
 
 **A ready pane can still swallow the Enter.** That failure looks healthy: the
 composer clears, the session rests at the idle prompt, the worktree is clean

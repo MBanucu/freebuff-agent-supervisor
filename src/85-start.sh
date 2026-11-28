@@ -8,7 +8,7 @@ start() {
     local ready_timeout="$READY_TIMEOUT" ready_poll="$READY_POLL"
     local submit_timeout="$SUBMIT_TIMEOUT" trust_agents=0
     local prompt_text="" sent brief_hash_value jitter_max jitter=0
-    local model_want=""
+    local model_want="" model_key_set=""
     local ready_rc=0 submit_rc=0 pane refusal="" title_before trust_dir
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -129,7 +129,10 @@ start() {
         [ "$jitter_max" = 0 ] || note "jitter_max=${jitter_max}s"
         note "ready_timeout=${ready_timeout}s ready_poll=${ready_poll}s"
         note "trust_agents=$([ "$trust_agents" = 1 ] && printf yes || printf no)"
-        [ -z "$model_want" ] || note "model=$model_want"
+        if [ -n "$model_want" ]; then
+            note "model=$model_want"
+            note "model_key=$(model_settings_path)"
+        fi
         note "submit_timeout=${submit_timeout}s"
         [ "$wake_lock" = 0 ] || note 'wake_lock=requested'
         note "tmux=${FREEBUFF_TMUX:-tmux} -x $COLS -y $ROWS -c $wt"
@@ -301,6 +304,21 @@ start() {
     # made or confirmed sends no brief: the session is stopped and the
     # worktree kept, like every other failed launch.
     if [ -n "$model_want" ]; then
+        # The switch writes the client's one model key, so it runs under a
+        # lock every launch shares and the key this launch found is put back
+        # afterwards (#134). A lock that cannot be taken switches nothing.
+        if ! model_key_take "$wt"; then
+            "$tmux" kill-session -t "$session" 2>/dev/null || true
+            note "session=$session"
+            note "model_want=$model_want"
+            note "model_key=$MODEL_KEY_ERROR"
+            note 'sent=no'
+            die "start: could not isolate the client's model key for '$model_want': $MODEL_KEY_ERROR. Nothing was switched or sent; stopped it, worktree kept ($wt)."
+        fi
+        # Every way out of start from here puts the key back, including the
+        # dies below: a launch that fails after the switch must not leave the
+        # client's key on a model it never ran.
+        trap 'model_key_put_back "${wt-}"' EXIT
         if ! model_choose "$tmux" "$session" "$wt" "$model_want"; then
             pane=$("$tmux" capture-pane -p -t "$session" -S "-$REFUSAL_WINDOW" 2>/dev/null || true)
             "$tmux" send-keys -t "$session" Escape 2>/dev/null || true
@@ -316,6 +334,10 @@ start() {
         # The picker's own price line is the answer to whether this run spends
         # hours: `free` means it printed no multiplier under the entry.
         ready_note "$wt" "model=$MODEL_RESOLVED price=$(model_hours_cost "$MODEL_PRICE") elapsed=${PICKER_ELAPSED}s session=$session"
+        # What the switch wrote, for the same reason the snapshot is recorded:
+        # the pair is what makes a key left behind visible after the fact.
+        model_key_set=$(model_key_value "$(model_settings_path)")
+        ready_note "$wt" "model_key=set value=${model_key_set:-none}"
     fi
 
     # A brief that is byte-identical across sessions reads as scripted use to
@@ -385,6 +407,9 @@ start() {
     # (text nobody saw) never blocks a deliberate retry with that text.
     brief_ledger_record "$brief_hash_value" "$name" "$branch"
     ready_note "$wt" "submit=yes proof=${SUBMIT_PROOF} elapsed=${SUBMIT_ELAPSED}s timeout=${submit_timeout}s poll=${ready_poll}s session=$session"
+    # The switch has done its work: the snapshot goes back now, before any
+    # later step can fail with the client's key still on this launch's model.
+    model_key_put_back "$wt"
     note "session=$session"
     note 'sent=yes'
     note "submit_proof=${SUBMIT_PROOF} elapsed=${SUBMIT_ELAPSED}s"

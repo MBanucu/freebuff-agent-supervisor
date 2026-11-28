@@ -137,6 +137,21 @@ MODEL_AMBIGUOUS=0
 # the walk both read.
 MODEL_FRAME=''
 PICKER_ELAPSED=0
+# The key the switch writes (#134). The client has one settings.json and the
+# model is one key in it, so two launches that switch in the same minute race
+# for it and the loser runs, and bills, the other launch's model. A launch
+# snapshots the key, switches under a lock in the config dir, and writes the
+# snapshot back once the brief is submitted. The lock waits up to this long
+# before the launch gives up: it spans one switch and one submission.
+MODEL_LOCK_TIMEOUT=300
+MODEL_LOCK_POLL=0.5
+# Set by model_key_take/model_key_put_back: the value to put back, whether the
+# file had one at all, why the guard could not be taken, and whether this
+# process owns the lock right now.
+MODEL_KEY_SAVED=''
+MODEL_KEY_MODE=''
+MODEL_KEY_ERROR=''
+MODEL_LOCK_HELD=0
 # Preflight: `freebuff --version` must answer inside this many seconds, or the
 # start says so instead of waiting out the readiness gate. A client that exists
 # but cannot execute (the glibc binary on bionic Termux, #89) is the failure
@@ -198,7 +213,10 @@ Spawn parallel Freebuff agents in isolated git worktrees.
                          `paid` and `daily` are a Paid plan and a per-day
                          session cap. A name the frame does not draw is
                          found by scrolling the list. An ambiguous or
-                         unknown name fails before anything is sent.
+                         unknown name fails before anything is sent. The
+                         client keeps its model in one global key, so the
+                         value found before the switch is put back once the
+                         brief is submitted.
       --no-gh            do not label or comment on the issue
       --no-check         skip the preflight that names a missing tmux,
                          freebuff, stty or git before anything is created
@@ -381,10 +399,15 @@ Notes:
     types /model, moves the `›` marker with the arrow keys the frame prints,
     and presses Enter only once that marker sits on the chosen name. The
     footer must then name the model, or the launch fails with no brief sent
-    and the session stopped. The choice and its cost class are recorded in
-    .supervisor.log, and status, sessions and the GUI card report them. The
-    switch writes the client's global model setting, so two launches that
-    want different models must not run at the same moment.
+    and the session stopped. The switch writes freebuffModelKey in the one
+    settings.json every launch shares, so start snapshots the key it found,
+    switches under a lock in that config dir, and writes the snapshot back
+    once the brief is submitted — and on every later failure, so a launch
+    that never sent leaves the key as it found it. A config whose key cannot
+    be read is not switched at all, and a restore that fails is recorded as
+    model_key=restore-failed in .supervisor.log instead of passing silently.
+    The choice and its cost class are recorded in .supervisor.log, and status,
+    sessions and the GUI card report them.
   - A ready pane can still swallow the Enter. After typing, start waits for
     the input line to clear and for the turn to begin (or the chat title to
     change) and prints sent=yes with the signal that proved it. A send that
