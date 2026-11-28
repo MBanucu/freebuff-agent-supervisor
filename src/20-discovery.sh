@@ -78,9 +78,14 @@ ensure_excludes() {
     local file entry
     file=$(exclude_path)
     mkdir -p "$(dirname "$file")"
+    # .concord/ is the work-state export an agent's Concord tools write under
+    # its worktree: local coordination state, like the run evidence below, and
+    # never project content. Excluded here (the common dir, so every linked
+    # worktree inherits it) so a run that used its work-state tools is not
+    # reported dirty and cannot commit the export (#154).
     for entry in '.worktrees/' '.task.md' 'local.properties' "$RESULT_FILE" \
         '.supervisor.log' "$GH_STATE_FILE" "$BRIEF_LEDGER" "$HOURS_LEDGER" \
-        "$STATE_LEDGER"; do
+        '.concord/' "$STATE_LEDGER"; do
         grep -qxF "$entry" "$file" 2>/dev/null || printf '%s\n' "$entry" >>"$file"
     done
 }

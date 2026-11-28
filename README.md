@@ -113,7 +113,11 @@ so passing the same literal prompt to two sessions fails the second.
 
 With `--max-sessions N` for N > 1, `start` waits a random 0–2N seconds before
 typing, so a burst of launches does not reach the TUI within the same second.
-`FREEBUFF_START_JITTER` overrides the bound (`0` disables the wait).
+A launch that starts while another client is still booting is delayed the same
+way before `tmux new-session`, because two cold clients in the same second can
+leave the second pane drawn but in canonical mode; a session that already
+submitted its brief delays nothing. `FREEBUFF_START_JITTER` overrides the bound
+(`0` disables the wait).
 
 Use `--task-file FILE` when an issue needs a custom scope instead of the
 generic issue brief. `--dry-run` prints the plan and changes nothing;

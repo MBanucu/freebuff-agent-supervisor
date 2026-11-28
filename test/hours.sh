@@ -128,6 +128,47 @@ if out=$(PATH="$TMP/account-bin:$TMP/bin:$PATH" bash "$TOOL" --root "$REPO" hour
 check test "$rc" -eq 0
 check test "$out" = 'hours=0/21 reset=2026-11-28T23:00:00Z session=- source=account'
 
+# The live answer is one line for the whole account (#153): the daily object
+# first, then prices, wallets and per-model limits, several carrying a `limit`
+# of their own, and a later `remaining`. Only the daily pair is the budget, so
+# the last `limit` on the line cannot pair with the daily remaining.
+printf '%s' '{"freebucks":{"balance":5,"daily":{"limit":105,"spent":0,"remaining":105,"resetAt":"2026-11-29T08:00:00.000Z","resetTimeZone":"Europe/Berlin"},"prices":{"fast":{"limit":6,"remaining":6},"smart":{"limit":6},"pro":{"limit":6}},"wallet":{"balance":0,"limit":6},"remaining":1056}}' \
+    >"$FAKE_DIR/curl_body"
+if out=$(PATH="$TMP/account-bin:$TMP/bin:$PATH" bash "$TOOL" --root "$REPO" hours --source account); then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+check test "$out" = 'hours=21/21 reset=2026-11-29T08:00:00Z session=- source=account'
+
+if out=$(PATH="$TMP/account-bin:$TMP/bin:$PATH" bash "$TOOL" --root "$REPO" hours --source account --json); then rc=0; else rc=$?; fi
+check test "$rc" -eq 0
+check json_ok "$out"
+check contains "$out" '"hours":"21/21"'
+check contains "$out" '"remaining":105'
+check contains "$out" '"limit":105'
+
+# A pair with remaining over limit is not a reading: the last `limit` on the
+# line is not the daily one, so the figure is novalue rather than a mismatched
+# pair in the display or start's zero-budget gate.
+printf '%s' '{"freebucks":{"daily":{"limit":6,"spent":0,"remaining":105,"resetAt":"2026-11-29T08:00:00.000Z"},"prices":[{"limit":6}],"remaining":1056}}' \
+    >"$FAKE_DIR/curl_body"
+fake_clear
+if out=$(PATH="$TMP/account-bin:$TMP/bin:$PATH" bash "$TOOL" --root "$REPO" hours --source account); then rc=0; else rc=$?; fi
+check test "$rc" -eq 2
+check test "$out" = $'account=novalue\nhours=unknown'
+
+if out=$(PATH="$TMP/account-bin:$TMP/bin:$PATH" bash "$TOOL" --root "$REPO" hours --source account --json); then rc=0; else rc=$?; fi
+check test "$rc" -eq 2
+check json_ok "$out"
+check contains "$out" '"account":"novalue"'
+check contains "$out" '"remaining":null'
+
+# Without a daily object there is no budget to read: a lone remaining on the
+# line is not it, and the whole-line grep this replaces is gone.
+printf '%s' '{"freebucks":{"remaining":1056,"wallet":{"limit":6}}}' \
+    >"$FAKE_DIR/curl_body"
+if out=$(PATH="$TMP/account-bin:$TMP/bin:$PATH" bash "$TOOL" --root "$REPO" hours --source account); then rc=0; else rc=$?; fi
+check test "$rc" -eq 2
+check test "$out" = $'account=novalue\nhours=unknown'
+
 # A rejected token is a named state, not an unknown figure, and a readable
 # pane does not mask it.
 : >"$FAKE_DIR/curl_body"

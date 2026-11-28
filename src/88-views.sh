@@ -470,6 +470,26 @@ live_session_count() {
     printf '%s' "${count:-0}"
 }
 
+booting_session_count() {
+    # booting_session_count -> live fb-* sessions that have not proven their
+    # first submission yet, i.e. clients still paying their cold start. Only
+    # those race a new launch (#138): a session that submitted its brief long
+    # ago already holds its slot and takes no notice of another client coming
+    # up. A live session with no log at all counts as booting, because its
+    # state is unknown and the delay is cheaper than the race.
+    local name count=0 session_log
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        session_log="$ROOT/.worktrees/${name#fb-}/.supervisor.log"
+        if [ -f "$session_log" ] &&
+            grep -q 'submit=yes' "$session_log" 2>/dev/null; then
+            continue
+        fi
+        count=$((count + 1))
+    done <<<"$(live_sessions)"
+    printf '%s' "$count"
+}
+
 finished_live() {
     # finished_live NAME [TMUX] -> 0 when the TUI is alive but its run is over.
     # The vendor counts live sessions against the concurrent-session limit, not

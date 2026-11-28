@@ -46,7 +46,8 @@
 #     concord_evidence, emit_evidence, classify_state, session_state,
 #     session_activity, idle_seconds
 #   the brief:
-#     write_task, ready_polls, ready_elapsed, ready_note, wait_ready,
+#     write_task, ready_polls, ready_elapsed, ready_note, ready_pane_dump,
+#     wait_ready,
 #     composer_line, chat_title, composer_cleared, turn_began,
 #     await_submission, brief_hash, brief_ledger_file, brief_ledger_seen,
 #     brief_ledger_trim, brief_ledger_record, brief_ledger_mark_refused,
@@ -63,8 +64,8 @@
 #     start
 #   status, list, sessions, hours and models:
 #     print_explanation, launch_branch, worktree_branch, status, list_agents,
-#     watcher_state, live_sessions, live_session_count, finished_live,
-#     finished_live_names, sessions, hours, models
+#     watcher_state, live_sessions, live_session_count, booting_session_count,
+#     finished_live, finished_live_names, sessions, hours, models
 #   watch, autostop, notify, reap and gc:
 #     reap, watch_run, watch, autostop, notify, gc
 #   the state monitor:
@@ -214,6 +215,13 @@ READY_REASON=''
 READY_STTY=''
 READY_TTY=''
 READY_ERROR=''
+# The last stty -a reading, flattened to one line, and whether the resting
+# prompt was already on screen while the tty stayed canonical. That pair is
+# the #138 timeout: a drawn TUI whose pty never went raw is a late or stuck
+# client, not a cold start, so the failure names it and records the reading
+# with the last pane lines in .supervisor.log.
+READY_STTY_OUT=''
+READY_DRAWN=0
 # A ready TUI can still swallow the Enter: the brief lands in the composer and
 # is never submitted, the composer clears, and the session rests at the idle
 # prompt looking healthy. So the Enter is not proof. After typing, start waits
@@ -311,6 +319,8 @@ Spawn parallel Freebuff agents in isolated git worktrees.
                          instead of failing; requires --max-sessions
                          With N > 1, each send is jittered by a random delay
                          so a burst does not reach the TUI in one second.
+                         A launch that lands while another client is still
+                         booting is delayed the same way before tmux starts.
       --no-start         create the worktree and brief, do not launch
       --prompt TEXT      send this message instead of the default brief
       --model NAME       choose this model in the TUI before the brief is
@@ -542,8 +552,9 @@ Environment:
   FREEBUFF_STTY       stty executable for the raw-mode check (default: stty on
                       PATH); point it at GNU stty if the PATH one has no -F
   FREEBUFF_START_JITTER  upper bound in seconds for the random delay before a
-                         send when --max-sessions allows several (default:
-                         2N; 0 disables the wait)
+                         send when --max-sessions allows several, and before
+                         a launch that races another client's boot (default:
+                         2N; 0 disables both waits)
   FREEBUFF_TTYD       ttyd executable for gui --ttyd (default: ttyd on PATH)
   FREEBUFF_WAKE_LOCK  1 acquires the Termux wake lock for every start, like
                       --wake-lock
@@ -559,8 +570,11 @@ Notes:
     types nothing and names the directory: answer `y` once in an interactive
     launch there to record the trust, or rerun start with --trust-agents.
   - A wait that gives up names the timeout it used, prints the last pane
-    lines and records elapsed seconds in .supervisor.log, so a slow cold
-    launch is distinguishable from a hung TUI.
+    lines and records the elapsed seconds, those pane lines and the last
+    stty -a reading in .supervisor.log, so a slow cold launch is
+    distinguishable from a hung TUI. A resting prompt on a tty that stayed
+    canonical is ready=timeout reason=canonical-drawn, printed with
+    retry=safe: the pane is drawn, so a larger --ready-timeout cannot help.
   - --model drives the client's own /model picker. There is no client flag,
     environment override or per-worktree setting for the model, so start
     types /model, moves the `›` marker with the arrow keys the frame prints,
@@ -732,9 +746,14 @@ ensure_excludes() {
     local file entry
     file=$(exclude_path)
     mkdir -p "$(dirname "$file")"
+    # .concord/ is the work-state export an agent's Concord tools write under
+    # its worktree: local coordination state, like the run evidence below, and
+    # never project content. Excluded here (the common dir, so every linked
+    # worktree inherits it) so a run that used its work-state tools is not
+    # reported dirty and cannot commit the export (#154).
     for entry in '.worktrees/' '.task.md' 'local.properties' "$RESULT_FILE" \
         '.supervisor.log' "$GH_STATE_FILE" "$BRIEF_LEDGER" "$HOURS_LEDGER" \
-        "$STATE_LEDGER"; do
+        '.concord/' "$STATE_LEDGER"; do
         grep -qxF "$entry" "$file" 2>/dev/null || printf '%s\n' "$entry" >>"$file"
     done
 }
@@ -1101,8 +1120,12 @@ account_read() {
     # read as an unknown figure or as a network failure. Everything else is
     # named and left to the caller, which falls back to the pane. The figures
     # are the daily remaining and limit divided by five, the unit the TUI
-    # prints, plus the daily reset.
-    local file token body rc=0 code
+    # prints, plus the daily reset. The account answers with the whole
+    # account on one line, many keys after the daily object carrying a
+    # `limit` of their own, so the body is cut down to `"daily":{...}`
+    # before a figure is read and a pair with `remaining` over `limit` is
+    # `novalue` rather than a reading.
+    local file token body rc=0 code flat daily
     ACCOUNT_STATE=''
     ACCOUNT_REMAINING=''
     ACCOUNT_LIMIT=''
@@ -1135,18 +1158,29 @@ account_read() {
         esac
         return 1
     fi
-    ACCOUNT_REMAINING=$(printf '%s\n' "$body" |
-        sed -n 's/.*"remaining"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' |
-        head -n 1)
-    ACCOUNT_LIMIT=$(printf '%s\n' "$body" |
-        sed -n 's/.*"limit"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' |
-        head -n 1)
-    ACCOUNT_RESET=$(printf '%s\n' "$body" |
-        sed -n 's/.*"resetAt"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
-        head -n 1)
+    # The daily object is not always first and the line continues after it
+    # with `prices`, wallets and per-model limits: flatten the body and keep
+    # only the first `"daily":{...}`, so a later `remaining` (1056 in the
+    # live answer) or a per-model `limit` cannot be read as the budget. No
+    # daily object means no budget to read.
+    flat=$(printf '%s' "$body" | tr -d '\n')
+    daily=$(printf '%s\n' "$flat" |
+        grep -o '"daily"[[:space:]]*:[[:space:]]*{[^}]*}' | head -n 1 || true)
+    ACCOUNT_REMAINING=$(printf '%s\n' "$daily" |
+        grep -o '"remaining"[[:space:]]*:[[:space:]]*[0-9][0-9]*' |
+        head -n 1 | sed 's/.*:[[:space:]]*//')
+    ACCOUNT_LIMIT=$(printf '%s\n' "$daily" |
+        grep -o '"limit"[[:space:]]*:[[:space:]]*[0-9][0-9]*' |
+        head -n 1 | sed 's/.*:[[:space:]]*//')
+    ACCOUNT_RESET=$(printf '%s\n' "$daily" |
+        grep -o '"resetAt"[[:space:]]*:[[:space:]]*"[^"]*"' |
+        head -n 1 | sed 's/^.*:[[:space:]]*"//; s/"$//')
     # The API spells the reset with milliseconds; the tool prints whole seconds.
     ACCOUNT_RESET=$(printf '%s' "$ACCOUNT_RESET" | sed 's/\.[0-9]*Z$/Z/')
-    if ! is_num "$ACCOUNT_REMAINING" || ! is_num "$ACCOUNT_LIMIT"; then
+    # A remaining larger than the limit it came from is a mismatched pair,
+    # not a reading: it must never reach the display or the start gate.
+    if ! is_num "$ACCOUNT_REMAINING" || ! is_num "$ACCOUNT_LIMIT" ||
+        [ "$ACCOUNT_REMAINING" -gt "$ACCOUNT_LIMIT" ]; then
         ACCOUNT_STATE=novalue
         ACCOUNT_REMAINING=''
         ACCOUNT_LIMIT=''
@@ -2149,6 +2183,21 @@ ready_note() {
     printf '%s %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >>"$wt/.supervisor.log"
 }
 
+ready_pane_dump() {
+    # ready_pane_dump WORKTREE PANE -> the pane lines in .supervisor.log, one
+    # prefixed line each. A launch that times out stops the session it read
+    # them from, so this is the only copy of what the TUI was showing (#138).
+    # The prefix keeps a frame distinct from the transitions around it, and a
+    # blank line inside the frame stays one log line.
+    local wt="$1" line stamp
+    [ -d "$wt" ] || return 0
+    [ -n "${2-}" ] || return 0
+    stamp=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+    printf '%s\n' "${2%$'\n'}" | while IFS= read -r line; do
+        printf '%s pane| %s\n' "$stamp" "$line" >>"$wt/.supervisor.log"
+    done
+}
+
 wait_ready() {
     # wait_ready TMUX SESSION WORKTREE TIMEOUT POLL -> 0 ready, 2 refused,
     # 3 trust prompt, 1 did not become ready. A refusal is checked first: the
@@ -2167,6 +2216,10 @@ wait_ready() {
     # in READY_REASON and the evidence in READY_ELAPSED/READY_TTY/READY_STTY/
     # READY_ERROR. A cool-down is not a hard failure: a tty that reports
     # canonical mode, or a raw pane without the resting prompt, keeps polling.
+    # A deadline that expires with the resting prompt already drawn reports
+    # reason=canonical-drawn instead of a plain timeout: the TUI is up and its
+    # pty never went raw, so the frame is in READY_DRAWN and the last reading
+    # in READY_STTY_OUT, which is a late client rather than a cold start.
     local tmux="$1" session="$2" wt="$3" timeout="$4" poll="$5"
     local polls i=0 tty pane stty out rc fails=0 no_tty=0
     polls=$(ready_polls "$timeout" "$poll")
@@ -2176,6 +2229,8 @@ wait_ready() {
     READY_STTY=''
     READY_TTY=''
     READY_ERROR=''
+    READY_STTY_OUT=''
+    READY_DRAWN=0
     while :; do
         if ! "$tmux" has-session -t "$session" 2>/dev/null; then
             READY_ELAPSED=$(ready_elapsed "$i" "$poll")
@@ -2219,6 +2274,11 @@ wait_ready() {
                 READY_STTY=${stty:-stty}
                 READY_TTY=$tty
                 READY_ERROR=${out//$'\n'/ }
+                # This check did not read the mode, so it cannot call the
+                # frame canonical: the timeout line names that instead of an
+                # older reading that may no longer hold.
+                READY_STTY_OUT=''
+                READY_DRAWN=0
                 if [ "$fails" -ge "$READY_FAILS" ]; then
                     READY_ELAPSED=$(ready_elapsed "$i" "$poll")
                     READY_REASON=stty
@@ -2226,8 +2286,18 @@ wait_ready() {
                 fi
             else
                 fails=0
+                READY_TTY=$tty
+                READY_STTY_OUT=${out//$'\n'/ }
+                # A resting prompt on a canonical tty is the #138 timeout: the
+                # TUI is drawn and no keystroke can be accepted, so a longer
+                # --ready-timeout buys nothing. Remember the last frame drawn.
+                if printf '%s' "$pane" | grep -q 'Enter a coding task'; then
+                    READY_DRAWN=1
+                else
+                    READY_DRAWN=0
+                fi
                 if printf '%s' "$out" | grep -q -- '-icanon' &&
-                    printf '%s' "$pane" | grep -q 'Enter a coding task'; then
+                    [ "$READY_DRAWN" = 1 ]; then
                     READY_ELAPSED=$(ready_elapsed "$i" "$poll")
                     ready_note "$wt" "ready=yes elapsed=${READY_ELAPSED}s timeout=${timeout}s poll=${poll}s"
                     return 0
@@ -2237,7 +2307,11 @@ wait_ready() {
         i=$((i + 1))
         if [ "$i" -ge "$polls" ]; then
             READY_ELAPSED=$(ready_elapsed "$i" "$poll")
-            READY_REASON=timeout
+            if [ "$READY_DRAWN" = 1 ]; then
+                READY_REASON=canonical-drawn
+            else
+                READY_REASON=timeout
+            fi
             return 1
         fi
         if [ $((i % READY_NOTE_POLLS)) -eq 0 ]; then
@@ -3047,6 +3121,7 @@ start() {
     local ready_timeout="$READY_TIMEOUT" ready_poll="$READY_POLL"
     local submit_timeout="$SUBMIT_TIMEOUT" trust_agents=0
     local prompt_text="" sent brief_hash_value jitter_max jitter=0
+    local launch_jitter_max=0 launch_jitter=0 live_before=0 launch_slots=0
     local model_want="" model_key_set=""
     local ready_rc=0 submit_rc=0 pane refusal="" title_before trust_dir
     while [ $# -gt 0 ]; do
@@ -3141,6 +3216,21 @@ start() {
     sent=$(compose_brief "$name" "$branch" "$wt" "$issue" "$prompt_text")
     brief_hash_value=$(brief_hash "$sent")
     jitter_max=$(brief_jitter_max "$max_sessions")
+    # A launch can race another client's boot, not only a send (#138): two
+    # cold clients started in the same second left the second pane drawn and
+    # its tty canonical until the readiness gate gave up. The send already
+    # jitters by --max-sessions, so the launch gets the same bound, but only
+    # while a live session has not proven its own submission yet. A session
+    # that has been running for hours is not racing this one and delays
+    # nothing.
+    live_before=$(booting_session_count)
+    launch_slots=$max_sessions
+    if [ "$live_before" -gt "$launch_slots" ]; then
+        launch_slots=$((live_before + 1))
+    fi
+    if [ "$live_before" -gt 0 ]; then
+        launch_jitter_max=$(brief_jitter_max "$launch_slots")
+    fi
 
     if [ -z "$title" ] || [ -z "$url" ]; then
         if [ -n "$slug" ] && command -v "${GH_BIN:-gh}" >/dev/null 2>&1; then
@@ -3166,6 +3256,8 @@ start() {
         note "brief_hash=$brief_hash_value"
         note "brief_chars=${#sent}"
         [ "$jitter_max" = 0 ] || note "jitter_max=${jitter_max}s"
+        [ "$launch_jitter_max" = 0 ] ||
+            note "launch_jitter_max=${launch_jitter_max}s booting=$live_before"
         note "ready_timeout=${ready_timeout}s ready_poll=${ready_poll}s"
         note "trust_agents=$([ "$trust_agents" = 1 ] && printf yes || printf no)"
         if [ -n "$model_want" ]; then
@@ -3284,6 +3376,16 @@ start() {
     else
         printf -v cmd 'TERM=xterm-256color %q --cwd %q' "$fb" "$wt"
     fi
+    # Stagger the launch itself, not only the send: a second client that
+    # reaches tmux in the same second as a booting one is the case #138
+    # stopped on, and a retry succeeding seconds later is the proof it is a
+    # race. The bound is the one the send uses, and the line is recorded so a
+    # launch that then times out shows the delay it already paid.
+    if [ "$launch_jitter_max" -gt 0 ]; then
+        launch_jitter=$((RANDOM % (launch_jitter_max + 1)))
+        ready_note "$wt" "launch_delay=${launch_jitter}s max=${launch_jitter_max}s booting=$live_before"
+        sleep "$launch_jitter"
+    fi
     "$tmux" new-session -d -s "$session" -x "$COLS" -y "$ROWS" -c "$wt" "$cmd"
 
     wait_ready "$tmux" "$session" "$wt" "$ready_timeout" "$ready_poll" || ready_rc=$?
@@ -3325,8 +3427,14 @@ start() {
         die "start: Freebuff stopped at its trust prompt for $trust_dir in $session: it loads repository-supplied .agents files and mcp.json only after that directory is trusted. Answer y once in an interactive launch in $wt (freebuff --cwd $wt), or rerun start with --trust-agents to load it without asking. No key was typed; stopped it, worktree kept ($wt)."
     fi
     if [ "$ready_rc" -ne 0 ]; then
+        pane=$("$tmux" capture-pane -p -t "$session" -S -15 2>/dev/null || true)
         printf '%s\n' '--- last pane lines ---'
-        "$tmux" capture-pane -p -t "$session" -S -15 2>/dev/null || true
+        printf '%s\n' "$pane"
+        # The session is stopped below, so this frame is the last evidence of
+        # why it never took input. Record it, with the stty reading in the
+        # timeout lines, so the next occurrence is diagnosable after the
+        # terminal is gone (#138; the first two left nothing in the log).
+        ready_pane_dump "$wt" "$pane"
         # A pane that never reached raw input can never accept the brief, so it
         # is dead weight. Kill only the session; the worktree and branch stay.
         "$tmux" kill-session -t "$session" 2>/dev/null || true
@@ -3346,9 +3454,17 @@ start() {
                 ready_note "$wt" "ready=no reason=no-session elapsed=${READY_ELAPSED}s timeout=${ready_timeout}s poll=${ready_poll}s session=$session"
                 die "start: session $session disappeared before it reached raw input after ${READY_ELAPSED}s; stopped it, worktree kept ($wt)."
                 ;;
+            canonical-drawn)
+                # The pane is drawn and its tty never went raw: a brief typed
+                # here is line-buffered, not submitted, and the deadline is
+                # not the problem. Name the race and the retry instead of
+                # sending the operator back to --ready-timeout.
+                ready_note "$wt" "ready=timeout reason=canonical-drawn elapsed=${READY_ELAPSED}s timeout=${ready_timeout}s poll=${ready_poll}s session=$session tty=$READY_TTY stty_out=$READY_STTY_OUT retry=safe"
+                die "start: the TUI is drawn in $session but its tty never left canonical mode after ${READY_ELAPSED}s (tty=$READY_TTY, stty: $READY_STTY_OUT): the resting prompt is on screen, yet a brief typed there would be line-buffered rather than submitted. A client that came up while another one was booting is the usual cause — every launch shares one account and its admission lock, and a retry seconds later usually clears it — and a larger --ready-timeout cannot fix a pane that is already drawn. Nothing was typed and the worktree is kept ($wt); retry=safe: launch the same issue under another --name, or remove that worktree and branch first."
+                ;;
             *)
-                ready_note "$wt" "ready=timeout elapsed=${READY_ELAPSED}s timeout=${ready_timeout}s poll=${ready_poll}s session=$session"
-                die "start: TUI did not reach raw input in $session after ${READY_ELAPSED}s (--ready-timeout $ready_timeout, --ready-poll $ready_poll); stopped it, worktree kept ($wt). A cold first launch can need a larger --ready-timeout."
+                ready_note "$wt" "ready=timeout elapsed=${READY_ELAPSED}s timeout=${ready_timeout}s poll=${ready_poll}s session=$session tty=${READY_TTY:-none} stty_out=${READY_STTY_OUT:-none} retry=safe"
+                die "start: TUI did not reach raw input in $session after ${READY_ELAPSED}s (--ready-timeout $ready_timeout, --ready-poll $ready_poll); stopped it, worktree kept ($wt). A cold first launch can need a larger --ready-timeout. Nothing was typed, so retry=safe: launch the same issue under another --name, or remove the kept worktree and branch first."
                 ;;
         esac
     fi
@@ -3977,6 +4093,26 @@ live_session_count() {
     local count
     count=$(live_sessions | grep -c . || true)
     printf '%s' "${count:-0}"
+}
+
+booting_session_count() {
+    # booting_session_count -> live fb-* sessions that have not proven their
+    # first submission yet, i.e. clients still paying their cold start. Only
+    # those race a new launch (#138): a session that submitted its brief long
+    # ago already holds its slot and takes no notice of another client coming
+    # up. A live session with no log at all counts as booting, because its
+    # state is unknown and the delay is cheaper than the race.
+    local name count=0 session_log
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        session_log="$ROOT/.worktrees/${name#fb-}/.supervisor.log"
+        if [ -f "$session_log" ] &&
+            grep -q 'submit=yes' "$session_log" 2>/dev/null; then
+            continue
+        fi
+        count=$((count + 1))
+    done <<<"$(live_sessions)"
+    printf '%s' "$count"
 }
 
 finished_live() {
