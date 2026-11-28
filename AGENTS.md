@@ -13,7 +13,10 @@ change.
   `src/NN-area.sh` parts concatenated by `./build.sh` in the order that file
   lists. Run `./build.sh` after a change and commit the result;
   `./build.sh --check` fails on a stale artifact, and CI runs it before the
-  suite. A new part goes into `PARTS` in `build.sh`.
+  suite. CI also runs `./build.sh --edited <base>`, which refuses a commit that
+  changed the artifact and no part and names the part the edit belongs in, so a
+  hand edit is told to move into `src/` rather than to run the build. A new part
+  goes into `PARTS` in `build.sh`.
 - Keep it one file: it must not `source` a part or anything else it does not
   ship, and it may not gain a runtime dependency, a JSON helper or `jq`.
 - The tests are not shipped, so `test/lib.sh` may be shared by both suites.

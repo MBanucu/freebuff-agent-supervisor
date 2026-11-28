@@ -14,7 +14,7 @@ starts a real agent.
 | --- | --- |
 | `spawn-freebuff-agent` | The whole shipped tool, in one bash file: `usage()` at the top, shared helpers, one function per subcommand (`start`, `status`, `sessions`, `hours`, `models`, `notify`, `gui`, `stop`, ...), and the subcommand dispatch at the bottom. It is **generated** — edit `src/` and run `./build.sh`. |
 | `src/` | The source of truth, one part per area, in the order `build.sh` concatenates them: `00-head.sh` (shebang, the function map, constants), `10-argv.sh`, `20-discovery.sh`, `30-preflight.sh`, `40-wakelock.sh`, `50-refusal.sh`, `60-json.sh`, `70-evidence.sh`, `75-brief.sh`, `78-picker.sh`, `79-model-key.sh`, `80-mirror.sh`, `85-start.sh`, `88-views.sh`, `90-watch.sh`, `92-gui.sh`, `94-send.sh`, `99-dispatch.sh`. |
-| `build.sh` | Concatenates `src/` into the artifact and checks it: `--check` fails when the shipped file is stale, `--out FILE` builds elsewhere. Bash only; the order of parts is the `PARTS` array. |
+| `build.sh` | Concatenates `src/` into the artifact and checks it: `--check` fails when the shipped file is stale, `--edited REF` fails when the artifact changed against `REF` but no part did (and names the part from the banner above the edit), `--out FILE` builds elsewhere. Bash only; the order of parts is the `PARTS` array. |
 | `spawn-freebuff-agent-test.sh` | The deviceless runner. Sources `test/lib.sh`, then each area file in order, and prints `ok N checks`. |
 | `test/lib.sh` | The shared harness: temporary git repo, fake tmux/stty/freebuff, pane fixtures, `check`/`contains`/`json_ok`, and the cleanup trap. |
 | `test/cli-json.sh` | Area: the CLI surface, the git exclude list, `--json` output and the remaining flags. |
