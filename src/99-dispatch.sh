@@ -45,6 +45,7 @@ case "$cmd" in
     watch) watch "$@" ;;
     autostop) autostop "$@" ;;
     notify) notify "$@" ;;
+    monitor) monitor "$@" ;;
     gc) gc "$@" ;;
     stop) stop "$@" ;;
     -h|--help|help) usage ;;

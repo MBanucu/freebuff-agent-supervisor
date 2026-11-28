@@ -88,6 +88,22 @@ ACCOUNT_HOURS=''
 # Turn text sits above the visible prompt, so refusal detection reads this
 # many lines of scrollback rather than the 12-line chrome window.
 REFUSAL_WINDOW=40
+# The state monitor (#43) records a transition, never a poll, so a long run is
+# a history instead of a log. The ledger sits in the repository root beside the
+# other ledgers and is rotated, because a phone has no room for an unbounded
+# one: at --ledger-max-bytes it is renamed to <path>.1 and a fresh file starts.
+STATE_LEDGER='.state-monitor.jsonl'
+# Seconds between scans. --once ignores it entirely and never sleeps.
+MONITOR_INTERVAL=10
+# A non-terminal state held longer than this is stuck. The flag is recorded in
+# the ledger, so it fires once per run of that state and not on every poll.
+MONITOR_STUCK_AFTER=1800
+# More than MONITOR_FLAP_LIMIT transitions inside MONITOR_FLAP_WINDOW seconds
+# usually means the pane markers disagree rather than the agent being busy.
+MONITOR_FLAP_WINDOW=600
+MONITOR_FLAP_LIMIT=3
+# 1 MB, the default cap a phone can afford to lose to a ledger.
+MONITOR_LEDGER_MAX=1048576
 # No rule matching a pane used to fall through to `working`, which made new
 # vendor chrome indistinguishable from a live turn. It is now `unknown`, but
 # only once the same normalised window has been seen twice: a boot frame or a
@@ -394,6 +410,36 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       turn_outcome=lastMessage|error; otherwise event=none with a reason.
       Missing chat directory or log.jsonl prints reason=no-turn-log and
       exits 2. It never sends, stops or waits.
+
+  spawn-freebuff-agent monitor [--interval N] [--once] [--stuck-after N]
+                               [--json] [--ledger PATH] [--ledger-max-bytes N]
+                               [--fail-on unknown]
+      Follow every live fb-* session and record what changes, not what is
+      steady. Each session is classified once per scan with the same state
+      function status uses, and every transition appends one line to
+      .state-monitor.jsonl in the repository root:
+      {ts,name,state,prev,rule,fingerprint,stuck_seconds}, mode 0600. A
+      fingerprint is the window hash behind the verdict, or the state and
+      rule when a file gave it, so two scans can say whether the same pane
+      produced the same state. Prints one line per transition
+      (`ts=… name=… state=… prev=… rule=…`) and nothing while a session holds
+      its state; a read-only monitor, it never sends, stops or waits.
+      --interval N        seconds between scans (default: 10)
+      --once              one scan and exit, for cron or a test; never sleeps
+      --stuck-after N     flag a non-terminal state held longer than N
+                          seconds (default: 1800). The flag is recorded in
+                          the ledger and reported once per run of that state
+      --json              one JSON object per reported line, with the ledger
+                          fields and `flag` when it reports stuck or flapping
+      --ledger PATH       ledger file (default: .state-monitor.jsonl in the
+                          repository root)
+      --ledger-max-bytes N
+                          rotate the ledger to PATH.1 at N bytes (default:
+                          1048576)
+      --fail-on unknown   exit 3 when any live session is unclassified, for
+                          CI; without it the exit status is 0
+      Flapping is more than three transitions within ten minutes, reported
+      once when the fourth arrives: a bound, not a count of polls.
 
   spawn-freebuff-agent stop NAME [--graceful [--wait N]]
       Kill the tmux session; the worktree and branch are left in place.

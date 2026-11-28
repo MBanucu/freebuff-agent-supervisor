@@ -67,6 +67,9 @@
 #     finished_live_names, sessions, hours, models
 #   watch, autostop, notify, reap and gc:
 #     reap, watch_run, watch, autostop, notify, gc
+#   the state monitor:
+#     monitor_field, monitor_history, monitor_record, monitor_print,
+#     monitor_append, monitor_scan, monitor
 #   the GUI:
 #     snapshot_html, gui
 #   attach, send and stop:

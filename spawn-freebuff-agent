@@ -67,6 +67,9 @@
 #     finished_live_names, sessions, hours, models
 #   watch, autostop, notify, reap and gc:
 #     reap, watch_run, watch, autostop, notify, gc
+#   the state monitor:
+#     monitor_field, monitor_history, monitor_record, monitor_print,
+#     monitor_append, monitor_scan, monitor
 #   the GUI:
 #     snapshot_html, gui
 #   attach, send and stop:
@@ -165,6 +168,22 @@ ACCOUNT_HOURS=''
 # Turn text sits above the visible prompt, so refusal detection reads this
 # many lines of scrollback rather than the 12-line chrome window.
 REFUSAL_WINDOW=40
+# The state monitor (#43) records a transition, never a poll, so a long run is
+# a history instead of a log. The ledger sits in the repository root beside the
+# other ledgers and is rotated, because a phone has no room for an unbounded
+# one: at --ledger-max-bytes it is renamed to <path>.1 and a fresh file starts.
+STATE_LEDGER='.state-monitor.jsonl'
+# Seconds between scans. --once ignores it entirely and never sleeps.
+MONITOR_INTERVAL=10
+# A non-terminal state held longer than this is stuck. The flag is recorded in
+# the ledger, so it fires once per run of that state and not on every poll.
+MONITOR_STUCK_AFTER=1800
+# More than MONITOR_FLAP_LIMIT transitions inside MONITOR_FLAP_WINDOW seconds
+# usually means the pane markers disagree rather than the agent being busy.
+MONITOR_FLAP_WINDOW=600
+MONITOR_FLAP_LIMIT=3
+# 1 MB, the default cap a phone can afford to lose to a ledger.
+MONITOR_LEDGER_MAX=1048576
 # No rule matching a pane used to fall through to `working`, which made new
 # vendor chrome indistinguishable from a live turn. It is now `unknown`, but
 # only once the same normalised window has been seen twice: a boot frame or a
@@ -472,6 +491,36 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       Missing chat directory or log.jsonl prints reason=no-turn-log and
       exits 2. It never sends, stops or waits.
 
+  spawn-freebuff-agent monitor [--interval N] [--once] [--stuck-after N]
+                               [--json] [--ledger PATH] [--ledger-max-bytes N]
+                               [--fail-on unknown]
+      Follow every live fb-* session and record what changes, not what is
+      steady. Each session is classified once per scan with the same state
+      function status uses, and every transition appends one line to
+      .state-monitor.jsonl in the repository root:
+      {ts,name,state,prev,rule,fingerprint,stuck_seconds}, mode 0600. A
+      fingerprint is the window hash behind the verdict, or the state and
+      rule when a file gave it, so two scans can say whether the same pane
+      produced the same state. Prints one line per transition
+      (`ts=… name=… state=… prev=… rule=…`) and nothing while a session holds
+      its state; a read-only monitor, it never sends, stops or waits.
+      --interval N        seconds between scans (default: 10)
+      --once              one scan and exit, for cron or a test; never sleeps
+      --stuck-after N     flag a non-terminal state held longer than N
+                          seconds (default: 1800). The flag is recorded in
+                          the ledger and reported once per run of that state
+      --json              one JSON object per reported line, with the ledger
+                          fields and `flag` when it reports stuck or flapping
+      --ledger PATH       ledger file (default: .state-monitor.jsonl in the
+                          repository root)
+      --ledger-max-bytes N
+                          rotate the ledger to PATH.1 at N bytes (default:
+                          1048576)
+      --fail-on unknown   exit 3 when any live session is unclassified, for
+                          CI; without it the exit status is 0
+      Flapping is more than three transitions within ten minutes, reported
+      once when the fourth arrives: a bound, not a count of polls.
+
   spawn-freebuff-agent stop NAME [--graceful [--wait N]]
       Kill the tmux session; the worktree and branch are left in place.
       --graceful sends Escape, waits up to N seconds (default: 20) for the turn
@@ -684,7 +733,8 @@ ensure_excludes() {
     file=$(exclude_path)
     mkdir -p "$(dirname "$file")"
     for entry in '.worktrees/' '.task.md' 'local.properties' "$RESULT_FILE" \
-        '.supervisor.log' "$GH_STATE_FILE" "$BRIEF_LEDGER" "$HOURS_LEDGER"; do
+        '.supervisor.log' "$GH_STATE_FILE" "$BRIEF_LEDGER" "$HOURS_LEDGER" \
+        "$STATE_LEDGER"; do
         grep -qxF "$entry" "$file" 2>/dev/null || printf '%s\n' "$entry" >>"$file"
     done
 }
@@ -4391,9 +4441,10 @@ models() {
     printf 'models=%s session=%s\n' "$count" "$session"
 }
 
-# ---- watch, autostop, reap and gc ----
+# ---- watch, autostop, notify, reap and gc ----
 # The lifecycle: follow a run, stop what has finished or gone quiet, and record
-# the evidence the review needs.
+# the evidence the review needs. The state monitor at the end is the same
+# follow, across every live session at once, into one ledger.
 reap() {
     # reap NAME REASON [EXTRA] -> record evidence under .worktrees, then kill
     local name="$1" reason="$2" extra="${3:-}" session="fb-$name"
@@ -4710,6 +4761,263 @@ gc() {
             reap "$name" orphan
         fi
     done
+}
+
+monitor_field() {
+    # monitor_field LINE KEY -> the value of KEY in one ledger line. The file
+    # ships no JSON parser, so this reads back only the shape its own writer
+    # produces: a quoted string or a bare number, each key once per line, and
+    # values that need no escape because every field is a word or a digit.
+    local line="$1" key="$2"
+    printf '%s' "$line" | awk -v key="$key" '
+        {
+            pat = "\"" key "\":"
+            at = index($0, pat)
+            if (!at) exit
+            v = substr($0, at + length(pat))
+            if (substr(v, 1, 1) == "\"") {
+                v = substr(v, 2)
+                q = index(v, "\"")
+                if (q) v = substr(v, 1, q - 1)
+            } else {
+                sub(/[^0-9].*/, "", v)
+            }
+            printf "%s", v
+        }
+    '
+}
+
+monitor_history() {
+    # monitor_history LEDGER NAME NOW WINDOW -> what one scan needs from a
+    # session's recorded past, as key=value lines: `prev`, the state it was
+    # last seen in; `run_start`, when the state it holds now began (0 when
+    # nothing was recorded); `transitions`, the entries that changed state
+    # inside the flap window; and `stuck`, yes when this run already carries a
+    # stuck flag. The ledger is the monitor's only memory, so a long loop and
+    # a cron `--once` see the same history.
+    local ledger="$1" name="$2" now="$3" window="$4"
+    [ -f "$ledger" ] || return 0
+    awk -v name="$name" -v now="$now" -v window="$window" '
+        function str(line, key,    pat, v, at) {
+            pat = "\"" key "\":\""
+            at = index(line, pat)
+            if (!at) return ""
+            v = substr(line, at + length(pat))
+            q = index(v, "\"")
+            if (q) v = substr(v, 1, q - 1)
+            return v
+        }
+        function num(line, key,    pat, v, at) {
+            pat = "\"" key "\":"
+            at = index(line, pat)
+            if (!at) return 0
+            v = substr(line, at + length(pat))
+            sub(/[^0-9].*/, "", v)
+            return v + 0
+        }
+        str($0, "name") == name {
+            n++
+            ts[n] = num($0, "ts")
+            state[n] = str($0, "state")
+            prev[n] = str($0, "prev")
+            stucksecs[n] = num($0, "stuck_seconds")
+            # A record whose state equals its prev is a flag, not a change.
+            if (state[n] != prev[n] && ts[n] >= now - window) flaps++
+        }
+        END {
+            if (n == 0) {
+                printf "prev=\nrun_start=0\ntransitions=0\nstuck=no\n"
+                exit
+            }
+            last = state[n]
+            start = ts[n]
+            flagged = 0
+            for (i = n; i >= 1 && state[i] == last; i--) {
+                if (state[i] == prev[i]) {
+                    # A flag entry carries how long the run had lasted when it
+                    # was written, so the run clock survives it instead of
+                    # restarting at the flag.
+                    flagged = 1
+                    start = ts[i] - stucksecs[i]
+                } else {
+                    start = ts[i]
+                }
+            }
+            printf "prev=%s\nrun_start=%s\ntransitions=%s\nstuck=%s\n", \
+                last, start, flaps, (flagged ? "yes" : "no")
+        }
+    ' "$ledger" 2>/dev/null || true
+}
+
+monitor_record() {
+    # monitor_record TS NAME STATE PREV RULE FINGERPRINT STUCK_SECONDS -> one
+    # ledger line, the object #43 names, in a fixed order. It is built whole
+    # before it is written, so the append is one short write.
+    printf '{"ts":%s,"name":%s,"state":%s,"prev":%s,"rule":%s,"fingerprint":%s,"stuck_seconds":%s}' \
+        "$1" "$(json_str "$2")" "$(json_str "$3")" "$(json_str "$4")" \
+        "$(json_str "$5")" "$(json_str "$6")" "$7"
+}
+
+monitor_print() {
+    # monitor_print RECORD FLAG JSON -> the line for one report. With --json it
+    # is the ledger object itself, plus `flag` when there is one; otherwise it
+    # is the key=value line, which names the extra fields only when they carry
+    # news: stuck_seconds for a stuck run, the threshold for a flap.
+    local record="$1" flag="${2:-}" json="${3:-0}" out
+    if [ "$json" = 1 ]; then
+        if [ -n "$flag" ]; then
+            record=$(printf '%s' "$record" | sed "s/}\$/,\"flag\":\"$flag\"}/")
+        fi
+        note "$record"
+        return 0
+    fi
+    out="ts=$(monitor_field "$record" ts) name=$(monitor_field "$record" name) state=$(monitor_field "$record" state) prev=$(monitor_field "$record" prev) rule=$(monitor_field "$record" rule)"
+    case "$flag" in
+        stuck)
+            out+=" flag=stuck stuck_seconds=$(monitor_field "$record" stuck_seconds)"
+            ;;
+        flapping)
+            out+=" flag=flapping transitions=$((MONITOR_FLAP_LIMIT + 1)) window=${MONITOR_FLAP_WINDOW}s"
+            ;;
+    esac
+    note "$out"
+}
+
+monitor_append() {
+    # monitor_append LEDGER MAX_BYTES LINE -> rotate at the cap, then append
+    # LINE once. A single write to a file opened in append mode is atomic for a
+    # short record, so two monitors interleave whole lines and never a
+    # truncated one. Rotation renames first: a concurrent writer's fd follows
+    # the file it opened, so its line lands in one file, never across both.
+    local ledger="$1" max="$2" line="$3" size
+    if [ -f "$ledger" ]; then
+        size=$(wc -c <"$ledger" 2>/dev/null | tr -d ' ' || true)
+        is_num "$size" || size=0
+        if [ "$size" -ge "$max" ]; then
+            mv -f "$ledger" "$ledger.1" 2>/dev/null || true
+        fi
+    fi
+    (umask 077; printf '%s\n' "$line" >>"$ledger") ||
+        die "monitor: cannot write ledger: $ledger"
+    chmod 600 "$ledger" 2>/dev/null || true
+}
+
+monitor_scan() {
+    # monitor_scan LEDGER STUCK_AFTER MAX_BYTES FAIL_ON JSON -> one scan of
+    # every live session. classify_state reads the pane once per session (and
+    # twice only for its own documented unknown rescan; the monitor adds no
+    # capture of its own). A transition appends one ledger line, a state held
+    # past the deadline appends one stuck flag, and the fourth transition
+    # inside the window prints one flapping report. Returns 3 when FAIL_ON is
+    # unknown and a session is unclassified, 0 otherwise.
+    local ledger="$1" stuck_after="$2" max="$3" fail_on="$4" json="$5"
+    local now name state rule fp block history prev run_start transitions
+    local was_stuck record stuck flapping unknown=0 rc=0
+    now=$(date +%s)
+
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        # Session names come from tmux, so one is checked before it is used
+        # anywhere, as every other reader of one does.
+        if ! valid_name "$name"; then
+            printf 'monitor: skip invalid session name: fb-%s\n' "$name" >&2
+            continue
+        fi
+        block=$(classify_state "$name" "$REFUSAL_WINDOW" pane)
+        state=$(evidence_field "$block" state)
+        rule=$(evidence_field "$block" rule)
+        fp=$(evidence_field "$block" window_sha256)
+        # A verdict from a file has no window to hash, so its fingerprint is
+        # its own state and rule: stable while nothing changes, distinct
+        # across states.
+        [ -n "$fp" ] ||
+            fp=$(printf 'state=%s\nrule=%s\n' "$state" "$rule" | sha256_hex)
+        [ -n "$state" ] || state=unknown
+        [ -n "$rule" ] || rule=no-rule-matched
+        [ "$state" != unknown ] || unknown=$((unknown + 1))
+
+        history=$(monitor_history "$ledger" "$name" "$now" "$MONITOR_FLAP_WINDOW")
+        prev=$(evidence_field "$history" prev)
+        run_start=$(evidence_field "$history" run_start)
+        transitions=$(evidence_field "$history" transitions)
+        was_stuck=$(evidence_field "$history" stuck)
+        is_num "$run_start" || run_start=0
+        is_num "$transitions" || transitions=0
+        [ -n "$was_stuck" ] || was_stuck=no
+
+        if [ "$state" != "$prev" ]; then
+            # Seconds spent in the state that is ending; an empty prev is the
+            # first sight of the session and has no earlier clock.
+            stuck=0
+            if [ -n "$prev" ] && [ "$run_start" -gt 0 ] &&
+                [ "$now" -gt "$run_start" ]; then
+                stuck=$((now - run_start))
+            fi
+            record=$(monitor_record "$now" "$name" "$state" "$prev" "$rule" "$fp" "$stuck")
+            monitor_append "$ledger" "$max" "$record"
+            monitor_print "$record" '' "$json"
+            # A flap is reported where it is crossed, so one burst of
+            # transitions is one report rather than one per further poll.
+            [ $((transitions + 1)) -eq $((MONITOR_FLAP_LIMIT + 1)) ] || continue
+            flapping=$(monitor_record "$now" "$name" "$state" "$state" "$rule" "$fp" 0)
+            monitor_print "$flapping" flapping "$json"
+        elif ! state_is_terminal "$state" && [ "$run_start" -gt 0 ] &&
+            [ "$now" -gt $((run_start + stuck_after)) ] &&
+            [ "$was_stuck" = no ]; then
+            stuck=$((now - run_start))
+            record=$(monitor_record "$now" "$name" "$state" "$state" "$rule" "$fp" "$stuck")
+            monitor_append "$ledger" "$max" "$record"
+            monitor_print "$record" stuck "$json"
+        fi
+    done <<<"$(live_sessions | sed 's/^fb-//' | LC_ALL=C sort)"
+
+    if [ "$fail_on" = unknown ] && [ "$unknown" -gt 0 ]; then
+        rc=3
+    fi
+    return "$rc"
+}
+
+monitor() {
+    local interval="$MONITOR_INTERVAL" once=0 stuck_after="$MONITOR_STUCK_AFTER"
+    local json=0 ledger='' max="$MONITOR_LEDGER_MAX" fail_on='' rc=0 dir
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --interval) interval=${2:-}; shift 2 ;;
+            --once) once=1; shift ;;
+            --stuck-after) stuck_after=${2:-}; shift 2 ;;
+            --json) json=1; shift ;;
+            --ledger) ledger=${2:-}; shift 2 ;;
+            --ledger-max-bytes) max=${2:-}; shift 2 ;;
+            --fail-on) fail_on=${2:-}; shift 2 ;;
+            -h|--help) usage; exit 0 ;;
+            *) die "monitor: unsupported argument: $1" ;;
+        esac
+    done
+    is_duration "$interval" ||
+        die "monitor: --interval must be a number greater than zero"
+    is_num "$stuck_after" || die "monitor: --stuck-after must be a number"
+    is_num "$max" || die "monitor: --ledger-max-bytes must be a number"
+    [ "$max" -gt 0 ] ||
+        die "monitor: --ledger-max-bytes must be greater than zero"
+    case "$fail_on" in
+        ''|unknown) ;;
+        *) die "monitor: --fail-on must be unknown" ;;
+    esac
+    [ -n "$ledger" ] || ledger="$ROOT/$STATE_LEDGER"
+    dir=$(dirname -- "$ledger")
+    [ -d "$dir" ] || die "monitor: ledger directory does not exist: $dir"
+    # The ledger is runtime state in the repository root like the other two, so
+    # a repo that only ever ran the monitor still cannot commit it.
+    ensure_excludes
+
+    while :; do
+        rc=0
+        monitor_scan "$ledger" "$stuck_after" "$max" "$fail_on" "$json" ||
+            rc=$?
+        [ "$once" = 0 ] || break
+        sleep "$interval"
+    done
+    return "$rc"
 }
 
 # ---- the GUI ----
@@ -5188,6 +5496,7 @@ case "$cmd" in
     watch) watch "$@" ;;
     autostop) autostop "$@" ;;
     notify) notify "$@" ;;
+    monitor) monitor "$@" ;;
     gc) gc "$@" ;;
     stop) stop "$@" ;;
     -h|--help|help) usage ;;

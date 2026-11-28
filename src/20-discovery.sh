@@ -79,7 +79,8 @@ ensure_excludes() {
     file=$(exclude_path)
     mkdir -p "$(dirname "$file")"
     for entry in '.worktrees/' '.task.md' 'local.properties' "$RESULT_FILE" \
-        '.supervisor.log' "$GH_STATE_FILE" "$BRIEF_LEDGER" "$HOURS_LEDGER"; do
+        '.supervisor.log' "$GH_STATE_FILE" "$BRIEF_LEDGER" "$HOURS_LEDGER" \
+        "$STATE_LEDGER"; do
         grep -qxF "$entry" "$file" 2>/dev/null || printf '%s\n' "$entry" >>"$file"
     done
 }
