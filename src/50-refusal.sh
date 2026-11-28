@@ -172,8 +172,12 @@ account_read() {
     # read as an unknown figure or as a network failure. Everything else is
     # named and left to the caller, which falls back to the pane. The figures
     # are the daily remaining and limit divided by five, the unit the TUI
-    # prints, plus the daily reset.
-    local file token body rc=0 code
+    # prints, plus the daily reset. The account answers with the whole
+    # account on one line, many keys after the daily object carrying a
+    # `limit` of their own, so the body is cut down to `"daily":{...}`
+    # before a figure is read and a pair with `remaining` over `limit` is
+    # `novalue` rather than a reading.
+    local file token body rc=0 code flat daily
     ACCOUNT_STATE=''
     ACCOUNT_REMAINING=''
     ACCOUNT_LIMIT=''
@@ -206,18 +210,29 @@ account_read() {
         esac
         return 1
     fi
-    ACCOUNT_REMAINING=$(printf '%s\n' "$body" |
-        sed -n 's/.*"remaining"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' |
-        head -n 1)
-    ACCOUNT_LIMIT=$(printf '%s\n' "$body" |
-        sed -n 's/.*"limit"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' |
-        head -n 1)
-    ACCOUNT_RESET=$(printf '%s\n' "$body" |
-        sed -n 's/.*"resetAt"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
-        head -n 1)
+    # The daily object is not always first and the line continues after it
+    # with `prices`, wallets and per-model limits: flatten the body and keep
+    # only the first `"daily":{...}`, so a later `remaining` (1056 in the
+    # live answer) or a per-model `limit` cannot be read as the budget. No
+    # daily object means no budget to read.
+    flat=$(printf '%s' "$body" | tr -d '\n')
+    daily=$(printf '%s\n' "$flat" |
+        grep -o '"daily"[[:space:]]*:[[:space:]]*{[^}]*}' | head -n 1 || true)
+    ACCOUNT_REMAINING=$(printf '%s\n' "$daily" |
+        grep -o '"remaining"[[:space:]]*:[[:space:]]*[0-9][0-9]*' |
+        head -n 1 | sed 's/.*:[[:space:]]*//')
+    ACCOUNT_LIMIT=$(printf '%s\n' "$daily" |
+        grep -o '"limit"[[:space:]]*:[[:space:]]*[0-9][0-9]*' |
+        head -n 1 | sed 's/.*:[[:space:]]*//')
+    ACCOUNT_RESET=$(printf '%s\n' "$daily" |
+        grep -o '"resetAt"[[:space:]]*:[[:space:]]*"[^"]*"' |
+        head -n 1 | sed 's/^.*:[[:space:]]*"//; s/"$//')
     # The API spells the reset with milliseconds; the tool prints whole seconds.
     ACCOUNT_RESET=$(printf '%s' "$ACCOUNT_RESET" | sed 's/\.[0-9]*Z$/Z/')
-    if ! is_num "$ACCOUNT_REMAINING" || ! is_num "$ACCOUNT_LIMIT"; then
+    # A remaining larger than the limit it came from is a mismatched pair,
+    # not a reading: it must never reach the display or the start gate.
+    if ! is_num "$ACCOUNT_REMAINING" || ! is_num "$ACCOUNT_LIMIT" ||
+        [ "$ACCOUNT_REMAINING" -gt "$ACCOUNT_LIMIT" ]; then
         ACCOUNT_STATE=novalue
         ACCOUNT_REMAINING=''
         ACCOUNT_LIMIT=''
