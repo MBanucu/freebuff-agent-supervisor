@@ -145,6 +145,22 @@ start() {
         return 0
     fi
 
+    # The account's own usage is one GET away (#124), so a launch that would
+    # land on an empty budget is refused before it spends a worktree or a
+    # concurrent-session slot. Only a definitive zero refuses, and only when
+    # no --model was named: a free model spends no hours and its picker price
+    # is the only place that is known. An absent token, an absent curl or a
+    # server that does not answer is never a reason to block a launch; those
+    # keep the pane-side refusal below.
+    if [ "$nostart" = 0 ] && [ -z "$model_want" ] && account_read &&
+        [ "$ACCOUNT_REMAINING" = 0 ]; then
+        note 'refused=hours'
+        note "hours=$ACCOUNT_HOURS"
+        [ -z "$ACCOUNT_RESET" ] || note "reset=$ACCOUNT_RESET"
+        note "hint=wait for the daily hours to refill, or launch a model that costs no hours with --model"
+        die "start: the account has no hours left ($ACCOUNT_HOURS, reset ${ACCOUNT_RESET:--}); nothing was created"
+    fi
+
     # Every session shares one account, so a launch is pointless while the
     # limit is reached: the pane stops on the overlay and never takes input.
     # Check before spending a worktree, and wait for a slot if asked.

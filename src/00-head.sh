@@ -32,6 +32,7 @@
 #     result_key, result_state, state_is_terminal, refusal_recorded,
 #     refusal_sentence, refusal_record, clear_refusal, refusal_is_hours,
 #     hours_quota, hours_panel, hours_footer, hours_source, hours_age_label,
+#     account_credentials_file, account_token, account_hours_div, account_read,
 #     hours_read, refusal_notes
 #   escaping and JSON:
 #     json_str, json_nullable_str, json_nullable_num, html_escape,

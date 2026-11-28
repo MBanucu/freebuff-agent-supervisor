@@ -68,6 +68,20 @@ HOURS_VALUE=''
 HOURS_AGE=''
 HOURS_SOURCE=''
 HOURS_FRESH=0
+# The account's own usage (#124): one authenticated GET answers what the pane
+# scrape works around, so the figure is the account's rather than a session's.
+# The token is the client's default.authToken and no fingerprint field or
+# cookie jar is needed. curl is read-only like gh and stays optional: without
+# it the state is named and the pane is still the fallback.
+ACCOUNT_URL='https://freebuff.com/api/web/freebuff-session'
+ACCOUNT_TIMEOUT=5
+# Set by account_read: STATE names why a read failed (unconfigured, nocurl,
+# request, novalue, unauthorized) and the figures it parsed.
+ACCOUNT_STATE=''
+ACCOUNT_REMAINING=''
+ACCOUNT_LIMIT=''
+ACCOUNT_RESET=''
+ACCOUNT_HOURS=''
 # Turn text sits above the visible prompt, so refusal detection reads this
 # many lines of scrollback rather than the 12-line chrome window.
 REFUSAL_WINDOW=40
@@ -264,13 +278,24 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       reapable by plain gc. --json emits the same rows as an array of
       objects, with the model as its own object ({name, hours}).
 
-  spawn-freebuff-agent hours [NAME] [--json]
-      Read the remaining Freebuff hour budget from a live pane: the welcome
-      panel's `N/M hours remaining` first, then the fraction in the footer
-      next to the model (`DeepSeek V4.1 Flash 10/17 • high`). NAME defaults
-      to any live fb-* session. The value is an observation with an age (the
-      seconds since the pane last changed), never an estimate.
-      --json      emit the same fields as one JSON object
+  spawn-freebuff-agent hours [NAME] [--source pane|account] [--json]
+      Read the remaining Freebuff hour budget. The default source is a live
+      pane: the welcome panel's `N/M hours remaining` first, then the fraction
+      in the footer next to the model (`DeepSeek V4.1 Flash 10/17 • high`).
+      NAME defaults to any live fb-* session, and the value is an observation
+      with an age (the seconds since the pane last changed), never an estimate.
+      --source account
+                  ask the account API instead: one GET with the client's
+                  default.authToken from ~/.config/manicode/credentials.json,
+                  no cookie jar. Prints hours=5/21 reset=2026-11-27T23:00:00Z
+                  session=- source=account, where the figures are the daily
+                  remaining and limit divided by five, the unit the TUI draws.
+                  A token the server rejects is named as hours=unknown
+                  source=account status=unauthorized (exit 2); a missing or
+                  tokenless credentials file prints account=unconfigured and
+                  falls back to the pane.
+      --json      emit the same fields as one JSON object, with remaining,
+                  limit and reset_at (null when the pane is the source)
       Prints hours=unknown and exits 2 when no live pane can be read.
 
   spawn-freebuff-agent models [NAME] [--free] [--json]
@@ -424,6 +449,12 @@ Notes:
     because Freebuff treats a repeated message as scripted use and counts a
     strike against the account. A brief the vendor refused is marked in the
     same ledger, kept past the window and never sent again.
+  - Before a launch creates anything, start asks the account API for the
+    remaining hours (the reader behind hours --source account) and refuses an
+    empty budget as refused=hours with the reset time, without spending a
+    worktree or a session slot. Only a definitive zero refuses, --model skips
+    the check because a free model spends no hours, and an absent token, an
+    absent curl or a server that does not answer never blocks a launch.
   - A refusal (the concurrent-session or hours overlay, or the vendor's
     anti-automation answer in the turn text) is recorded in
     .worktrees/<name>/.refusal and .supervisor.log. start prints refused=yes,

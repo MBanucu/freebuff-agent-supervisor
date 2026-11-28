@@ -129,6 +129,105 @@ hours_age_label() {
     fi
 }
 
+account_credentials_file() {
+    # account_credentials_file -> the client's credentials.json under its
+    # config root, the same root the turn log is read from.
+    printf '%s/credentials.json' "$(freebuff_config_dir)"
+}
+
+account_token() {
+    # account_token FILE -> the `default.authToken` the account API accepts,
+    # empty when the file is absent, unreadable or carries no token. The file
+    # is read once and the text after the `default` key is kept, so another
+    # account's token is never used; a file without that key still answers
+    # with its only authToken. No jq and no JSON parser: one sed pass.
+    local file=${1-} text token
+    [ -f "$file" ] && [ -r "$file" ] || return 0
+    text=$(sed -e ':a' -e 'N' -e '$!ba' -- "$file" 2>/dev/null || true)
+    token=$(printf '%s\n' "$text" |
+        sed -e 's/.*"default"[[:space:]]*:[[:space:]]*{//' |
+        sed -n 's/.*"authToken"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+        head -n 1)
+    case "$token" in
+        ''|*[[:space:]]*) return 0 ;;
+    esac
+    printf '%s' "$token"
+}
+
+account_hours_div() {
+    # account_hours_div N -> N/5, the unit the TUI draws (105 -> 21, 25 -> 5).
+    # A figure that does not divide evenly keeps one decimal rather than being
+    # rounded to a number the account does not have.
+    awk -v n="${1:-0}" 'BEGIN {
+        v = n / 5
+        if (v == int(v)) printf "%d", v
+        else printf "%.1f", v
+    }'
+}
+
+account_read() {
+    # account_read -> 0 when the account's own usage was read from
+    # ACCOUNT_URL, 1 with ACCOUNT_STATE naming why not. A 401 is its own
+    # state, `unauthorized`: an expired token is a fixable thing and must not
+    # read as an unknown figure or as a network failure. Everything else is
+    # named and left to the caller, which falls back to the pane. The figures
+    # are the daily remaining and limit divided by five, the unit the TUI
+    # prints, plus the daily reset.
+    local file token body rc=0 code
+    ACCOUNT_STATE=''
+    ACCOUNT_REMAINING=''
+    ACCOUNT_LIMIT=''
+    ACCOUNT_RESET=''
+    ACCOUNT_HOURS=''
+    file=$(account_credentials_file)
+    token=$(account_token "$file")
+    if [ -z "$token" ]; then
+        ACCOUNT_STATE=unconfigured
+        return 1
+    fi
+    if ! command -v curl >/dev/null 2>&1; then
+        ACCOUNT_STATE=nocurl
+        return 1
+    fi
+    # -f makes an HTTP error a non-zero exit, and -w still prints its code, so
+    # one request both reads the body and tells 401 from a transport failure.
+    if body=$(curl -fsS -m "$ACCOUNT_TIMEOUT" -w '\n%{http_code}' \
+        -H "Authorization: Bearer $token" "$ACCOUNT_URL" 2>/dev/null); then
+        rc=0
+    else
+        rc=$?
+    fi
+    code=$(printf '%s\n' "$body" | tail -n 1)
+    body=$(printf '%s\n' "$body" | sed '$d')
+    if [ "$rc" -ne 0 ]; then
+        case "$code" in
+            401) ACCOUNT_STATE=unauthorized ;;
+            *) ACCOUNT_STATE=request ;;
+        esac
+        return 1
+    fi
+    ACCOUNT_REMAINING=$(printf '%s\n' "$body" |
+        sed -n 's/.*"remaining"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' |
+        head -n 1)
+    ACCOUNT_LIMIT=$(printf '%s\n' "$body" |
+        sed -n 's/.*"limit"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' |
+        head -n 1)
+    ACCOUNT_RESET=$(printf '%s\n' "$body" |
+        sed -n 's/.*"resetAt"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' |
+        head -n 1)
+    # The API spells the reset with milliseconds; the tool prints whole seconds.
+    ACCOUNT_RESET=$(printf '%s' "$ACCOUNT_RESET" | sed 's/\.[0-9]*Z$/Z/')
+    if ! is_num "$ACCOUNT_REMAINING" || ! is_num "$ACCOUNT_LIMIT"; then
+        ACCOUNT_STATE=novalue
+        ACCOUNT_REMAINING=''
+        ACCOUNT_LIMIT=''
+        ACCOUNT_RESET=''
+        return 1
+    fi
+    ACCOUNT_HOURS="$(account_hours_div "$ACCOUNT_REMAINING")/$(account_hours_div "$ACCOUNT_LIMIT")"
+    return 0
+}
+
 hours_read() {
     # hours_read SESSION PANE -> 0 when there is an hours reading to show, 1
     # when neither the pane nor the ledger has one. A fraction in the pane is

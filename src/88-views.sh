@@ -651,15 +651,25 @@ sessions() {
 }
 
 hours() {
-    # hours [NAME] [--json] -> the remaining hour budget, read from a live
-    # pane. It is an observation with an age, never an estimate: the welcome
-    # panel's `N/M hours remaining` wins over the footer fraction next to the
-    # model, and a pane that shows neither (or no live session at all) is
-    # unknown with exit 2.
-    local name="" json=0 tmux="" session="" pane="" value="" source='' age='' agedisp='-'
+    # hours [NAME] [--source pane|account] [--json] -> the remaining hour
+    # budget. The default source is a live pane and stays the default until
+    # the account reader is proven in the field: the welcome panel's
+    # `N/M hours remaining` wins over the footer fraction next to the model,
+    # and a pane that shows neither (or no live session at all) is unknown
+    # with exit 2. --source account asks the account API instead (#124), so
+    # the figure is the account's and needs no session.
+    local name="" json=0 want=pane tmux="" session="" pane="" value="" source=''
+    local age='' agedisp='-' note_account='' extra=''
     while [ $# -gt 0 ]; do
         case "$1" in
             --json) json=1; shift ;;
+            --source)
+                case "${2:-}" in
+                    pane|account) want=$2 ;;
+                    *) die 'hours: --source must be pane or account' ;;
+                esac
+                shift 2
+                ;;
             -h|--help) usage; exit 0 ;;
             -*) die "hours: unsupported argument: $1" ;;
             *)
@@ -672,6 +682,35 @@ hours() {
         valid_name "$name" || die "hours: invalid name"
         session="fb-$name"
     fi
+
+    if [ "$want" = account ]; then
+        if account_read; then
+            if [ "$json" = 1 ]; then
+                printf '{"hours":%s,"session":null,"age":null,"source":"account","remaining":%s,"limit":%s,"reset_at":%s}\n' \
+                    "$(json_str "$ACCOUNT_HOURS")" "$ACCOUNT_REMAINING" \
+                    "$ACCOUNT_LIMIT" "$(json_nullable_str "$ACCOUNT_RESET")"
+            else
+                note "hours=$ACCOUNT_HOURS reset=${ACCOUNT_RESET:--} session=- source=account"
+            fi
+            return 0
+        fi
+        if [ "$ACCOUNT_STATE" = unauthorized ]; then
+            # The server answered and said no: the token is expired or
+            # revoked, which is a fixable thing rather than an unknown figure.
+            if [ "$json" = 1 ]; then
+                printf '{"hours":null,"session":null,"age":null,"source":"account","status":"unauthorized","remaining":null,"limit":null,"reset_at":null}\n'
+            else
+                note 'hours=unknown session=- source=account status=unauthorized'
+                note "hint=log in again with the Freebuff client to refresh $(account_credentials_file)"
+            fi
+            exit 2
+        fi
+        # No verdict from the server (no token, no curl, a timeout, a body
+        # without figures): the pane is still an observation, so name the
+        # state and read it as the default source does.
+        note_account=$ACCOUNT_STATE
+    fi
+
     tmux=$(tmux_bin 2>/dev/null || true)
     [ -n "$session" ] || session=$(live_sessions | head -n 1)
 
@@ -690,29 +729,34 @@ hours() {
         # session that cannot report its activity has no age, not a zero.
         age=$(idle_seconds "${session#fb-}" 2>/dev/null || true)
         [ -z "$age" ] || agedisp="${age}s"
+        [ -z "$note_account" ] || extra=$(printf ',"account":%s' "$(json_str "$note_account")")
         if [ -z "$value" ]; then
             if [ "$json" = 1 ]; then
-                printf '{"hours":null,"session":%s,"age":%s,"source":null}\n' \
-                    "$(json_nullable_str "$session")" "$(json_nullable_num "$age")"
+                printf '{"hours":null,"session":%s,"age":%s,"source":null,"remaining":null,"limit":null,"reset_at":null%s}\n' \
+                    "$(json_nullable_str "$session")" "$(json_nullable_num "$age")" "$extra"
             else
+                [ -z "$note_account" ] || note "account=$note_account"
                 note "hours=unknown session=$session age=$agedisp source=none"
             fi
             exit 2
         fi
         if [ "$json" = 1 ]; then
-            printf '{"hours":%s,"session":%s,"age":%s,"source":%s}\n' \
+            printf '{"hours":%s,"session":%s,"age":%s,"source":%s,"remaining":null,"limit":null,"reset_at":null%s}\n' \
                 "$(json_str "$value")" "$(json_str "$session")" \
-                "$(json_nullable_num "$age")" "$(json_str "$source")"
+                "$(json_nullable_num "$age")" "$(json_str "$source")" "$extra"
         else
+            [ -z "$note_account" ] || note "account=$note_account"
             note "hours=$value session=$session age=$agedisp source=$source"
         fi
         return 0
     fi
 
     # No live pane: the tool cannot invent a number it has not read.
+    [ -z "$note_account" ] || extra=$(printf ',"account":%s' "$(json_str "$note_account")")
     if [ "$json" = 1 ]; then
-        printf '{"hours":null,"session":null,"age":null,"source":null}\n'
+        printf '{"hours":null,"session":null,"age":null,"source":null,"remaining":null,"limit":null,"reset_at":null%s}\n' "$extra"
     else
+        [ -z "$note_account" ] || note "account=$note_account"
         note 'hours=unknown'
     fi
     exit 2
