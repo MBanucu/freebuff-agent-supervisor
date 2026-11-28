@@ -2,3 +2,7 @@
 *.log
 *.pid
 __pycache__/
+# Concord's work-state export: an agent's tools write .concord/ into its
+# worktree (and a checkout that used them). Local coordination state, not
+# project content; start also excludes it in .git/info/exclude (#154).
+.concord/
