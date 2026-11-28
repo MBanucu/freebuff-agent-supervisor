@@ -118,6 +118,13 @@ READY_REASON=''
 READY_STTY=''
 READY_TTY=''
 READY_ERROR=''
+# The last stty -a reading, flattened to one line, and whether the resting
+# prompt was already on screen while the tty stayed canonical. That pair is
+# the #138 timeout: a drawn TUI whose pty never went raw is a late or stuck
+# client, not a cold start, so the failure names it and records the reading
+# with the last pane lines in .supervisor.log.
+READY_STTY_OUT=''
+READY_DRAWN=0
 # A ready TUI can still swallow the Enter: the brief lands in the composer and
 # is never submitted, the composer clears, and the session rests at the idle
 # prompt looking healthy. So the Enter is not proof. After typing, start waits
@@ -215,6 +222,8 @@ Spawn parallel Freebuff agents in isolated git worktrees.
                          instead of failing; requires --max-sessions
                          With N > 1, each send is jittered by a random delay
                          so a burst does not reach the TUI in one second.
+                         A launch that lands while another client is still
+                         booting is delayed the same way before tmux starts.
       --no-start         create the worktree and brief, do not launch
       --prompt TEXT      send this message instead of the default brief
       --model NAME       choose this model in the TUI before the brief is
@@ -416,8 +425,9 @@ Environment:
   FREEBUFF_STTY       stty executable for the raw-mode check (default: stty on
                       PATH); point it at GNU stty if the PATH one has no -F
   FREEBUFF_START_JITTER  upper bound in seconds for the random delay before a
-                         send when --max-sessions allows several (default:
-                         2N; 0 disables the wait)
+                         send when --max-sessions allows several, and before
+                         a launch that races another client's boot (default:
+                         2N; 0 disables both waits)
   FREEBUFF_TTYD       ttyd executable for gui --ttyd (default: ttyd on PATH)
   FREEBUFF_WAKE_LOCK  1 acquires the Termux wake lock for every start, like
                       --wake-lock
@@ -433,8 +443,11 @@ Notes:
     types nothing and names the directory: answer `y` once in an interactive
     launch there to record the trust, or rerun start with --trust-agents.
   - A wait that gives up names the timeout it used, prints the last pane
-    lines and records elapsed seconds in .supervisor.log, so a slow cold
-    launch is distinguishable from a hung TUI.
+    lines and records the elapsed seconds, those pane lines and the last
+    stty -a reading in .supervisor.log, so a slow cold launch is
+    distinguishable from a hung TUI. A resting prompt on a tty that stayed
+    canonical is ready=timeout reason=canonical-drawn, printed with
+    retry=safe: the pane is drawn, so a larger --ready-timeout cannot help.
   - --model drives the client's own /model picker. There is no client flag,
     environment override or per-worktree setting for the model, so start
     types /model, moves the `›` marker with the arrow keys the frame prints,

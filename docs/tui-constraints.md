@@ -24,7 +24,22 @@ can never accept the brief, so `start` prints the last pane lines, stops that
 session, and fails in a message naming the `--ready-timeout` that was used,
 leaving the worktree and branch in place. The elapsed time and pane tail are
 what distinguishes a slow cold start from a hung TUI; raise `--ready-timeout`
-for the former. The concurrent-session and hours overlays are refusals instead:
+for the former.
+
+That evidence outlives the terminal: the pane lines are appended to
+`.supervisor.log` as `pane| <line>`, and the outcome line carries the tty and
+the last `stty -a` reading (`stty_out=`), so a launch that timed out is still
+diagnosable after its session is gone (#138). Two cold clients started in the
+same second used to leave the second one drawn and canonical — every launch
+shares one account and its admission lock — and the deadline was never the
+fault: a retry seconds later succeeds. That case is
+`ready=timeout reason=canonical-drawn`, and `start` prints `retry=safe`
+instead of sending the operator to a larger `--ready-timeout`. The launch is
+staggered too: while a live `fb-*` session has not proven its submission,
+`start` waits 0–2N seconds before `tmux new-session` — the bound
+`--max-sessions` gives a send, or `FREEBUFF_START_JITTER` — and records
+`launch_delay=Ns max=Ns booting=N`. A session that already submitted delays
+nothing. The concurrent-session and hours overlays are refusals instead:
 no keys are typed (their Enter takes over another live session or opens the
 model picker), `start` prints `refused=yes`, or `refused=hours` with `hours=N/M`
 when the panel shows the account's usage plus a `hint=` naming both ways out,
