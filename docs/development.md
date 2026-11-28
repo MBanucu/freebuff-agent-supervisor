@@ -19,7 +19,7 @@ starts a real agent.
 | `test/lib.sh` | The shared harness: temporary git repo, fake tmux/stty/freebuff, pane fixtures, `check`/`contains`/`json_ok`, and the cleanup trap. |
 | `test/cli-json.sh` | Area: the CLI surface, the git exclude list, `--json` output and the remaining flags. |
 | `test/snapshot-gui.sh` | Area: the static HTML snapshot, its escaping and `--watch`. |
-| `test/state-evidence.sh` | Area: the `.agent-result` protocol, pane classification and its evidence, `--explain`, and the terminal-idle rule. |
+| `test/state-evidence.sh` | Area: the `.agent-result` protocol, pane classification and its evidence, `--explain`, the Concord state source and its fallback, and the terminal-idle rule. |
 | `test/lifecycle-sessions.sh` | Area: autostop, `gc`, the `sessions` inventory, graceful stop and the capacity pre-flight. |
 | `test/brief-refusals.sh` | Area: the brief-hash ledger and the vendor refusal vocabulary and state. |
 | `test/readiness-submission.sh` | Area: the readiness deadline and proof that the brief was submitted. |
@@ -74,7 +74,7 @@ Find the area that owns the behaviour:
 | --- | --- |
 | CLI flags, exclude list, `--json` shape | `test/cli-json.sh` |
 | Static snapshot, HTML escaping, `--watch` | `test/snapshot-gui.sh` |
-| Result file, pane state, `--explain`, evidence | `test/state-evidence.sh` |
+| Result file, pane/Concord state, `--explain`, evidence | `test/state-evidence.sh` |
 | `autostop`, `gc`, `sessions`, graceful stop, capacity | `test/lifecycle-sessions.sh` |
 | Brief ledger, refusals | `test/brief-refusals.sh` |
 | Readiness deadline, submission proof | `test/readiness-submission.sh` |

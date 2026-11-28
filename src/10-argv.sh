@@ -5,6 +5,9 @@ COLS=180
 ROWS=55
 PROMPT='Read the file .task.md in this directory and execute it autonomously. Do not commit .task.md, .agent-result or local.properties. Follow the PR instructions in it exactly. Do not ask questions; if blocked, open a draft PR and explain.'
 RESULT_FILE='.agent-result'
+# Concord writes this export under the worktree's own .concord/ when an agent
+# uses its work-state tools. status can read it instead of the pane (#68).
+CONCORD_FILE='.concord/WORK_STATE.json'
 # Written next to a worktree at launch: issue and slug, so a transition later
 # (blocked, done, stopped) can label the right issue without asking the pane.
 GH_STATE_FILE='.supervisor-gh'
@@ -243,7 +246,7 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       --help             this text
 
   spawn-freebuff-agent status NAME [--lines N] [--no-gh] [--json] [--explain]
-                              [--source pane|log|auto] [--window N]
+                              [--source pane|log|concord|auto] [--window N]
       Show the session, input mode, result state, pane tail, branch, last
       commit and PR. model=<name> hours=<free|Nx|paid|daily> is the model
       the run was launched with, absent when it chose none. hours=N/M is
@@ -254,20 +257,26 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       --no-gh     do not ask gh for the PR
       --json      emit the same fields as one JSON object, plus an evidence
                   object naming the source, the rule, the matched line and
-                  the window, and turn_state/turn_outcome from the turn log
+                  the window, turn_state/turn_outcome from the turn log and
+                  the Concord fields when one is read
       --explain   print the classification decision line by line: every
-                  marker checked and the pane or turn log the rule looked at
-      --source S  where the state comes from: pane (default) reads the
-                  terminal, log reads the client's per-chat turn log and
+                  marker checked, the source that won, and when two are
+                  present, the losing source and its verdict
+      --source S  where session_state comes from: pane (default) reads the
+                  terminal. log reads the client's per-chat turn log and
                   reports turn_state=working|finished|failed with
-                  turn_outcome=lastMessage|error, auto prefers the log and
-                  falls back to the pane when it has no verdict
+                  turn_outcome=lastMessage|error. concord reads the
+                  worktree's .concord/WORK_STATE.json and names the task an
+                  agent reported. auto prefers the log, then Concord, and
+                  falls back to the pane naming the reason (log=<reason>,
+                  concord=<reason>) so a missing or corrupt file never
+                  becomes `unknown` by accident
       --window N  pane lines the classifier reads (default: 40)
 
   spawn-freebuff-agent list
       List worktrees with session state, running flag and idle time.
 
-  spawn-freebuff-agent sessions [--no-gh] [--json]
+  spawn-freebuff-agent sessions [--no-gh] [--json] [--source S]
       One table over every fb-* session and every worktree: live state, idle
       time, attached autostop watcher, whether a worktree exists, the result
       state, the branch, the open PR, the model the run was launched with
@@ -275,8 +284,10 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       the last account hours reading (N/M for a live read, N/M age=47m for
       the .supervisor-hours ledger, - when there is neither).
       Sessions with no worktree are listed here instead of only being
-      reapable by plain gc. --json emits the same rows as an array of
-      objects, with the model as its own object ({name, hours}).
+      reapable by gc --all. --json emits the same rows as an array of
+      objects, with the model as its own object ({name, hours}). --source
+      selects the live STATE column the same way status does (pane, log,
+      concord or auto).
 
   spawn-freebuff-agent hours [NAME] [--source pane|account] [--json]
       Read the remaining Freebuff hour budget. The default source is a live
@@ -313,7 +324,7 @@ Spawn parallel Freebuff agents in isolated git worktrees.
                   launch should pick from when the account's hours are short
       --json      emit the same rows as one JSON object
 
-  spawn-freebuff-agent gui --snapshot FILE [--watch N] [--no-gh]
+  spawn-freebuff-agent gui --snapshot FILE [--watch N] [--no-gh] [--source S]
       Write one self-contained HTML page from `sessions --json`: one card
       per session with done-versus-working visible at a glance and the model
       it was launched with, with its cost class, beside the hours reading.
@@ -321,9 +332,11 @@ Spawn parallel Freebuff agents in isolated git worktrees.
       offline.
       --watch N   rewrite the file every N seconds (adds a meta refresh)
       --no-gh     do not ask gh for the PR
+      --source S  pane, concord or auto for the STATE column (see status)
 
   spawn-freebuff-agent gui --serve [--port N] [--host H] [--token T] [--read-only]
                               [--allow-host NAME] [--ttyd [--interactive]]
+                              [--source S]
       Serve the dashboard and JSON API from python3's standard library:
       GET / is the --snapshot page, GET /api/sessions is `sessions --json`
       verbatim and GET /api/session/<name>/pane is `status --json`. POST
@@ -346,6 +359,9 @@ Spawn parallel Freebuff agents in isolated git worktrees.
                       --interactive, which adds ttyd's -W.
       --interactive   let the browser type into the agent; refused with
                       --read-only
+      --source S      pane, concord or auto, forwarded to sessions and to
+                      the pane route's status, so the page and the JSON API
+                      name the same source and the same loser
 
   spawn-freebuff-agent attach NAME
       Attach to the tmux session (detach with Ctrl-b d).

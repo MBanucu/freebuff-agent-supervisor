@@ -3,7 +3,9 @@
 
 This is a thin layer over `spawn-freebuff-agent`: it reimplements no state,
 it shells out to `sessions --json` and `status NAME --json` and returns what
-those print. Standard library only (`http.server`), no third-party packages.
+those print. `--source pane|log|concord|auto` is forwarded to both, so the page
+and the JSON API read the same source as the CLI. Standard library only
+(`http.server`), no third-party packages.
 
 Routes:
   GET  /                       the page `gui --snapshot` writes
@@ -236,13 +238,14 @@ class Server(ThreadingHTTPServer):
 
     def __init__(self, address, handler, root, token, read_only, style,
                  ttyd=None, ttyd_wanted=False, interactive=False,
-                 allowed_hosts=frozenset(LOOPBACK_HOSTS)):
+                 allowed_hosts=frozenset(LOOPBACK_HOSTS), source="pane"):
         super().__init__(address, handler)
         self.root = root
         self.token = token
         self.style = style
         self.allowed_hosts = allowed_hosts
         self.read_only = read_only
+        self.source = source
         self.ttyd = ttyd
         self.ttyd_wanted = ttyd_wanted
         self.interactive = interactive
@@ -560,7 +563,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._dashboard(
                     extra, self.server.take_flash(key) if key else "")
             if segments == ["api", "sessions"]:
-                return self._proxy(["sessions", "--json"], 500, extra)
+                return self._proxy(
+                    ["sessions", "--json", "--source", self.server.source],
+                    500, extra)
             # /tty/<name>: the dashboard's terminal link. The name is
             # unquoted already, so valid_name runs before anything else.
             if len(segments) == 2 and segments[0] == "tty":
@@ -573,7 +578,8 @@ class Handler(BaseHTTPRequestHandler):
                 if not valid_name(name):
                     return self._json(400, {"error": "invalid name"}, extra=extra)
                 return self._proxy(
-                    ["status", name, "--json", "--no-gh"], 404, extra)
+                    ["status", name, "--json", "--no-gh",
+                     "--source", self.server.source], 404, extra)
             return self._json(404, {"error": "no such route"}, extra=extra)
 
         return self._post(parsed, query, extra, form)
@@ -832,7 +838,8 @@ class Handler(BaseHTTPRequestHandler):
         # page the browser gets is byte-for-byte what `gui --snapshot` writes.
         with tempfile.TemporaryDirectory(prefix="freebuff-gui-") as tmp:
             path = os.path.join(tmp, "dashboard.html")
-            argv = ["gui", "--snapshot", path]
+            argv = ["gui", "--snapshot", path,
+                    "--source", self.server.source]
             if self.server.ttyd:
                 # The renderer owns the markup; it only has to know that a
                 # terminal link exists and where it points.
@@ -886,6 +893,9 @@ def parse_args(argv):
                         help="add a terminal link per session, served by ttyd")
     parser.add_argument("--interactive", action="store_true",
                         help="let the ttyd viewer type (needs --ttyd)")
+    parser.add_argument("--source", choices=("pane", "log", "concord", "auto"),
+                        default="pane",
+                        help="where session_state comes from (default: pane)")
     return parser.parse_args(argv)
 
 
@@ -930,7 +940,7 @@ def main(argv=None):
             root=os.path.abspath(args.root), token=token,
             read_only=args.read_only, style=style, ttyd=ttyd,
             ttyd_wanted=args.ttyd, interactive=args.interactive,
-            allowed_hosts=allowed)
+            allowed_hosts=allowed, source=args.source)
     except OSError as exc:
         print("gui: cannot listen on %s:%s: %s" % (args.host, args.port, exc),
               file=sys.stderr)
@@ -943,6 +953,7 @@ def main(argv=None):
           flush=True)
     print("root=%s" % os.path.abspath(args.root), flush=True)
     print("read_only=%s" % ("yes" if args.read_only else "no"), flush=True)
+    print("source=%s" % args.source, flush=True)
     if args.ttyd:
         print("ttyd=%s" % ("yes" if ttyd else "missing"), flush=True)
         if ttyd:

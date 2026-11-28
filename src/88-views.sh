@@ -46,6 +46,25 @@ print_explanation() {
                     printf 'explain: turn_outcome=%s\n' "${line#turn_outcome=}"
                 ;;
             turn_log=*) printf 'explain: turn_log=%s\n' "${line#turn_log=}" ;;
+
+            concord_status=*)
+                [ -z "${line#concord_status=}" ] ||
+                    printf 'explain: concord_status=%s\n' \
+                        "${line#concord_status=}"
+                ;;
+            concord_task=*)
+                [ -z "${line#concord_task=}" ] ||
+                    printf 'explain: concord_task=%s\n' \
+                        "${line#concord_task=}"
+                ;;
+            concord_reason=*)
+                case "${line#concord_reason=}" in
+                    ''|task) ;;
+                    *) printf 'explain: concord=%s\n' "${line#concord_reason=}" ;;
+                esac
+                ;;
+            loser=*) printf 'explain: loser=%s\n' "${line#loser=}" ;;
+            loser_state=*) printf 'explain: loser_state=%s\n' "${line#loser_state=}" ;;
             rule=*)
                 rule=${line#rule=}
                 printf 'explain: rule=%s\n' "$rule"
@@ -97,8 +116,8 @@ status() {
     esac
     is_num "$window" || die "status: --window must be a number"
     case "$source" in
-        pane|log|auto) ;;
-        *) die "status: --source must be pane, log or auto" ;;
+        pane|log|concord|auto) ;;
+        *) die "status: --source must be pane, log, concord or auto" ;;
     esac
 
     local wt="$ROOT/.worktrees/$name" branch session tmux running=0 tty mode=unknown stty out
@@ -106,15 +125,17 @@ status() {
     local wake_lock="" hours="" model model_name="" model_hours=""
     local result_pr="" result_commit="" result_tests="" prs="" pr_json=null
     local evidence="" ev_rule="" ev_matched="" ev_lines="" ev_sha="" ev_scans="" ev_source=""
+    local ev_loser="" ev_loser_state=""
     local turn_evidence="" tstate="" tout="" turn_log=""
+    local conc_block conc_status="" conc_task="" conc_reason=""
     [ -d "$wt" ] || die "status: no worktree at $wt"
     branch=$(worktree_branch "$wt")
     session="fb-$name"
     tmux=$(tmux_bin 2>/dev/null || true)
 
-    # The turn log is a file, so it can be read with or without a session. The
-    # human view shows its fields only when a source asks for it; --json always
-    # carries the keys, null when there is no chat directory.
+    # Both files can be read with or without a session. The human view shows
+    # their fields only when a source asks for them; --json always carries the
+    # keys, null when there is nothing to read.
     if [ "$source" != pane ] || [ "$json" = 1 ]; then
         turn_evidence=$(turn_log_evidence "$name")
         tstate=$(evidence_field "$turn_evidence" turn_state)
@@ -123,6 +144,15 @@ status() {
         if [ "$json" = 1 ] && [ "$turn_log" != yes ]; then
             tstate=''
             tout=''
+        fi
+        if [ "$source" != pane ]; then
+            # The classifier reads the export again; this copy is what the
+            # human view and the JSON fields report, including the reason for
+            # a fallback (missing, corrupt, no-task or unknown-status).
+            conc_block=$(concord_evidence "$name")
+            conc_status=$(evidence_field "$conc_block" concord_status)
+            conc_task=$(evidence_field "$conc_block" concord_task)
+            conc_reason=$(evidence_field "$conc_block" concord_reason)
         fi
     fi
 
@@ -178,9 +208,9 @@ status() {
         evidence=$(classify_state "$name" "$window" "$source")
         sstate=$(evidence_field "$evidence" state)
         # Only a session that can still be idle has an idle time. The result
-        # file outranks the pane, so `state` is the terminal answer even while
-        # the TUI process stays alive; `session_state` carries the same verdict
-        # on a branch that reports blocked and failed distinctly (#32).
+        # file outranks every source, so `state` is the terminal answer even
+        # while the TUI process stays alive; `session_state` carries the same
+        # verdict on a branch that reports blocked and failed distinctly (#32).
         if ! state_is_terminal "$state" && ! state_is_terminal "$sstate"; then
             idle=$(idle_seconds "$name" || true)
         fi
@@ -189,7 +219,12 @@ status() {
             printf 'running=yes\ninput=%s\n' "$mode"
             printf 'session_state=%s\n' "$sstate"
             if [ "$source" != pane ]; then
-                printf 'turn_state=%s\nturn_outcome=%s\n' "$tstate" "$tout"
+                [ -z "$tstate" ] && [ -z "$tout" ] ||
+                    printf 'turn_state=%s\nturn_outcome=%s\n' "$tstate" "$tout"
+                [ -z "$conc_status" ] || printf 'concord_status=%s\n' "$conc_status"
+                [ -z "$conc_task" ] || printf 'concord_task=%s\n' "$conc_task"
+                [ "$conc_reason" = task ] ||
+                    printf 'concord=%s\n' "${conc_reason:-unknown}"
             fi
             [ "$explain" = 0 ] || print_explanation "$evidence"
             [ -z "$idle" ] || printf 'idle_seconds=%s\n' "$idle"
@@ -197,8 +232,9 @@ status() {
     else
         local sentence
         if [ "$source" != pane ]; then
-            # The log outlives the TUI, so a stopped session can still name
-            # its last turn; auto falls back to `missing` when there is none.
+            # Both files outlive the TUI, so a stopped session can still
+            # name its last turn and the task it was running; auto falls back
+            # to `missing` when neither has anything to say.
             evidence=$(classify_state "$name" "$window" "$source")
             sstate=$(evidence_field "$evidence" state)
         else
@@ -218,7 +254,12 @@ status() {
         if [ "$json" = 0 ]; then
             printf 'running=no\nsession_state=%s\n' "$sstate"
             if [ "$source" != pane ]; then
-                printf 'turn_state=%s\nturn_outcome=%s\n' "$tstate" "$tout"
+                [ -z "$tstate" ] && [ -z "$tout" ] ||
+                    printf 'turn_state=%s\nturn_outcome=%s\n' "$tstate" "$tout"
+                [ -z "$conc_status" ] || printf 'concord_status=%s\n' "$conc_status"
+                [ -z "$conc_task" ] || printf 'concord_task=%s\n' "$conc_task"
+                [ "$conc_reason" = task ] ||
+                    printf 'concord=%s\n' "${conc_reason:-unknown}"
             fi
             [ "$explain" = 0 ] || print_explanation "$evidence"
         fi
@@ -289,6 +330,8 @@ status() {
     ev_source=$(evidence_field "$evidence" source)
     ev_rule=$(evidence_field "$evidence" rule)
     ev_matched=$(evidence_field "$evidence" matched)
+    ev_loser=$(evidence_field "$evidence" loser)
+    ev_loser_state=$(evidence_field "$evidence" loser_state)
     ev_lines=$(evidence_field "$evidence" window_lines)
     ev_sha=$(evidence_field "$evidence" window_sha256)
     ev_scans=$(evidence_field "$evidence" stable_scans)
@@ -311,6 +354,9 @@ status() {
     printf '  "session_state": %s,\n' "$(json_str "$sstate")"
     printf '  "turn_state": %s,\n' "$(json_nullable_str "$tstate")"
     printf '  "turn_outcome": %s,\n' "$(json_nullable_str "$tout")"
+    printf '  "concord_status": %s,\n' "$(json_nullable_str "$conc_status")"
+    printf '  "concord_task": %s,\n' "$(json_nullable_str "$conc_task")"
+    printf '  "concord_reason": %s,\n' "$(json_nullable_str "$conc_reason")"
     printf '  "idle_seconds": %s,\n' "$(json_nullable_num "$idle")"
     printf '  "watcher": %s,\n' "$(json_nullable_str "$watcher")"
     printf '  "wake_lock": %s,\n' "$(json_nullable_str "$wake_lock")"
@@ -330,6 +376,8 @@ status() {
     printf '    "source": %s,\n' "$(json_nullable_str "$ev_source")"
     printf '    "rule": %s,\n' "$(json_nullable_str "$ev_rule")"
     printf '    "matched": %s,\n' "$(json_nullable_str "$ev_matched")"
+    printf '    "loser": %s,\n' "$(json_nullable_str "$ev_loser")"
+    printf '    "loser_state": %s,\n' "$(json_nullable_str "$ev_loser_state")"
     printf '    "window_lines": %s,\n' "$(json_nullable_num "$ev_lines")"
     printf '    "window_sha256": %s,\n' "$(json_nullable_str "$ev_sha")"
     printf '    "stable_scans": %s\n' "$(json_nullable_num "$ev_scans")"
@@ -464,16 +512,21 @@ sessions() {
     local no_gh=0 json=0 name wt worktree running state idle activity now idle_secs
     local watcher wake_lock result branch pr prs="" slug="" tmux total=0 live=0 trees=0
     local pane hours model model_name model_hours model_show
-    local finished=no finished_count=0
+    local finished=no finished_count=0 source=pane
     local names=() x first=1
     while [ $# -gt 0 ]; do
         case "$1" in
             --json) json=1; shift ;;
             --no-gh) no_gh=1; shift ;;
+            --source) source=${2:-}; shift 2 ;;
             -h|--help) usage; exit 0 ;;
             *) die "sessions: unsupported argument: $1" ;;
         esac
     done
+    case "$source" in
+        pane|log|concord|auto) ;;
+        *) die "sessions: --source must be pane, log, concord or auto" ;;
+    esac
     tmux=$(tmux_bin 2>/dev/null || true)
     now=$(date +%s)
 
@@ -558,7 +611,7 @@ sessions() {
         if [ -n "$tmux" ] && "$tmux" has-session -t "fb-$name" 2>/dev/null; then
             running=yes
             live=$((live + 1))
-            state=$(session_state "$name")
+            state=$(session_state "$name" "$source")
             # A finished run whose TUI is still alive holds a vendor slot. The
             # count is what a refused start points at; `gc` is what frees it.
             if state_is_terminal "$state"; then
@@ -608,6 +661,7 @@ sessions() {
             printf '  {\n'
             printf '    "name": %s,\n' "$(json_str "$name")"
             printf '    "state": %s,\n' "$(json_nullable_str "$state")"
+            printf '    "source": %s,\n' "$(json_str "$source")"
             printf '    "idle_seconds": %s,\n' "$(json_nullable_num "$idle_secs")"
             if [ "$finished" = yes ]; then
                 printf '    "finished": true,\n'

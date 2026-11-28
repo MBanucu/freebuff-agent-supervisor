@@ -15,7 +15,12 @@ a `no worktree` tag. A run that chose no model has no model row, so `free` and
 ```bash
 spawn-freebuff-agent gui --snapshot ${TMPDIR:-/tmp}/agents.html
 spawn-freebuff-agent gui --snapshot ${TMPDIR:-/tmp}/agents.html --watch 5
+spawn-freebuff-agent gui --snapshot ${TMPDIR:-/tmp}/agents.html --source concord
 ```
+
+`--source pane|log|concord|auto` is forwarded to `sessions`, so the STATE badge on
+each card comes from the same source `status` would use (the default remains
+the pane).
 
 There is no server, no network and no auth: the file is opened directly or
 served by any static host, so it works on a phone and nothing listens to be
@@ -50,13 +55,16 @@ spawn-freebuff-agent gui --serve                    # http://127.0.0.1:7788
 spawn-freebuff-agent gui --serve --port 8080 --token "$TOKEN"
 spawn-freebuff-agent gui --serve --read-only
 spawn-freebuff-agent gui --serve --ttyd             # terminal link per card
+spawn-freebuff-agent gui --serve --source auto      # Concord first, pane fallback
 ```
 
 - `GET /` renders one card per session, including `worktree=missing` orphans.
 - `GET /tty/<name>` redirects to a ttyd viewer for that session, with `--ttyd`.
-- `GET /api/sessions` returns `sessions --json` verbatim.
-- `GET /api/session/<name>/pane` returns `status NAME --json`, or 404 when the
-  name has no worktree.
+- `GET /api/sessions` returns `sessions --json` verbatim, with the server's
+  `--source`.
+- `GET /api/session/<name>/pane` returns `status NAME --json` with the same
+  `--source` (so its evidence names a disagreement), or 404 when the name has
+  no worktree.
 - `POST /api/session/<name>/stop[?graceful=1]` runs `stop NAME`, or
   `stop NAME --graceful`. A **cookie-authenticated form POST** is answered
   with a confirmation page and changes nothing; the page's confirm form posts

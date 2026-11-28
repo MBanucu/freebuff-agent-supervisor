@@ -454,4 +454,185 @@ check contains "$out" 'reason=no-turn-log'
 # leave the fixture out of the areas that run after this one
 rm -rf "$FREEBUFF_CONFIG_DIR/projects"
 rm -f "$WT/.turn-log-cursor"
+# ---- the Concord source (#68) ----
+# The export is a fixture: no Concord install, MCP client or network is
+# involved. It is the shape Concord writes (generated_at, presence, tasks),
+# pretty-printed one key per line.
+CONCORD="$WT/.concord/WORK_STATE.json"
+concord_work_state() {
+    # concord_work_state STATUS [BRANCH] -> one task in a WORK_STATE.json
+    local status=$1 branch=${2:-test/999}
+    mkdir -p "$WT/.concord"
+    # Concord's setup writes this, so the export keeps the worktree clean.
+    printf '*\n' >"$WT/.concord/.gitignore"
+    cat >"$CONCORD" <<EOF
+{
+  "generated_at": "2026-11-27T10:00:00.000Z",
+  "presence": [],
+  "tasks": [
+    {
+      "task_id": "T68",
+      "title": "concord source",
+      "status": "$status",
+      "agent": "codex",
+      "agent_id": "codex:t68",
+      "assigned_agent_id": null,
+      "version": 3,
+      "updated_at": "2026-11-27T10:00:00.000Z",
+      "lease_expires_at": null,
+      "owner": null,
+      "branch": "$branch",
+      "parent_task_id": null,
+      "modules": [],
+      "domains": [],
+      "expected_files": []
+    }
+  ]
+}
+EOF
+}
+
+# Every reported status maps to one session_state and is read without a pane:
+# no tmux session exists for this loop, so only the file can answer.
+fake_clear
+for pair in active:working assigned:working handoff_offered:working \
+    blocked:blocked review_ready:done handed_off:done complete:done closed:done; do
+    cstatus=${pair%%:*}
+    want=${pair#*:}
+    concord_work_state "$cstatus"
+    out=$(bash "$TOOL" --root "$REPO" status --no-gh --source concord test-999)
+    check contains "$out" "session_state=$want"
+    check contains "$out" "concord_status=$cstatus"
+    check contains "$out" "concord_task=T68"
+done
+
+# A status that is not a run signal is unknown with the reason, never working.
+concord_work_state proposed
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --source concord --explain test-999)
+check contains "$out" 'session_state=unknown'
+check contains "$out" 'explain: rule=concord-unknown-status'
+check contains "$out" 'concord=unknown-status'
+
+# A branch selects the worktree's task in the shared workspace: the older
+# blocked task on another branch does not win.
+mkdir -p "$WT/.concord"
+printf '*\n' >"$WT/.concord/.gitignore"
+cat >"$CONCORD" <<'EOF'
+{
+  "generated_at": "2026-11-27T10:00:00.000Z",
+  "presence": [],
+  "tasks": [
+    {
+      "task_id": "T-other",
+      "status": "blocked",
+      "version": 9,
+      "updated_at": "2026-11-27T11:00:00.000Z",
+      "branch": "feat/other"
+    },
+    {
+      "task_id": "T-mine",
+      "status": "active",
+      "version": 1,
+      "updated_at": "2026-11-27T09:00:00.000Z",
+      "branch": "test/999"
+    }
+  ]
+}
+EOF
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --source concord test-999)
+check contains "$out" 'session_state=working'
+check contains "$out" 'concord_task=T-mine'
+
+# Both sources present and disagreeing: auto chooses Concord and prints the
+# losing pane verdict, while the default pane view ignores Concord entirely.
+concord_work_state active
+fake_session test-999 "$IDLE_PANE"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --source auto --explain test-999)
+check contains "$out" 'session_state=working'
+check contains "$out" 'explain: source=concord'
+check contains "$out" 'explain: loser=pane'
+check contains "$out" 'explain: loser_state=idle'
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --source concord --explain test-999)
+check contains "$out" 'session_state=working'
+check contains "$out" 'explain: source=concord'
+check contains "$out" 'explain: loser_state=idle'
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --source pane test-999)
+check contains "$out" 'session_state=idle'
+check test -z "$(printf '%s\n' "$out" | grep -F 'concord_status=' || true)"
+
+# Missing and corrupt exports fall back to the pane for auto, with a reason
+# line; never an accidental unknown, and no write to the worktree.
+rm -rf "$WT/.concord"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --source auto --explain test-999)
+check contains "$out" 'session_state=idle'
+check contains "$out" 'concord=missing'
+check contains "$out" 'explain: source=pane'
+check contains "$out" 'explain: check: concord-verdict: missing'
+check test ! -e "$WT/.concord"
+
+mkdir -p "$WT/.concord"
+printf '{"tasks": [\n' >"$CONCORD"
+fake_session test-999 "$BUSY_PANE"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --source auto test-999)
+check contains "$out" 'session_state=working'
+check contains "$out" 'concord=corrupt'
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --source concord --explain test-999)
+check contains "$out" 'session_state=unknown'
+check contains "$out" 'explain: rule=concord-corrupt'
+check contains "$out" 'explain: concord=corrupt'
+
+# With no pane either, auto still reports the pane's missing, not unknown.
+fake_clear
+rm -rf "$WT/.concord"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --source auto --explain test-999)
+check contains "$out" 'session_state=missing'
+check contains "$out" 'explain: rule=no-session'
+check contains "$out" 'concord=missing'
+
+# The result file outranks every source, Concord included.
+fake_session test-999 "$IDLE_PANE"
+concord_work_state active
+printf 'state=done\npr=none\n' >"$WT/.agent-result"
+out=$(bash "$TOOL" --root "$REPO" status --no-gh --source concord test-999)
+check contains "$out" 'session_state=done'
+rm -f "$WT/.agent-result"
+
+# --json carries the source and the Concord fields additively. The evidence
+# block names the source and, on a disagreement, the losing pane verdict.
+concord_work_state blocked
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh --source concord test-999)
+check json_ok "$out"
+check contains "$out" '"session_state": "blocked"'
+check contains "$out" '"concord_status": "blocked"'
+check contains "$out" '"concord_task": "T68"'
+check contains "$out" '"concord_reason": "task"'
+check contains "$out" '"source": "concord"'
+concord_work_state active
+fake_session test-999 "$IDLE_PANE"
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh --source concord test-999)
+check json_ok "$out"
+check contains "$out" '"loser": "pane"'
+check contains "$out" '"loser_state": "idle"'
+out=$(bash "$TOOL" --root "$REPO" status --json --no-gh test-999)
+check json_ok "$out"
+check contains "$out" '"session_state": "idle"'
+check contains "$out" '"concord_status": null'
+check contains "$out" '"concord_reason": null'
+check contains "$out" '"source": "pane"'
+
+# sessions --source drives the inventory the GUI renders; its JSON says which
+# source produced STATE.
+concord_work_state blocked
+out=$(bash "$TOOL" --root "$REPO" sessions --json --no-gh --source concord)
+check json_ok "$out"
+check contains "$out" '"state": "blocked"'
+check contains "$out" '"source": "concord"'
+if bash "$TOOL" --root "$REPO" sessions --source bogus \
+    >"$TMP/sessions-bogus.out" 2>&1; then rc=0; else rc=$?; fi
+check test "$rc" -ne 0
+check contains "$(cat "$TMP/sessions-bogus.out")" '--source must be pane, log, concord or auto'
+
+# Leave no Concord fixture for the areas that run after this one.
+rm -rf "$WT/.concord"
+rm -f "$WT/.agent-result"
 fake_session test-999 "$IDLE_PANE"

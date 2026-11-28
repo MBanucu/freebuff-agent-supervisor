@@ -342,6 +342,158 @@ turn_log_poll() {
         return 0
     fi
     printf 'event=none\nreason=no-new-turn\nlog=%s\n' "$log"
+    return 0
+}
+
+concord_file() {
+    # concord_file WORKTREE -> the generated work-state export
+    printf '%s/%s' "$1" "$CONCORD_FILE"
+}
+
+concord_validate() {
+    # concord_validate FILE -> 0 when FILE has the export's outer shape.
+    # The tool ships no JSON parser, so this is the strongest check that needs
+    # no runtime: a brace-delimited object with a tasks array. A file that
+    # fails it is corrupt, never "no tasks", so the caller can name the fault.
+    local file=$1 first last
+    [ -f "$file" ] && [ -s "$file" ] || return 1
+    first=$(grep -m1 -v '^[[:space:]]*$' "$file" 2>/dev/null |
+        sed -E 's/^[[:space:]]+//' || true)
+    [ "${first:0:1}" = '{' ] || return 1
+    last=$(grep -v '^[[:space:]]*$' "$file" 2>/dev/null | tail -n 1 |
+        sed -E 's/[[:space:]]+$//' || true)
+    [ "${last: -1}" = '}' ] || return 1
+    grep -qE '"tasks"[[:space:]]*:[[:space:]]*\[' "$file" || return 1
+    return 0
+}
+
+concord_task_record() {
+    # concord_task_record FILE BRANCH -> status, task_id, branch and
+    # updated_at of the task this worktree owns, tab-separated. Concord's
+    # workspace is shared by the main checkout and every linked worktree, so
+    # the worktree's branch selects its task; with no match a lone task is
+    # unambiguous, several are not, and `no-task` lets auto fall back.
+    local file=$1 branch=$2
+    awk -v branch="$branch" '
+        function value(line, key,    pat, v) {
+            pat = "\"" key "\"[[:space:]]*:[[:space:]]*\""
+            if (!match(line, pat)) return ""
+            v = substr(line, RSTART + RLENGTH)
+            sub(/".*/, "", v)
+            return v
+        }
+        function number(line, key,    pat, v) {
+            pat = "\"" key "\"[[:space:]]*:[[:space:]]*"
+            if (!match(line, pat)) return 0
+            v = substr(line, RSTART + RLENGTH)
+            sub(/[^0-9].*/, "", v)
+            return v + 0
+        }
+        /"tasks"[[:space:]]*:[[:space:]]*\[/ { in_tasks = 1; next }
+        in_tasks && /^[[:space:]]*\][[:space:]]*,?[[:space:]]*$/ {
+            in_tasks = 0; next
+        }
+        in_tasks && !in_rec && /^[[:space:]]*\{[[:space:]]*$/ {
+            in_rec = 1; status = ""; id = ""; br = ""; updated = ""; version = 0
+            next
+        }
+        in_tasks && in_rec && /^[[:space:]]*\},?[[:space:]]*$/ {
+            n++
+            t_status[n] = status; t_id[n] = id; t_branch[n] = br
+            t_updated[n] = updated; t_version[n] = version
+            in_rec = 0
+            next
+        }
+        in_tasks && in_rec {
+            key = $0
+            sub(/^[[:space:]]*"/, "", key)
+            sub(/".*/, "", key)
+            if (key == "status") status = value($0, "status")
+            else if (key == "task_id") id = value($0, "task_id")
+            else if (key == "branch") br = value($0, "branch")
+            else if (key == "updated_at") updated = value($0, "updated_at")
+            else if (key == "version") version = number($0, "version")
+        }
+        END {
+            best = 0
+            for (i = 1; i <= n; i++) {
+                if (branch != "" && t_branch[i] == branch) {
+                    if (best == 0 || t_updated[i] > t_updated[best] ||
+                        (t_updated[i] == t_updated[best] &&
+                         t_version[i] > t_version[best])) best = i
+                }
+            }
+            if (best == 0 && n == 1) best = 1
+            if (best == 0) {
+                printf "no-task\t\t\t\n"
+                exit
+            }
+            printf "%s\t%s\t%s\t%s\n", \
+                t_status[best], t_id[best], t_branch[best], t_updated[best]
+        }
+    ' "$file" 2>/dev/null || true
+}
+
+concord_map_state() {
+    # concord_map_state STATUS -> session_state, or `unknown` for a status
+    # that is not a run signal. The map uses only what an agent reported to
+    # Concord: active/assigned/handoff_offered are a turn in flight, blocked
+    # is a blocker, and review_ready/handed_off/complete/closed are a finished
+    # run. Concord has no failed or refused status, so those stay the result
+    # file's and the refusal file's words, never an inference from this file.
+    case "${1:-}" in
+        active|assigned|handoff_offered) printf 'working' ;;
+        blocked) printf 'blocked' ;;
+        review_ready|handed_off|complete|closed) printf 'done' ;;
+        *) printf 'unknown' ;;
+    esac
+}
+
+concord_evidence() {
+    # concord_evidence NAME [CHECKS] -> the evidence block from the Concord
+    # export. `concord_status` is the raw status an agent reported and
+    # `concord_reason` says why there is no verdict (missing, corrupt,
+    # no-task, unknown-status) or `task` when there is. A missing or corrupt
+    # file is `unknown`/concord-missing|concord-corrupt, never a guessed
+    # `working`, so auto can name the fallback instead of failing silently.
+    local name="$1" checks="${2:-}"
+    local wt="$ROOT/.worktrees/$name" file branch record
+    local status task tbranch updated state rule matched reason concord_checks
+    file=$(concord_file "$wt")
+    branch=$(git -C "$wt" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    concord_checks=""
+
+    if [ ! -e "$file" ]; then
+        state=unknown; rule=concord-missing; matched=''; reason=missing
+        concord_checks="check: concord ($file): no"
+    elif ! concord_validate "$file"; then
+        state=unknown; rule=concord-corrupt; matched=''; reason=corrupt
+        concord_checks="check: concord ($file): corrupt"
+    else
+        concord_checks="check: concord ($file): yes"
+        record=$(concord_task_record "$file" "$branch")
+        IFS=$'\t' read -r status task tbranch updated <<<"$record" || true
+        if [ -z "$status" ] || [ "$status" = no-task ]; then
+            state=unknown; rule=concord-no-task; matched=''; reason=no-task
+            concord_checks+=$'\n'"check: concord-task (branch ${branch:-?}): no"
+        else
+            concord_checks+=$'\n'"check: concord-task ($task): status=$status branch=${tbranch:--}"
+            state=$(concord_map_state "$status")
+            if [ "$state" = unknown ]; then
+                rule=concord-unknown-status
+                reason=unknown-status
+                matched="task $task status=$status"
+            else
+                rule=concord-task
+                reason=task
+                matched="task $task status=$status branch=${tbranch:--}"
+            fi
+        fi
+    fi
+    [ -z "$checks" ] || concord_checks="$checks"$'\n'"$concord_checks"
+    printf 'state=%s\nsource=concord\nrule=%s\nmatched=%s\nconcord_status=%s\nconcord_task=%s\nconcord_reason=%s\nwindow_lines=0\nwindow_sha256=\nstable_scans=0\n%s\n' \
+        "$state" "$rule" "${matched:0:200}" "${status:-}" "${task:-}" \
+        "$reason" "$concord_checks"
 }
 
 # The classifier's window, shared by emit_evidence and the status view.
@@ -355,6 +507,8 @@ emit_evidence() {
     # that; everything after it is what --explain shows line by line. `source`
     # names what produced the verdict (pane, log, result-file or refusal) and
     # is additive: the keys that were already there keep their meaning.
+    # that; everything after it is what --explain shows line by line. SOURCE
+    # names what produced the verdict (pane, result-file or refusal).
     local state="$1" rule="$2" matched="$3" scans="$4" checks="$5" source="${6:-pane}"
     printf 'state=%s\nsource=%s\nrule=%s\nmatched=%s\nwindow_lines=%s\nwindow_sha256=%s\nstable_scans=%s\n' \
         "$state" "$source" "$rule" "${matched:0:200}" "$EV_LINES" "$EV_SHA" "$scans"
@@ -365,14 +519,15 @@ emit_evidence() {
 classify_state() {
     # classify_state NAME [WINDOW] [SOURCE] -> evidence block; line one is
     # `state=done|refused|working|idle|unknown|missing`. SOURCE is pane (the
-    # default), log or auto. Read-only: captures and reads only, never sends,
-    # stops or writes. A first pane scan that no rule claims is captured again
-    # after a pause, and only the same normalised window twice becomes
-    # `unknown`.
+    # default), log, concord or auto. Read-only: captures and reads files
+    # only, never sends, stops or writes. A first pane scan that no rule claims
+    # is captured again after a pause, and only the same normalised window
+    # twice becomes `unknown`.
     local name="$1" window="${2:-$REFUSAL_WINDOW}" source="${3:-pane}"
     local session="fb-$name" wt="$ROOT/.worktrees/$name" tmux
     local sentence result pane chrome norm norm2 base_checks checks
     local has_session=0 logblock logstate
+    local cblock cstate creason pane_block pane_state
     tmux=$(tmux_bin 2>/dev/null || true)
 
     EV_PANE=''
@@ -386,8 +541,9 @@ classify_state() {
         checks="check: session (fb-$name): no"
     fi
 
-    # The pane and auto sources start from a live session. The log is a file,
-    # so it still answers after the TUI is gone.
+    # Only the pane needs a live session. The turn log and the Concord export
+    # are files, so they still answer after the TUI is gone; auto decides
+    # after reading them.
     if [ "$source" = pane ] && [ "$has_session" = 0 ]; then
         emit_evidence missing no-session '' 0 "$checks"
         return 0
@@ -420,6 +576,9 @@ classify_state() {
         turn_log_evidence "$name" "$base_checks"
         return 0
     fi
+
+    # auto prefers what the client recorded: the turn log first, then the
+    # Concord export, and the pane only when neither has a verdict.
     if [ "$source" = auto ]; then
         logblock=$(turn_log_evidence "$name" "$base_checks")
         logstate=$(evidence_field "$logblock" turn_state)
@@ -427,9 +586,32 @@ classify_state() {
             printf '%s\n' "$logblock"
             return 0
         fi
-        # No usable turn log: fall back to the pane, naming the loser so the
-        # disagreement is visible instead of silent.
         base_checks+=$'\n'"check: log-verdict: ${logstate:-unknown}"
+    fi
+
+    if [ "$source" = concord ] || [ "$source" = auto ]; then
+        cblock=$(concord_evidence "$name" "$base_checks")
+        cstate=$(evidence_field "$cblock" state)
+        creason=$(evidence_field "$cblock" concord_reason)
+        if [ "$source" = concord ] || [ "$cstate" != unknown ]; then
+            # Concord answered. When a pane is also present and disagrees,
+            # name the loser so the disagreement is visible instead of silent;
+            # the pane never outranks an explicit --source concord, it is only
+            # reported.
+            if [ "$has_session" = 1 ]; then
+                pane_block=$(classify_state "$name" "$window" pane)
+                pane_state=$(evidence_field "$pane_block" state)
+                if [ "$pane_state" != "$cstate" ]; then
+                    cblock+=$'\n'"loser=pane"$'\n'"loser_state=$pane_state"
+                fi
+            fi
+            printf '%s\n' "$cblock"
+            return 0
+        fi
+        # Neither file has a verdict: fall back to the pane, naming each
+        # reason (missing, corrupt, no-task or unknown-status) so the fallback
+        # is evidence rather than an accidental `unknown`.
+        base_checks+=$'\n'"check: concord-verdict: ${creason:-unknown}"
         if [ "$has_session" = 0 ]; then
             emit_evidence missing no-session '' 0 "$base_checks"
             return 0
@@ -471,9 +653,11 @@ classify_state() {
 }
 
 session_state() {
-    # session_state NAME -> done|blocked|failed|refused|working|idle|unknown|missing
+    # session_state NAME [SOURCE] -> done|blocked|failed|refused|working|idle|
+    # unknown|missing. SOURCE defaults to pane, so every existing caller keeps
+    # its meaning; sessions passes its own --source through.
     local block first
-    block=$(classify_state "$1")
+    block=$(classify_state "$1" "$REFUSAL_WINDOW" "${2:-pane}")
     first=${block%%$'\n'*}
     printf '%s' "${first#state=}"
 }

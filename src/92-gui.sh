@@ -227,7 +227,7 @@ gui() {
     # The server itself is gui/server.py; python3 stays optional so the rest
     # of the CLI works on a host that does not have it.
     local snapshot='' watch='' no_gh=0 serve=0 first=1 json args py dir
-    local links='' note_text='' ttyd=0 interactive=0
+    local links='' note_text='' ttyd=0 interactive=0 source=pane
     local form_nonce='' flash_file='' flash_text=''
     local passthrough=()
     while [ $# -gt 0 ]; do
@@ -238,6 +238,7 @@ gui() {
             --serve) serve=1; shift ;;
             --ttyd) ttyd=1; passthrough+=(--ttyd); shift ;;
             --interactive) interactive=1; passthrough+=(--interactive); shift ;;
+            --source) source=${2:-}; passthrough+=(--source "${2:-}"); shift 2 ;;
             --terminal-links) links=/tty/; shift ;;
             --terminal-note) note_text=${2:-}; shift 2 ;;
             --form-nonce) form_nonce=${2:-}; shift 2 ;;
@@ -250,6 +251,10 @@ gui() {
             *) die "gui: unsupported argument: $1" ;;
         esac
     done
+    case "$source" in
+        pane|log|concord|auto) ;;
+        *) die "gui: --source must be pane, log, concord or auto" ;;
+    esac
 
     if [ "$serve" = 0 ] && { [ "$ttyd" = 1 ] || [ "$interactive" = 1 ]; }; then
         die "gui: --ttyd and --interactive belong to --serve"
@@ -278,7 +283,7 @@ gui() {
     fi
     mkdir -p "$(dirname "$snapshot")"
     while :; do
-        args=(--json)
+        args=(--json --source "$source")
         if [ "$no_gh" = 1 ]; then
             args+=(--no-gh)
         fi
